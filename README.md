@@ -4,7 +4,7 @@ Asistente que farmea **Clash of Clans** solo, en el emulador **BlueStacks** de t
 
 - 🏰 **Llena los almacenes** de cada cuenta hasta el % que tú elijas (ataca bases con buen botín).
 - 🌙 **Llena la aldea nocturna** (batallas de constructor).
-- 🔨 **Mejora lo recomendado** en una cuenta pequeña *(experimental, ahora desactivada: pendiente de adaptar al panel nuevo del juego)*.
+- 🔨 **Mejora lo recomendado** en una cuenta pequeña, hasta el nivel de ayuntamiento que digas.
 - 🤝 **Dona** lo que pidan en el clan y **pide tropas** siempre que puede.
 - 👀 **Visor web** en `http://localhost:8000`: ves la pantalla en directo, lo que decide, el botín de cada ataque,
   los almacenes, y **ordenas la rutina arrastrando**.
@@ -73,8 +73,8 @@ Abre **`asistente\config.json`** con el Bloc de notas. Por cada cuenta, en `"acc
 | `village_name` | el nombre de la aldea **tal cual sale arriba a la izquierda** en el juego | `"MiAldea"` |
 | `switch_label` | el nombre de la tarjeta en **Supercell ID → Cambiar de cuenta** | `"MiAldea"` |
 | `label` | cómo quieres verla en el visor | `"Principal · TH18"` |
-| `capacity` | capacidad de oro / elixir / oscuro (toca cada barra en el juego, sale el **Máx.**) | `28000000` |
-| `builder_capacity` | *(opcional)* capacidad de la aldea nocturna | `6500000` |
+| `capacity` | no hace falta: el asistente lee el **Máx.** de cada recurso del juego y lo actualiza solo | `28000000` |
+| `builder_capacity` | *(opcional)* igual, para la aldea nocturna | `4700000` |
 | `min_loot` | botín mínimo para atacar una base | `1000000` |
 | `auto_build` | `true` si quieres que **mejore solo** esa cuenta | `true` |
 | `auto_build_until_th` | nivel de ayuntamiento en el que deja de mejorar | `10` |
@@ -112,7 +112,7 @@ Si una cuenta te sobra, bórrala (y sus pasos en `"routine"`). Guarda el archivo
 | **Llenar almacenes** | Ataca bases con buen botín hasta llegar al % objetivo. Si ya está lleno, pasa a lo siguiente. |
 | **Farmear** | Igual, pero como mucho N ataques por vuelta. |
 | **Llenar aldea nocturna** | Batallas de constructor hasta llenar la aldea nocturna (tope N por vuelta). |
-| **Mejorar lo recomendado** ⚠️ *experimental: desactivada por defecto, el juego cambió el panel de construcción y hay que adaptarla* | Abre el panel de constructores y pone a mejorar lo **recomendado** que se pueda pagar (nunca con gemas). Para al llegar a `auto_build_until_th`. |
+| **Mejorar lo recomendado** | Abre el panel de constructores y pone a mejorar lo **recomendado** que se pueda pagar (nunca con gemas). Para al llegar a `auto_build_until_th`. |
 
 ---
 

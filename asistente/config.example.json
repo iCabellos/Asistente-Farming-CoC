@@ -29,7 +29,15 @@
     },
     {
       "account": "Pequena",
+      "task": "build"
+    },
+    {
+      "account": "Pequena",
       "task": "fill_storages"
+    },
+    {
+      "account": "Pequena",
+      "task": "build"
     }
   ],
   "accounts": {
@@ -100,7 +108,7 @@
       "lightning_per_ad": 4,
       "lightning_total": 4,
       "full_ratio": 0.9,
-      "auto_build": false,
+      "auto_build": true,
       "auto_build_until_th": 10,
       "th_target": 7,
       "label": "Pequeña · TH6"
