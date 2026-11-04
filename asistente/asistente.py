@@ -80,7 +80,9 @@ def screen(img=None):
         return "upgrade", img
     # batalla primero: el botón rojo "Terminar batalla" (aldea principal y), en la nocturna, algo más arriba
     if is_red(color(img, 60, 780, 3)) or is_red(color(img, 60, 750, 3)):
-        return ("search" if is_orange(color(img, 1780, 820, 3)) else "battle"), img
+        # botón naranja «Siguiente»: el precio cambia de sitio según su longitud (350 / 1700), se miran varios puntos
+        orange = any(is_orange(color(img, x, y, 3)) for x, y in ((1780, 820), (1640, 815), (1640, 725), (1880, 815)))
+        return ("search" if orange else "battle"), img
     if is_green(color(img, 880, 945, 3)) and not is_yellow(color(img, 120, 1000)):
         return "result", img
     if is_yellow(color(img, 120, 1000)):
