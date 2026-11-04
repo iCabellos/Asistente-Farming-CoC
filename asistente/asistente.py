@@ -68,10 +68,11 @@ def check_stop():
 
 # ---------------- pantallas ----------------
 def upgrade_window(img):
-    """Ventana «¿Mejorar tu X al nivel N?» (panel blanco + X roja arriba a la derecha)."""
-    w = color(img, 1300, 500, 4)
-    x = color(img, 1720, 60, 3)
-    return min(w) > 225 and max(w) - min(w) < 12 and x[0] > 190 and x[1] < 160 and x[2] < 160
+    """Ventana «¿Mejorar tu X al nivel N?»: X roja arriba a la derecha y barra de título clara."""
+    a, b = color(img, 1725, 85, 3), color(img, 1665, 85, 3)
+    red = all(c[0] > 190 and c[1] < 90 and c[2] < 90 for c in (a, b))
+    frame = [color(img, x, y, 3) for x, y in ((185, 300), (1745, 700))]      # marco gris oscuro de la ventana
+    return red and all(max(c) < 110 and max(c) - min(c) < 25 for c in frame)
 
 
 def screen(img=None):
@@ -786,26 +787,27 @@ def _battle_sig(img):
 
 def wait_battle_end(stall_seconds=20, max_seconds=200, events=()):
     """Espera al resultado; si el botín y el % llevan stall_seconds quietos, termina la batalla.
-    events: [(instante, función)] que se ejecutan a su hora (habilidades, hielos…)."""
+    events: [(instante, función)] que se ejecutan a su hora (habilidades, hielos…). En cuanto sale la
+    pantalla de resultado se acaba, aunque queden eventos pendientes."""
     events = sorted(events, key=lambda e: e[0])
     t0 = time.time()
     last, since, fast = None, time.time(), False
     while time.time() - t0 < max_seconds:
+        kind, img = screen()
+        if kind == "result":
+            return
+        if kind == "home":                    # ya ha vuelto a la aldea
+            return
+        if not fast and speed_button(img):    # botón 1x del último minuto: x4 para acabar antes
+            tap(*SPEED_BTN, "velocidad x4", 0.5)
+            fast = True
         if events and events[0][0] <= time.time():
             try:
                 events.pop(0)[1]()
             except Exception as e:
                 log("warn", f"Evento de batalla falló: {e}")
-            if events and events[0][0] <= time.time():
-                time.sleep(1.2)              # atrasados: espaciados, no todos de golpe
-                continue
-        time.sleep(0.8 if events else 4)
-        kind, img = screen()
-        if kind == "result":
-            return
-        if not fast and speed_button(img):    # botón 1x del último minuto: x4 para acabar antes
-            tap(*SPEED_BTN, "velocidad x4", 0.5)
-            fast = True
+            continue
+        time.sleep(0.8 if events else 3)
         if any(not getattr(f, "is_snap", False) for _, f in events):
             continue                     # mientras queden habilidades/hielos no se da por parada
         sig = _battle_sig(img)
@@ -814,6 +816,8 @@ def wait_battle_end(stall_seconds=20, max_seconds=200, events=()):
         elif time.time() - since >= stall_seconds:
             log("think", f"Botín y daño quietos {stall_seconds} s: termino la batalla.")
             break
+    if screen()[0] == "result":
+        return
     tap(137, 805, "terminar batalla", 1.5)
     tap(1167, 693, "confirmar", 5)
     for _ in range(5):
@@ -1673,7 +1677,33 @@ def collect_resources():
         deselect()
 
 
-SEEN_BIG = {}
+BARS = {"main": (("gold", 1700, 57, (1380, 85, 1910, 240)), ("elixir", 1700, 130, (1380, 160, 1910, 315)),
+                 ("dark", 1750, 204, (1380, 235, 1910, 390))),
+        "builder": (("gold", 1560, 52, (1020, 80, 1910, 240)), ("elixir", 1700, 130, (1020, 160, 1910, 315)))}
+
+
+def read_capacity(acc, village="main"):
+    """Lee el máximo de cada recurso tocando su barra (ventana «Máx.») y lo guarda: si se amplían los
+    almacenes o aparece un recurso nuevo, no hay que tocar nada a mano."""
+    key = "capacity" if village == "main" else "builder_capacity"
+    a = CFG["accounts"].get(acc, {})
+    cap = dict(a.get(key) or {})
+    changed = False
+    for res, x, y, box in BARS[village]:
+        dev.tap(x, y, 0.9)
+        img = dev.shot()
+        d = eyes.ask(img.crop(box).resize(((box[2] - box[0]) * 2, (box[3] - box[1]) * 2)),
+                     'Lee el número blanco que va después de "Máx.:". Responde {"max": N} sin espacios; '
+                     '{"max": null} si no aparece ese texto.')
+        v = eyes._num(d.get("max"))
+        if v and v >= 1000 and v != cap.get(res):
+            log("think", f"{acc}: capacidad de {res}: {cap.get(res)} → {v}.")
+            cap[res] = int(v)
+            changed = True
+        dev.tap(1885, 425, 0.5)                # cierra la burbuja (borde del mapa, sin edificios ni botones)
+    if changed:
+        a[key] = cap
+        save_account_field(acc, key, cap)
 
 
 def note_resources(acc, res, village="main"):
@@ -1682,30 +1712,20 @@ def note_resources(acc, res, village="main"):
         st = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
     except (OSError, ValueError):
         st = {}
-    capkey = "capacity" if village == "main" else "builder_capacity"
-    cap = CFG["accounts"].get(acc, {}).get(capkey)
-    if cap:
-        for k in ("gold", "elixir", "dark"):
-            v = res.get(k)
-            # más de lo que «cabe»: han ampliado los almacenes → se aprende la capacidad nueva
-            # (con tope ×1,6 para no creerse una mala lectura)
-            big = v and cap.get(k) and v > cap[k] * 1.6
-            if big:                           # muy por encima: se acepta si se lee igual dos veces seguidas
-                seen = SEEN_BIG.get((acc, village, k))
-                SEEN_BIG[(acc, village, k)] = v
-                big = seen is not None and abs(seen - v) < 0.05 * v
-            if v and cap.get(k) and (cap[k] < v <= cap[k] * 1.6 or big):
-                log("think", f"{acc}: {k} {v} supera la capacidad apuntada ({cap[k]}): la actualizo.")
-                cap[k] = int(v)
-                save_account_field(acc, capkey, cap)
     allr = st.get("resources", {})
     allr[f"{acc}|{village}"] = {**{k: res.get(k) for k in ("gold", "elixir", "dark")}, "ts": time.time()}
     set_state(resources=allr)
 
 
 def storages_full(acc):
-    cap = CFG["accounts"][acc]["capacity"]
-    if not cap or not main_village():
+    if not main_village():
+        return False
+    try:
+        read_capacity(acc)                     # el máximo real, después de cada ataque
+    except Exception as e:
+        log("warn", f"No he podido leer la capacidad: {e}")
+    cap = CFG["accounts"][acc].get("capacity")
+    if not cap:
         return False
     res = eyes.my_resources(dev.shot())
     note_resources(acc, res)
@@ -1716,7 +1736,7 @@ def storages_full(acc):
     if focus:
         full = all((res.get(k) or 0) >= cap[k] * (dr if k == "dark" else r) for k in focus)
     else:
-        full = all((res.get(k) or 0) >= cap[k] * r for k in ("gold", "elixir")) and (res.get("dark") or 0) >= cap["dark"] * dr
+        full = all((res.get(k) or 0) >= cap[k] * r for k in ("gold", "elixir")) and (res.get("dark") or 0) >= cap.get("dark", 0) * dr
     log("think", f"{acc}: oro {res['gold']}/{cap['gold']}, elixir {res['elixir']}/{cap['elixir']}, "
                  f"oscuro {res['dark']}/{cap['dark']} → {'LLENO' if full else 'falta'}")
     return full
@@ -1888,6 +1908,10 @@ def bb_battle():
 def bb_storages(acc):
     """(lleno?, recursos) de la aldea nocturna según capacidad y % objetivo de la cuenta."""
     a = CFG["accounts"][acc]
+    try:
+        read_capacity(acc, "builder")
+    except Exception as e:
+        log("warn", f"No he podido leer la capacidad de la aldea nocturna: {e}")
     cap = a.get("builder_capacity")
     res = eyes.my_resources(dev.shot())
     note_resources(acc, res, "builder")
@@ -1955,22 +1979,45 @@ def builder_panel_open(img=None):
     return x[0] > 170 and x[1] < 90 and x[2] < 90 and tab[0] > 150 and 110 < tab[1] < 180
 
 
+ROW_PITCH = 85                     # distancia entre filas del panel
+
+
+def _brown_share(img, y0, y1):
+    box = img.crop((1500, y0, 1890, y1)).resize((39, max(1, (y1 - y0) // 2))).getdata()
+    return sum(1 for r, g, b in box if 120 < r < 215 and 85 < g < 175 and r - b > 35 and r - g > 15) / len(box)
+
+
 def panel_rows(img):
-    """Inicio (y) de las filas marrones de «Mejoras recomendadas»: el primer bloque de filas seguidas
-    tras las barras verdes de lo que ya se está mejorando."""
-    starts, prev = [], False
-    for y in range(70, 965, 2):
-        r, g, b = img.getpixel((1418, y))
-        brown = r > 110 and g < r
-        if brown and not prev:
-            starts.append(y)
-        prev = brown
-    block = starts[:1]
-    for y in starts[1:]:
-        if y - block[-1] > 100:                       # hueco grande = título «Otras mejoras»
-            break
-        block.append(y)
-    return block
+    """Filas de la primera sección del panel («Mejoras recomendadas»): [{top, new, gem, red}].
+    new = edificio nuevo (nombre en verde: hay que colocarlo), gem = cuesta gemas, red = no llega el dinero."""
+    top = next((y for y in range(130, 700, 2) if _brown_share(img, y, y + 12) > 0.45), None)
+    rows = []
+    while top is not None and top + 70 < 960 and _brown_share(img, top + 2, top + 14) > 0.45:
+        name = img.crop((1490, top + 6, 1800, top + 40)).getdata()
+        price = img.crop((1760, top + 34, 1885, top + 62)).getdata()
+        icon = img.crop((1880, top + 34, 1908, top + 62)).getdata()
+        rows.append({"top": top,
+                     "new": sum(1 for r, g, b in name if g > 190 and r < 190 and b < 130) > 40,
+                     "gem": sum(1 for r, g, b in icon if g > 150 and r < 150 and b < 120) > 25,
+                     "red": sum(1 for r, g, b in price if r > 200 and g < 90 and b < 90) > 15})
+        top += ROW_PITCH
+    return rows
+
+
+def cancel_placement(img):
+    """Si el juego dejó un edificio a medio colocar: pulsa su ✗ (cuadro rojo con cruz blanca). Nunca el ✓."""
+    px = img.load()
+    for y in range(160, 840, 6):
+        for x in range(320, 1380, 6):
+            r, g, b = px[x, y]
+            if r > 200 and g < 70 and b < 70 and x + 44 < img.width:
+                box = img.crop((x, y, x + 40, y + 40)).getdata()
+                red = sum(1 for c in box if c[0] > 190 and c[1] < 90 and c[2] < 90)
+                white = sum(1 for c in box if min(c) > 225)
+                if red > 500 and white > 80:
+                    tap(x + 20, y + 20, "cancelar colocación (✗)", 1.2)
+                    return True
+    return False
 
 
 def free_builders(img):
@@ -2017,49 +2064,30 @@ def build_recommended(acc):
         go_home()
         return
     started = 0
-    skip = set()                              # filas que no abren ventana de mejora (héroes: sólo centran la cámara)
-    for _ in range(7):                        # varias filas (algunas se saltan)
+    skip = set()                              # filas que no abrieron ventana en esta pasada
+    for _ in range(7):
         img = dev.shot()
         free, total = free_builders(img)
         if not free:
             log("think", f"{acc}: constructores ocupados ({free}/{total}).")
             break
         rows = panel_rows(img)
-        crop = img.crop((1405, 60, 1920, 960))
-        d = eyes.ask(crop, 'Panel "Estructuras y héroes" de Clash of Clans. Lista SOLO las filas de la sección '
-                           '"Mejoras recomendadas" (entre ese título y "Otras mejoras"), de arriba abajo, con su '
-                           'nombre, coste y recurso del coste según el icono (oro = moneda amarilla, elixir = gota '
-                           'rosa, oscuro = gota negra, gema = gema verde). '
-                           'Responde {"rows":[{"name":str,"cost":int,"res":"oro|elixir|oscuro|gema"}]}')
-        items = d.get("rows") or []
-        cand = []
-        for y0, it in zip(rows, items):
-            if str(it.get("res", "")).lower().startswith("gem"):
-                continue
-            icon = color(img, 1893, y0 + 38, 3)
-            if icon[1] > 150 and icon[0] < 140 and icon[2] < 140:      # icono de gema, aunque el LLM diga otra cosa
-                continue
-            txt = img.crop((1760, y0 + 22, 1880, y0 + 56)).getdata()
-            if sum(1 for r, g, b in txt if r > 200 and g < 90 and b < 90) > 15:   # cifra en rojo: no llega
-                continue
-            cand.append((y0, it))
+        cand = [r for r in rows if not (r["new"] or r["gem"] or r["red"]) and r["top"] not in skip]
+        log("think", f"{acc}: {len(rows)} mejoras recomendadas, {len(cand)} se pueden pagar. "
+                     f"Constructores libres: {free}/{total}.")
         if not cand:
-            log("think", f"{acc}: nada recomendado que se pueda pagar ahora.")
             break
-        cand = [c for c in cand if str(c[1].get("name")) not in skip]
-        if not cand:
-            log("think", f"{acc}: lo recomendado que queda no se puede mejorar desde aquí.")
-            break
-        y0, it = cand[0]
-        tap(1620, y0 + 38, f"elegir mejora recomendada: {it.get('name')} ({it.get('cost')} {it.get('res')})", 2)
+        row = cand[0]
+        tap(1620, row["top"] + 35, "elegir mejora recomendada", 2)
         win = dev.shot()
         if not upgrade_window(win):           # la ventana tarda en abrirse: un segundo más
             time.sleep(1.2)
             win = dev.shot()
-        if not upgrade_window(win):           # no salió la ventana (p. ej. un héroe): se salta y sigue con otra
+        if not upgrade_window(win):           # no salió: nada se confirma, se sigue con la siguiente fila
             win.save(HERE / "no_ventana_mejora.png")
-            skip.add(str(it.get("name")))
-            log("think", f"«{it.get('name')}» no abre ventana de mejora desde el panel: pruebo la siguiente.")
+            skip.add(row["top"])
+            log("warn", "Esa fila no abrió la ventana de mejora: la salto (captura en no_ventana_mejora.png).")
+            cancel_placement(win)
             go_home()
             tap(*BUILD_BTN, "reabrir mejoras", 2)
             continue
@@ -2086,6 +2114,7 @@ def build_recommended(acc):
         after = dev.shot()
         if builder_panel_open(after) or screen(after)[0] == "home":
             started += 1
+            skip.clear()
             log("done", f"{acc}: mejora iniciada → {name} nivel {lvl}.")
             if "ayuntamiento" in name.lower() and lvl:
                 a["th_target"] = lvl
