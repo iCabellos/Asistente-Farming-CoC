@@ -1,0 +1,26 @@
+# entorno y cachés
+.venv/
+__pycache__/
+*.pyc
+*.tmp
+*.bak*
+
+# tu configuración personal (cuentas): se crea desde asistente/config.example.json
+asistente/config.json
+
+# estado y registros de cada ejecución
+asistente/estado.json
+asistente/ENABLED
+asistente/STOP
+asistente/SKIP_REST
+asistente/PAUSA_DUENO
+asistente/*.out
+asistente/*.png
+asistente/ultimo_ataque/
+asistente/sin_aereas/
+log.jsonl
+loot.jsonl
+*.out
+
+# accesos directos locales
+*.lnk

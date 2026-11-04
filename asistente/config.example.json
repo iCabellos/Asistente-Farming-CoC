@@ -1,0 +1,109 @@
+{
+  "adb": "adb",
+  "serial": "127.0.0.1:5555",
+  "ollama": "http://127.0.0.1:11434",
+  "model": "qwen2.5vl:7b",
+  "bluestacks_player": "C:/Program Files/BlueStacks_nxt/HD-Player.exe",
+  "bluestacks_instance": "Pie64",
+  "rest_minutes_between_cycles": 2,
+  "rest_minutes_when_full": 30,
+  "owner_pause_minutes": 45,
+  "donation_check_minutes": 4,
+  "home_account": "Principal",
+  "full_ratio": 0.9,
+  "dark_full_ratio": 0.5,
+  "max_attacks_per_account": 15,
+  "routine": [
+    {
+      "account": "Principal",
+      "task": "fill_storages"
+    },
+    {
+      "account": "Secundaria",
+      "task": "fill_storages"
+    },
+    {
+      "account": "Secundaria",
+      "task": "builder_base",
+      "attacks": 10
+    },
+    {
+      "account": "Pequena",
+      "task": "fill_storages"
+    }
+  ],
+  "accounts": {
+    "Principal": {
+      "village_name": "NOMBRE DE LA ALDEA (como sale arriba a la izquierda)",
+      "switch_label": "NOMBRE DE LA TARJETA EN SUPERCELL ID",
+      "capacity": {
+        "gold": 28000000,
+        "elixir": 31000000,
+        "dark": 500000
+      },
+      "min_loot": {
+        "gold": 1000000,
+        "elixir": 1000000,
+        "dark": 25000,
+        "mode": "gold_and_elixir_or_dark"
+      },
+      "max_searches": 25,
+      "lightning_per_ad": 3,
+      "lightning_total": 0,
+      "full_ratio": 0.95,
+      "dark_full_ratio": 0.85,
+      "donor": true,
+      "request_message": "Superdragon y globos por favor. Gracias!",
+      "label": "Principal · TH18"
+    },
+    "Secundaria": {
+      "village_name": "NOMBRE DE LA ALDEA",
+      "switch_label": "NOMBRE EN SUPERCELL ID",
+      "capacity": {
+        "gold": 17000000,
+        "elixir": 17000000,
+        "dark": 300000
+      },
+      "builder_capacity": {
+        "gold": 6500000,
+        "elixir": 6500000
+      },
+      "builder_full_ratio": 0.95,
+      "min_loot": {
+        "gold": 700000,
+        "elixir": 700000,
+        "dark": 9000,
+        "mode": "gold_and_elixir_or_dark"
+      },
+      "max_searches": 25,
+      "lightning_per_ad": 3,
+      "lightning_total": 10,
+      "full_ratio": 0.9,
+      "dark_full_ratio": 0.5,
+      "label": "Secundaria · TH13"
+    },
+    "Pequena": {
+      "village_name": "NOMBRE DE LA ALDEA",
+      "switch_label": "NOMBRE EN SUPERCELL ID",
+      "capacity": {
+        "gold": 1175000,
+        "elixir": 2000000,
+        "dark": 0
+      },
+      "min_loot": {
+        "gold": 80000,
+        "elixir": 80000,
+        "dark": 0,
+        "mode": "gold_or_elixir"
+      },
+      "max_searches": 15,
+      "lightning_per_ad": 4,
+      "lightning_total": 4,
+      "full_ratio": 0.9,
+      "auto_build": false,
+      "auto_build_until_th": 10,
+      "th_target": 7,
+      "label": "Pequeña · TH6"
+    }
+  }
+}
