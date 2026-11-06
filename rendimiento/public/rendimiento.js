@@ -49,11 +49,23 @@ const PAGES = {
   miembros: ['Miembros', 'Quién hay en el clan, si está en guerra ahora y cómo le está yendo. Cambia entre jugadores y cuentas con «Ver por».'],
   guerras: ['Guerras normales', 'Guerras fuera de la liga. Cada jugador tiene 2 ataques. Aquí no entran las rondas de liga.'],
   ligas: ['Ligas', 'Liga de Guerras de Clanes: 8 clanes, 7 rondas y 1 ataque por jugador en cada ronda. Aquí no entran las guerras normales.'],
+  escenarios: ['Escenarios de liga', 'Dónde podemos acabar esta liga, qué hace falta para cada puesto y cómo va cambiando día a día. Se actualiza solo con cada recogida.'],
   admin: ['Administración', 'Cuentas ligadas a cada jugador, clan que se sigue, recogidas de datos y acceso.'],
   jugador: ['Ficha de la cuenta', 'Todo sobre una cuenta: cómo ataca, cómo defiende y su evolución. Usa «Este clan» o «Todo su historial» para cambiar qué guerras cuentan.'],
   persona: ['Ficha del jugador', 'Una persona con todas sus cuentas: sus KPIs son la media de las cuentas que han jugado guerras, y cada cuenta mantiene los suyos.'],
 };
 const DESC = {
+  eplan: ['Quién ataca a quién para sacar el mayor número de plenos, con el % de cada ataque. Nadie ataca por encima de su puesto. Se recalcula con cada recogida.'],
+  echat: ['Avisos listos para el chat del clan: copia un bloque, pégalo en el juego y ya. Van de 5 en 5, empezando por el jugador más bajo. Las reservas no salen: esperan y rematan.'],
+  epos: ['Cada puesto, en verde si ya está asegurado, en ámbar si es posible y en rojo si está descartado. Pulsa uno para ver qué hace falta.'],
+  etab: ['Cómo va el grupo ahora, con qué estrellas se espera que acabe cada clan y entre qué puestos puede moverse.'],
+  elog: ['Lo que ha pasado cada ronda y si cada guerra nos ha ayudado o no a mejorar nuestro puesto.'],
+  egam: ['Lo que queda por jugar y cómo de difícil es, para nosotros y para quien nos disputa el puesto.'],
+  eban: ['Qué cambios de alineación convienen en cada ronda, cuántas estrellas se ganan y a qué base debería atacar cada cuenta.'],
+  ewhat: ['Prueba resultados y mira al momento en qué puesto acabaríamos. No cambia ningún dato: es solo para hacer tus cuentas.'],
+  eniv: ['El nivel real de cada clan según sus ataques y defensas en esta liga, teniendo en cuenta sus ayuntamientos.'],
+  ecalc: ['Las fórmulas que hay detrás de cada cifra y hasta qué punto fiarse de ellas.'],
+  aliga: ['Cuántos clanes suben y bajan en tu liga, y qué cuentas no van a atacar. Al guardar se recalculan los escenarios.'],
   ranking: ['Ordenado por índice. Cambia entre jugadores y cuentas con «Ver por». Pulsa una fila para ver sus cuentas y cómo le va en liga y en normales.'],
   grupos: ['Arrastra las cuentas para decir de quién es cada una. El jugador recibe la media de sus cuentas y cada cuenta sigue teniendo sus propios KPIs. Se guarda solo.'],
   aclan: ['El clan que sigue la web. Al cambiarlo se recogen sus datos; el histórico del clan anterior se conserva.'],
@@ -93,7 +105,7 @@ const LG_STRIP = `<span class="lg-title">Últimos ataques</span>${key('sw s3', '
 const LG_LEVELS = `<span class="lg-title">Nivel según el índice</span>${key('sw', 'Élite 85+', 'background:var(--tblr-green)')}${key('sw', 'Sólido 70+', 'background:var(--tblr-azure)')}${key('sw', 'Irregular 50+', 'background:var(--tblr-yellow)')}${key('sw', 'En riesgo', 'background:var(--tblr-red)')}`;
 const LG_HEAT = `<span class="lg-title">Color</span>${key('sw', 'Pocas estrellas', 'background:rgba(176,124,14,.2)')}${key('sw', 'Muchas', 'background:rgba(176,124,14,.8)')}<span class="lg">«!» = ataque sin usar</span><span class="lg">Celda vacía = no jugó</span>`;
 const LG_CARD = `<span class="lg-title">Barra</span>${key('sw', 'Estrellas nuestras', 'background:#b07c0e')}${key('sw', 'Del rival', 'background:#a855f7')}<span class="lg-title">Borde superior</span>${key('sw', 'Victoria', 'background:var(--tblr-green)')}${key('sw', 'Derrota', 'background:var(--tblr-red)')}`;
-const LG_BULLET = compare => `<span class="lg-title">Barra</span>${key('sw', 'Valor actual; llena = objetivo cumplido', 'background:#b07c0e')}${compare ? key('sw', 'Media del clan', 'background:#a855f7;width:3px') : ''}`;
+const LG_BULLET = compare => `<span class="lg-title">Barra</span>${key('sw', 'Valor actual; llena = objetivo cumplido (en estrellas otorgadas al rival, vacía)', 'background:#b07c0e')}${compare ? key('sw', 'Media del clan', 'background:#a855f7;width:3px') : ''}`;
 const LG_TRACK = `${key('sw round', 'Victoria', 'background:var(--tblr-green)')}${key('sw round', 'Derrota', 'background:var(--tblr-red)')}${key('sw round', 'En batalla', 'box-shadow:inset 0 0 0 2px var(--tblr-green)')}${key('sw round', 'Preparación', 'box-shadow:inset 0 0 0 2px var(--tblr-secondary)')}${key('sw round s0', 'Pendiente')}`;
 const LEGENDS = {ranking: LG_LEVELS + LG_STRIP, llist: LG_CARD, wlist: LG_CARD, lheat: LG_HEAT, wheat: LG_HEAT, kpis: LG_BULLET(false), pkpi: LG_BULLET(true), okpi: LG_BULLET(true)};
 const legendBar = (...parts) => `<div class="card mb-3"><div class="legend-row border-0"><span class="lg-title">Estado</span>${parts.join('')}</div></div>`;
@@ -116,11 +128,16 @@ function strip(wars) {
   return cells.length ? `<span class="strip">${cells.slice(-10).map(c => `<i class="${c[0]}" title="${esc(c[1])}"></i>`).join('')}</span>` : '<span class="text-secondary">–</span>';
 }
 function bullet(k, c, compare) {
-  const s = c.scores[k.id], v = c.values[k.id], mark = compare && compare.scores[k.id];
-  const st = s == null ? ['text-secondary', 'ti-minus', 'Sin datos'] : s >= 100 ? ['text-green', 'ti-circle-check', 'Cumple'] : s >= 70 ? ['text-yellow', 'ti-alert-circle', 'Cerca'] : ['text-red', 'ti-alert-triangle', 'Lejos'];
-  return `<div class="bullet" title="${esc(k.help)}"><div class="d-flex align-items-baseline gap-2"><span class="fw-medium">${esc(k.name)}</span><span class="ms-auto fw-bold">${fmtKpi(k, v)}</span><span class="small ${st[0]}" style="width:4.6rem"><i class="ti ${st[1]} me-1"></i>${st[2]}</span></div>
-    <div class="bullet-track"><div class="bullet-fill" style="width:${s || 0}%"></div>${mark != null ? `<div class="bullet-mark" style="left:${mark}%" title="Media del clan"></div>` : ''}</div>
-    <div class="small text-secondary">Objetivo ${fmtKpi(k, k.target)}${k.target < k.floor ? " · menos es mejor" : ""}${compare ? ` · clan ${fmtKpi(k, compare.values[k.id])}` : ''}</div></div>`;
+  const s = c.scores[k.id], v = c.values[k.id];
+  const given = k.id === 'defensa' && c.def_max > 0;     // estrellas otorgadas: total frente al máximo de las guerras jugadas
+  const low = k.target < k.floor, near = low ? 50 : 70;
+  // Si menos es mejor la barra enseña la cantidad real: de 0 al peor valor, y la marca del clan en esa misma escala.
+  const at = x => x == null ? null : Math.max(0, Math.min(100, 100 * (x - k.target) / (k.floor - k.target)));
+  const fill = low ? at(v) : s, mark = compare ? (low ? at(compare.values[k.id]) : compare.scores[k.id]) : null;
+  const st = s == null ? ['text-secondary', 'ti-minus', 'Sin datos'] : s >= 100 ? ['text-green', 'ti-circle-check', 'Cumple'] : s >= near ? ['text-yellow', 'ti-alert-circle', 'Cerca'] : ['text-red', 'ti-alert-triangle', 'Lejos'];
+  return `<div class="bullet" title="${esc(k.help)}"><div class="d-flex align-items-baseline gap-2"><span class="fw-medium">${esc(k.name)}</span><span class="ms-auto fw-bold">${given ? `${c.def_total} ★ de ${c.def_max}` : fmtKpi(k, v)}</span><span class="small ${st[0]}" style="width:4.6rem"><i class="ti ${st[1]} me-1"></i>${st[2]}</span></div>
+    <div class="bullet-track"><div class="bullet-fill" style="width:${fill || 0}%"></div>${mark != null ? `<div class="bullet-mark" style="left:${mark}%" title="Media del clan"></div>` : ''}</div>
+    <div class="small text-secondary">Objetivo ${fmtKpi(k, k.target)}${low ? ' · menos es mejor' : ''}${compare ? ` · clan ${given && compare.values[k.id] != null ? dec(compare.values[k.id] * c.def_max / 3, 1) + ' ★' : fmtKpi(k, compare.values[k.id])}` : ''}</div></div>`;
 }
 const bullets = (K, c, compare) => `<div class="row g-4"><div class="col-lg-6">${K.slice(0, 4).map(k => bullet(k, c, compare)).join('')}</div><div class="col-lg-6">${K.slice(4).map(k => bullet(k, c, compare)).join('')}</div></div>`;
 function tracker(rounds, live) {
@@ -167,9 +184,9 @@ function chart(id, title, sub, opts = {}) {
 }
 const chartRow = html => `<div class="card-body"><div class="row g-4">${html}</div></div>`;
 // Sección desplegable: recuerda si estaba abierta y sólo dibuja sus gráficas al abrirse.
-const CLOSED = new Set(['calculo']);
+const CLOSED = new Set(['calculo', 'ecalc']);
 // En el teléfono se abren plegadas las secciones largas o de consulta, para llegar antes a lo importante.
-const CLOSED_MOBILE = new Set(['kpis', 'graficas', 'mgraf', 'wgraf', 'lgraf', 'ljug', 'lhist', 'wother', 'prival', 'pdef', 'pritmo', 'phcwl', 'phwar', 'ocmp']);
+const CLOSED_MOBILE = new Set(['egam', 'eban', 'ewhat', 'eniv', 'kpis', 'graficas', 'mgraf', 'wgraf', 'lgraf', 'ljug', 'lhist', 'wother', 'prival', 'pdef', 'pritmo', 'phcwl', 'phwar', 'ocmp']);
 const isMobile = () => matchMedia('(max-width:767.98px)').matches;
 function sec(id, title, sub, body, open, draw_) {
   if (draw_) drawers[id] = draw_;
@@ -360,6 +377,7 @@ function renderAdmin(d) {
     ${sec('grupos', 'Cuentas ligadas a cada jugador', '', ownerBoard(d), true)}
     ${sec('aclan', 'Clan', '', `<div class="card-body"><form class="d-flex flex-wrap gap-2" id="adminTag" style="max-width:26rem"><input class="form-control flex-fill" style="width:auto" id="adminTagInput" value="${esc(a.clan_tag || '')}" aria-label="Tag del clan" autocomplete="off" autocapitalize="characters"><button class="btn btn-primary" type="submit">Cambiar clan</button></form>
       <div class="small text-secondary mt-2">Ahora: ${esc(d.clan?.name || '–')} · ${plural(a.members, 'cuenta', 'cuentas')}</div></div>`, true)}
+    ${esAdminSection(a)}
     ${sec('arec', 'Recogida de datos', '', `<div class="card-body"><div class="d-flex flex-wrap align-items-center gap-2 mb-3"><div>Última completa: <b>${when(a.full_ts)}</b></div><button class="btn btn-primary ms-md-auto" id="adminSync"><i class="ti ti-refresh me-1"></i>Recoger ahora</button></div>
       ${a.error ? `<div class="alert alert-warning">${esc(a.error)}</div>` : ''}
       <div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>Cuándo</th><th>Tipo</th><th class="text-end">Cuentas</th><th class="text-end">Fallidas</th></tr></thead><tbody>${a.log.map(l => `<tr><td>${when(l.ts)}</td><td>${source[l.source] || esc(l.source)}</td><td class="text-end">${l.players}</td><td class="text-end ${l.failed ? 'text-red fw-bold' : 'text-secondary'}">${l.failed}</td></tr>`).join('') || `<tr><td colspan="4">${empty('Aún no hay recogidas')}</td></tr>`}</tbody></table></div></div>`, true)}
@@ -370,10 +388,11 @@ function renderAdmin(d) {
   wireBoard();
   const done = t => () => { toast(`<i class="ti ti-check me-1"></i>${t}`); load(); }, fail = err => toast(esc(err.message), 'danger');
   document.getElementById('adminOut')?.addEventListener('click', () => { sessionStorage.removeItem('clave'); load(); });
-  $('adminSync').onclick = e => { e.currentTarget.disabled = true; toast('Recogiendo datos…', 'info'); api('api/sync', {}).then(done('Recogida lanzada')).catch(fail); };
+  $('adminSync').onclick = e => { e.currentTarget.disabled = true; watchProgress(12000); api('api/sync', {}).then(j => { if (!j.started) toast('Ya hay una recogida en marcha', 'secondary'); }).catch(fail); };
   $('adminTag').onsubmit = e => { e.preventDefault(); const tag = $('adminTagInput').value.trim();
     if (tag === a.clan_tag || !confirm(`¿Seguir el clan ${tag}? La web pasará a enseñar sus datos.`)) return;
     api('api/tag', {clan_tag: tag}).then(done('Clan cambiado')).catch(fail); };
+  esAdminWire(done, fail);
   $('adminKey').onsubmit = e => { e.preventDefault(); api('api/key', {key: $('adminKeyInput').value}).then(done('Clave guardada')).catch(fail); };
   const pf = document.getElementById('adminPass');
   if (pf) pf.onsubmit = e => { e.preventDefault(); const user = $('passUser').value.trim(), password = $('passNew').value;
@@ -610,14 +629,14 @@ window.addEventListener('resize', fitCtx);
 function paint() {
   const d = S.data; if (!d) return;
   clearCharts();
-  $('clanFilters').classList.toggle('d-none', ['ligas', 'admin'].includes(S.sub));
+  $('clanFilters').classList.toggle('d-none', ['ligas', 'escenarios', 'admin'].includes(S.sub));
   const fixedKind = S.sub === 'guerras';                  // Guerras normales sólo enseña normales: no hay tipo que elegir
   $('clanKind').classList.toggle('d-none', fixedKind); $('clanKindLabel').classList.toggle('d-none', fixedKind);
   $('clanBy').classList.toggle('d-none', !['resumen', 'miembros'].includes(S.sub));
   $('clanBy').querySelectorAll('[data-by]').forEach(b => { b.classList.toggle('btn-primary', b.dataset.by === S.by); b.classList.toggle('btn-ghost-secondary', b.dataset.by !== S.by); });
   $('clanTabs').querySelectorAll('.nav-link').forEach(a => a.classList.toggle('active', a.dataset.v === (['jugador', 'persona'].includes(S.sub) ? 'miembros' : S.sub)));
   if (d.clan) { $('clanName').textContent = d.clan.name; $('clanMeta').textContent = `${d.clan.tag}${d.clan.season ? ' · ' + (d.clan.season.league || '') : ''}`; }
-  ({resumen: renderResumen, miembros: renderMembers, guerras: renderWars, ligas: renderLeagues, jugador: renderPlayer, persona: renderOwner, admin: renderAdmin})[S.sub](d);
+  ({resumen: renderResumen, miembros: renderMembers, guerras: renderWars, ligas: renderLeagues, escenarios: renderEscenarios, jugador: renderPlayer, persona: renderOwner, admin: renderAdmin})[S.sub](d);
   const page = PAGES[S.sub];
   $('clanView').insertAdjacentHTML('afterbegin', `<div class="page-intro"><h2 class="mb-1">${page[0]}</h2><p class="text-secondary mb-3">${page[1]}</p></div>`);
   cardTables();
@@ -625,9 +644,40 @@ function paint() {
   drawOpen();
   if (S.enter) { S.enter = false; $('clanView').classList.remove('fade-in'); void $('clanView').offsetWidth; $('clanView').classList.add('fade-in'); }
 }
+// ---------- avance de los cálculos: el trabajo corre aparte y la web sólo mira por dónde va
+function paintProgress(p) {
+  const box = $('clanProgress'), on = !!p?.active;
+  box.classList.toggle('d-none', !on);
+  if (!on) return;
+  const who = {diaria: 'Recogida automática', panel: 'Recogida manual', admin: 'Recálculo'}[p.source] || 'Cálculo';
+  box.innerHTML = `<div class="d-flex flex-wrap align-items-baseline gap-2"><b class="me-1"><i class="ti ti-refresh spin me-1"></i>${esc(p.label)}</b>${p.detail ? `<span class="small text-secondary">${esc(p.detail)}</span>` : ''}<b class="ms-auto">${num(p.pct)} %</b></div>
+    <div class="progress progress-sm mt-1" role="progressbar" aria-label="Avance del cálculo" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${p.pct}"><div class="progress-bar" style="width:${p.pct}%"></div></div>
+    <div class="small text-secondary mt-1">${esc(who)} · fase ${num(p.step)} de ${num(p.steps?.length)}. ${S.data ? 'Lo que ves es de la recogida anterior: se actualizará solo al terminar.' : 'Los datos aparecerán solos al terminar.'}</div>`;
+  const list = document.getElementById('esSteps');
+  if (list) list.innerHTML = esSteps(p);
+}
+function watchProgress(wait = 0) {
+  S.expect = Math.max(S.expect || 0, Date.now() + wait);    // recién lanzado, puede tardar en dar señales
+  if (S.watching) return;
+  S.watching = true;
+  let seen = false, misses = 0;
+  const tick = () => api('api/progress').then(p => {
+    if (!('active' in p) && seen && ++misses <= 6) { setTimeout(tick, 1500); return; }   // una lectura fallida no significa que haya acabado
+    misses = 0;
+    S.progress = p;
+    if (p.active) { seen = true; paintProgress(p); setTimeout(tick, 1500); return; }
+    if (Date.now() < S.expect) { setTimeout(tick, 1000); return; }
+    S.watching = false; paintProgress(null);
+    if (!seen) return;
+    if (p.ok === false) toast(esc(p.error || 'El cálculo no terminó'), 'danger'); else toast('<i class="ti ti-check me-1"></i>Datos actualizados');
+    S.fresh = true; load();
+  }).catch(() => setTimeout(tick, 3000));
+  tick();
+}
 function url() {
   if (S.sub === 'guerras') return `api/wars?kind=war&days=${S.days}`;
   if (S.sub === 'ligas') return 'api/leagues';
+  if (S.sub === 'escenarios') return 'api/escenarios';
   if (S.sub === 'jugador') return `api/player?tag=${encodeURIComponent(S.tag)}&scope=${S.scope}&${q()}`;
   if (S.sub === 'persona') return `api/owner?id=${encodeURIComponent(S.tag)}&scope=${S.scope}&${q()}`;
   return `api/overview?${q()}${S.sub === 'admin' ? '&fresh=1' : ''}`;
@@ -635,8 +685,11 @@ function url() {
 function load() {
   const seq = ++S.seq;
   const admin = S.sub === 'admin' && canEdit() ? api('api/admin', {}).catch(() => new Promise(r => setTimeout(r, 1300)).then(() => api('api/admin', {}))).catch(() => { sessionStorage.removeItem('clave'); return null; }) : null;   // un reintento antes de cerrar la sesión
-  return Promise.all([api(url()), admin]).then(([d, info]) => {
+  const to = url() + (S.fresh ? `${url().includes('?') ? '&' : '?'}fresh=1` : '');
+  S.fresh = false;
+  return Promise.all([api(to), admin]).then(([d, info]) => {
     d.admin = info;
+    if (d.progress?.active) { S.progress = d.progress; watchProgress(); }
     if (seq !== S.seq || S.dragging) return;    // llegó otra petición más nueva, o repintar cortaría el arrastre
     S.stamp = d.meta.stamp; S.syncing = d.meta.syncing; S.cloud = d.meta.cloud;
     paintHead(d.meta);
@@ -649,13 +702,14 @@ function load() {
 function poll() {
   api('api/status').then(m => {
     paintHead(m); S.cloud = m.cloud;
+    if (m.progress?.active) watchProgress();
     if (m.stamp !== S.stamp) load(); else S.syncing = m.syncing;
   }).catch(() => {}).finally(() => setTimeout(poll, S.cloud ? 600000 : 15000));   // en la nube cada consulta gasta cuota
 }
 window.Clan = {
   show() {
     const [sub, tag] = location.hash.slice(1).split('/');
-    S.sub = ['resumen', 'miembros', 'guerras', 'ligas', 'jugador', 'persona', 'admin'].includes(sub) ? sub : 'resumen';
+    S.sub = ['resumen', 'miembros', 'guerras', 'ligas', 'escenarios', 'jugador', 'persona', 'admin'].includes(sub) ? sub : 'resumen';
     S.tag = sub === 'jugador' && tag ? '#' + decodeURIComponent(tag) : sub === 'persona' && tag ? decodeURIComponent(tag) : null;
     S.openWar = S.openRow = null; S.data = null; clearCharts(); $('clanView').innerHTML = skeleton(); S.enter = true;
     if (['jugador', 'persona'].includes(S.sub) && !S.tag) S.sub = 'miembros';
@@ -686,9 +740,10 @@ $('clanView').addEventListener('click', e => {
 $('clanView').addEventListener('keydown', e => {
   if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('[data-war]')) { e.preventDefault(); const w = e.target.dataset.war; e.target.click(); document.querySelector(`[data-war="${w}"]`)?.focus(); }
 });
-$('clanRefresh').onclick = () => { $('clanRefresh').disabled = true; $('clanSync').innerHTML = '<i class="ti ti-refresh spin me-1"></i>Recogiendo datos…';
-  api('api/sync', {}).then(j => { toast(j.started ? 'Recogiendo datos…' : 'Ya hay una recogida en marcha', j.started ? 'info' : 'secondary'); S.syncing = true; if (S.cloud) load(); }).catch(e => { toast(esc(e.message), 'danger'); load(); }); };
+$('clanRefresh').onclick = () => { $('clanRefresh').disabled = true; $('clanSync').innerHTML = '<i class="ti ti-refresh spin me-1"></i>Recogiendo datos…'; watchProgress(12000);
+  api('api/sync', {}).then(j => { if (!j.started) toast('Ya hay una recogida en marcha', 'secondary'); S.syncing = true; }).catch(e => { toast(esc(e.message), 'danger'); load(); }); };
 window.addEventListener('hashchange', () => Clan.show());
+esBind({S, dec, plural, empty, sec, hash, paint, watchProgress});
 Clan.show();
 $('clanForm').onsubmit = e => { e.preventDefault();
   api('api/tag', {clan_tag: $('clanTagInput').value}).then(() => { toast('<i class="ti ti-check me-1"></i>Clan guardado; recogiendo datos…'); load(); }).catch(err => toast(esc(err.message), 'danger')); };

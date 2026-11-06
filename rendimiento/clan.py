@@ -28,6 +28,8 @@ from urllib.parse import quote
 import httpx
 
 import almacen
+import liga
+import modelo
 
 ACCOUNTS = Path(__file__).parent.parent / "asistente" / "config.json"
 API = os.environ.get("CLASHKING_API", "https://api.clashk.ing")
@@ -39,6 +41,8 @@ GROUP_ID_RE = re.compile(r"^[a-z0-9]{1,16}$")
 ROSTER_DAYS = 180     # quien jugó con el clan en estos días cuenta como miembro
 LIGHT_S = 1800        # con el panel abierto, refresco ligero cada 30 min
 MIN_ATTACKS = 3       # con menos ataques posibles se marca «Pocos datos»
+VILLAGE_DAYS, HISTORY_DAYS = 3, 6     # cada cuánto se renueva lo que se sabe de un jugador de la liga
+INTEL_SECONDS = 120   # tiempo máximo por recogida para renovarlo
 DAILY_HOUR, DAILY_MINUTE = 11, 1
 
 # Sistema de KPIs. Nota 0–100: lineal entre `floor` (0) y `target` (100). Si un KPI no se puede medir,
@@ -59,7 +63,7 @@ KPIS = [
     {"id": "exigencia", "name": "Contra TH igual o mayor", "unit": "★", "weight": 5, "floor": 1, "target": 2.4,
      "help": "Estrellas medias contra rivales de su TH o superior"},
     {"id": "defensa", "name": "Estrellas otorgadas al rival", "unit": "★", "weight": 5, "floor": 3, "target": 0,
-     "help": "Media que le sacan por defensa: cuanto más cerca de 0, mejor"},
+     "help": "Estrellas que le sacan por guerra jugada; si nadie le ataca cuenta 0. Lo mejor es 0 y lo peor 3 por guerra"},
     {"id": "constancia", "name": "Guerras completas", "unit": "%", "weight": 5, "floor": 40, "target": 100,
      "help": "Guerras en las que usó todos sus ataques"},
 ]
@@ -80,6 +84,11 @@ CREATE TABLE IF NOT EXISTS player_seasons(player TEXT, season TEXT, clan_name TE
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS moves(ts INT, tag TEXT, name TEXT, kind TEXT);
 CREATE INDEX IF NOT EXISTS plays_end ON plays(end_ts);
+CREATE TABLE IF NOT EXISTS book(a TEXT, d TEXT, end_ts REAL, ord INT, a_th INT, d_th INT, a_pos INT, d_pos INT, size INT, cwl INT, stars INT, pct REAL, fresh INT, clan TEXT,
+  PRIMARY KEY(a, d, end_ts, ord));
+CREATE TABLE IF NOT EXISTS war_use(tag TEXT, end_ts REAL, cwl INT, per INT, used INT, PRIMARY KEY(tag, end_ts));
+CREATE TABLE IF NOT EXISTS village(tag TEXT PRIMARY KEY, ts INT, data TEXT);
+CREATE TABLE IF NOT EXISTS intel(tag TEXT PRIMARY KEY, ts INT);
 """
 _running = threading.Lock()
 
@@ -115,6 +124,59 @@ def api_key():
     return settings().get("api_key") or os.environ.get("COC_API_KEY")
 
 
+class NotFound(RuntimeError):
+    pass
+
+
+# ---------------- avance de los cálculos ----------------
+# Una recogida o un recálculo tardan: se publica por qué parte van y la web lo enseña a quien la tenga abierta,
+# también si lo lanzó el cron. Cada fase ocupa un tramo de la barra según lo que suele tardar.
+STAGES = {"recoger": (0, 12, "Recogiendo guerras del clan"), "jugadores": (12, 30, "Actualizando jugadores"), "grupo": (30, 36, "Bajando el grupo de liga"),
+          "aldeas": (36, 54, "Revisando aldeas e historial"), "modelo": (54, 68, "Entrenando el modelo de ataques"), "plan": (68, 72, "Calculando el plan de ataque"),
+          "sim": (72, 90, "Simulando la liga"), "rondas": (90, 96, "Repasando las rondas jugadas"), "publicar": (96, 100, "Publicando los resultados")}
+STALLED_S = 150           # sin noticias en este tiempo, el trabajo se dio por muerto (una función cortada no avisa)
+
+
+class Progress:
+    def __init__(self, source, quiet=False, first="recoger"):
+        self.source, self.quiet, self.first = source, quiet, first
+        self.names = list(STAGES)
+        self.names = self.names[self.names.index(first):]
+        self.start = STAGES[first][0]
+        self.stage, self.pct, self.last, self.t0 = None, 0, 0.0, int(time.time())
+        self.gap = 2.5 if almacen.EN_NUBE else .4    # cada aviso en la nube gasta una operación del almacén
+        self.lock = threading.Lock()
+
+    def __call__(self, stage, frac=0.0, detail=None):
+        if self.quiet or stage not in self.names:
+            return
+        with self.lock:
+            a, b, _ = STAGES[stage]
+            raw = a + (b - a) * max(0.0, min(1.0, frac))
+            self.pct = max(self.pct, int(100 * (raw - self.start) / (100 - self.start)))    # la barra nunca retrocede
+            changed, self.stage = stage != self.stage, stage
+            if changed or time.time() - self.last >= self.gap:
+                self.last = time.time()
+                self._send(True, detail)
+
+    def _send(self, active, detail=None, **extra):
+        stage = self.stage or self.first
+        almacen.guardar_progreso({"active": active, "pct": self.pct, "stage": stage, "label": STAGES[stage][2], "detail": detail, "source": self.source, "started": self.t0, "updated": int(time.time()),
+                                  "step": self.names.index(stage) + 1, "steps": [STAGES[n][2] for n in self.names], **extra})
+
+    def finish(self, ok=True, error=None):
+        if not self.quiet:
+            self.pct = 100 if ok else self.pct
+            self._send(False, ok=ok, error=error)
+
+
+def progress_state():
+    p = almacen.leer_progreso()
+    if p.get("active") and time.time() - p.get("updated", 0) > STALLED_S:
+        return {**p, "active": False, "ok": False, "error": "La última recogida se cortó antes de terminar."}
+    return p
+
+
 def official(path, key=None):
     """API oficial de Supercell. Sus errores se explican para poder arreglarlos desde el panel."""
     try:
@@ -133,6 +195,8 @@ def official(path, key=None):
         raise RuntimeError("Supercell rechaza la clave. Revisa que esté bien copiada y que siga activa.")
     if r.status_code == 503:
         raise RuntimeError("El juego está en mantenimiento; se reintenta en la próxima recogida.")
+    if r.status_code == 404:
+        raise NotFound("La API oficial no lo encuentra.")
     raise RuntimeError(f"La API oficial respondió {r.status_code}.")
 
 
@@ -180,9 +244,15 @@ def admin_info():
     try:
         cfg = settings().get("admin")
         return {**meta_info(c), "user": cfg["user"] if cfg else "admin", "default": not cfg, "log": meta_get(c, "sync_log", [])[:8],
-                "members": c.execute("SELECT COUNT(*) n FROM players WHERE roster=1").fetchone()["n"]}
+                "members": c.execute("SELECT COUNT(*) n FROM players WHERE roster=1").fetchone()["n"], "liga": _liga_admin(c)}
     finally:
         c.close()
+
+
+def _liga_admin(c):
+    tag = settings().get("clan_tag")
+    view = meta_get(c, f"liga:{tag}") if tag else None
+    return {"cfg": liga_cfg(tag), "zones": view["zones"], "roster": view["bench"]["roster"]} if view else None
 
 
 # ---------------- API ----------------
@@ -356,7 +426,11 @@ def sync(light=False, source="panel"):
     if not _running.acquire(blocking=False):
         return False
     c = None
+    done = False
+    fail = None
+    P = Progress(source, quiet=light)
     try:
+        P("recoger")
         s = settings()
         tag = s.get("clan_tag")
         if not tag:
@@ -366,11 +440,13 @@ def sync(light=False, source="panel"):
             meta_set(c, "syncing", {"ts": time.time(), "light": light})
         wars = [(k, w) for k, t in (("cwl", "cwl"), ("war", "random"))
                 for w in (get(f"/v2/clan/{enc(tag)}/wars?limit=200&type={t}") or {}).get("items", [])]
+        P("recoger", .6)
         seasons = (get(f"/v2/cwl/{enc(tag)}/seasons?limit=24") or {}).get("items", [])
-        listed, official_error = None, None
+        listed, official_error, league = None, None, None
         if api_key():
             try:
-                listed = official(f"/clans/{enc(tag)}").get("memberList")
+                info = official(f"/clans/{enc(tag)}")
+                listed, league = info.get("memberList"), (info.get("warLeague") or {}).get("name")
             except RuntimeError as e:      # sin lista oficial la recogida sigue: no se pierden las guerras
                 official_error = str(e)
         with c:
@@ -402,11 +478,16 @@ def sync(light=False, source="panel"):
             for t in roster:
                 c.execute("INSERT INTO players(tag,roster) VALUES(?,1) ON CONFLICT(tag) DO UPDATE SET roster=1", (t,))
 
+        count = [0]
+
         def safe(t):
             try:
                 return fetch_player(t, light)
             except RuntimeError as e:      # un jugador que falla no tira la recogida entera
                 return {"tag": t, "error": str(e)}
+            finally:
+                count[0] += 1
+                P("jugadores", count[0] / max(len(roster), 1), f"{count[0]} de {len(roster)}")
 
         with ThreadPoolExecutor(3) as ex:
             data = list(ex.map(safe, roster))
@@ -436,8 +517,11 @@ def sync(light=False, source="panel"):
             meta_set(c, "last_error", official_error or (f"{len(failed)} jugadores sin actualizar" if failed else None))
             log = meta_get(c, "sync_log", [])
             meta_set(c, "sync_log", ([{"ts": now, "source": source, "light": light, "players": len(roster), "failed": len(failed)}] + log)[:15])
+        refresh_league(c, tag, league, P)
+        done = True
         return True
     except Exception as e:             # también lo inesperado: si no, una recogida fallida no dejaría rastro
+        fail = str(e)
         if c is None:
             c = db()
         with c:
@@ -445,11 +529,13 @@ def sync(light=False, source="panel"):
             meta_set(c, "fail_ts", int(time.time()))
         raise RuntimeError(str(e)) from e
     finally:
+        P("publicar")
         if c is not None:
             with c:
                 meta_set(c, "syncing", None)
             c.close()
             almacen.publicar_db()
+        P.finish(done, fail)
         _running.release()
 
 
@@ -476,6 +562,215 @@ def daily(retries=3, wait=300):
             if i + 1 < retries:
                 time.sleep(wait)
     return 1
+
+
+# ---------------- escenarios de liga ----------------
+# Cada recogida baja el grupo del clan seguido. Las guerras terminadas no cambian: se guardan y no se piden más.
+# Lo que enseña la web se calcula aquí (liga.build) y se guarda, así abrirla no cuesta nada.
+def liga_cfg(tag):
+    return (settings().get("liga") or {}).get(tag) or {}
+
+
+def trim_war(w):
+    keep = ("tag", "round", "state", "teamSize", "startTime", "endTime")
+    def side(s):
+        return {"tag": s["tag"], "name": s.get("name"), "stars": s.get("stars", 0), "destructionPercentage": s.get("destructionPercentage", 0), "attacks": s.get("attacks", 0),
+                "members": [{"tag": m["tag"], "name": m.get("name"), "townhallLevel": m.get("townhallLevel"), "mapPosition": m.get("mapPosition"),
+                             "attacks": [{k: a.get(k) for k in ("defenderTag", "stars", "destructionPercentage", "order")} for a in m.get("attacks") or []]}
+                            for m in s.get("members") or []]}
+    return {**{k: w.get(k) for k in keep}, "clan": side(w["clan"]), "opponent": side(w["opponent"])}
+
+
+def fetch_league(c, tag, league, progress=None):
+    """Liga normalizada, o None si el clan no está en ninguna ahora mismo."""
+    on = progress or (lambda *a, **k: None)
+    on("grupo")
+    try:
+        group = official(f"/clans/{enc(tag)}/currentwar/leaguegroup")
+    except NotFound:
+        return None
+    if not group.get("clans") or group.get("state") == "notInWar":
+        return None
+    key = f"liga_wars:{tag}:{group.get('season')}"
+    stored = meta_get(c, key, {})
+
+    count = [0]
+
+    def one(item):
+        r, wt = item
+        w = {**official(f"/clanwarleagues/wars/{quote(wt, safe='')}"), "round": r, "tag": wt}
+        count[0] += 1
+        on("grupo", count[0] / max(len(todo), 1), f"guerra {count[0]} de {len(todo)}")
+        return w
+    todo = [(i, wt) for i, r in enumerate(group.get("rounds") or [], 1) for wt in r.get("warTags") or [] if wt != "#0" and wt not in stored]
+    with ThreadPoolExecutor(4) as ex:
+        fresh = list(ex.map(one, todo))
+    wars = list(stored.values()) + [trim_war(w) for w in fresh]
+    meta_set(c, key, {w["tag"]: w for w in wars if w.get("state") == "warEnded"})
+    return {**liga.normalize(group, wars, tag, league), "now": time.time()}
+
+
+def refresh_intel(c, L, progress=None):
+    """Aldeas e historial de todos los inscritos, propios y rivales. Cambian despacio: se piden sólo si están viejos,
+    primero los que más lo necesitan y con tiempo limitado; lo que no dé tiempo llega en la siguiente recogida."""
+    now = int(time.time())
+    tags = [m["tag"] for x in L["clans"] for m in x["roster"]]
+    last_v = {r["tag"]: r["ts"] for r in c.execute("SELECT tag, ts FROM village")}
+    last_h = {r["tag"]: r["ts"] for r in c.execute("SELECT tag, ts FROM intel")}
+    stop = time.time() + INTEL_SECONDS
+    on = progress or (lambda *a, **k: None)
+    count = [0]
+
+    def tick():
+        count[0] += 1
+        total = len(old_v) + len(old_h)
+        on("aldeas", count[0] / max(total, 1), f"{count[0]} de {total}")
+
+    def village(t):
+        if time.time() > stop:
+            return None
+        try:
+            return t, modelo.village_summary(official(f"/players/{quote(t, safe='')}"))
+        except RuntimeError:
+            return None
+        finally:
+            tick()
+
+    def history(t):
+        if time.time() > stop:
+            return None
+        try:
+            return (t, *modelo.rows_from_history(t, (get(f"/v2/player/{enc(t)}/war/stats?limit=500") or {}).get("items", [])))
+        except RuntimeError:
+            return None
+        finally:
+            tick()
+    old_v = sorted((t for t in tags if now - last_v.get(t, 0) > VILLAGE_DAYS * 86400), key=lambda t: last_v.get(t, 0))
+    old_h = sorted((t for t in tags if now - last_h.get(t, 0) > HISTORY_DAYS * 86400), key=lambda t: last_h.get(t, 0))
+    on("aldeas")
+    with ThreadPoolExecutor(6) as ex:
+        villages = [x for x in ex.map(village, old_v) if x]
+    with ThreadPoolExecutor(4) as ex:
+        hist = [x for x in ex.map(history, old_h) if x]
+    with c:
+        c.executemany("INSERT OR REPLACE INTO village VALUES(?,?,?)", [(t, now, json.dumps(v, ensure_ascii=False)) for t, v in villages])
+        for t, rows, usage in hist:
+            c.executemany("INSERT OR REPLACE INTO book VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                          [(r["a"], r["d"], r["end"], r["ord"], r["a_th"], r["d_th"], r["a_pos"], r["d_pos"], r["size"], r["cwl"], r["stars"], r["pct"], r["fresh"], r["clan"]) for r in rows])
+            c.executemany("INSERT OR REPLACE INTO war_use VALUES(?,?,?,?,?)", [(u["tag"], u["end"], u["cwl"], u["per"], u["used"]) for u in usage])
+            c.execute("INSERT OR REPLACE INTO intel VALUES(?,?)", (t, now))
+    return len(villages), len(hist)
+
+
+def league_data(c):
+    """Todo lo conocido para entrenar el modelo. La memoria de ataques sobrevive a los cambios de clan."""
+    keys = ("a", "d", "end", "ord", "a_th", "d_th", "a_pos", "d_pos", "size", "cwl", "stars", "pct", "fresh", "clan")
+    rows = [dict(zip(keys, r)) for r in c.execute("SELECT a,d,end_ts,ord,a_th,d_th,a_pos,d_pos,size,cwl,stars,pct,fresh,clan FROM book")]
+    usage = [dict(zip(("tag", "end", "cwl", "per", "used"), r)) for r in c.execute("SELECT tag,end_ts,cwl,per,used FROM war_use")]
+    villages = {r["tag"]: json.loads(r["data"]) for r in c.execute("SELECT tag, data FROM village")}
+    saved = meta_get(c, "model_hp", {})
+    fresh = bool(saved) and len(rows) < saved.get("rows", 0) * 1.05    # se vuelve a afinar cuando hay un 5 % más de ataques
+    return {"rows": rows, "usage": usage, "villages": villages, "hp": saved.get("hp") if fresh else None}
+
+
+def build_league(c, tag, L, progress=None):
+    cfg = liga_cfg(tag)
+    key = f"liga_hist:{tag}:{L['season']}"
+    data = league_data(c)
+    view = liga.build(L, cfg, meta_get(c, key, {}), data=data, progress=progress)
+    meta_set(c, key, view.pop("hist"))
+    view["ts"] = int(time.time())
+    meta_set(c, f"liga:{tag}", view)
+    if not data["hp"] and view["model"].get("hp"):
+        meta_set(c, "model_hp", {"rows": view["model"].get("rows", 0), "hp": view["model"]["hp"]})
+    return view
+
+
+def refresh_league(c, tag, league, progress=None):
+    """Nunca tumba la recogida: si la liga falla, sigue lo demás y la pestaña avisa de que no está al día."""
+    if not api_key():
+        return
+    try:
+        L = fetch_league(c, tag, league, progress)
+        if L is not None:
+            refresh_intel(c, L, progress)
+        with c:
+            meta_set(c, f"liga_off:{tag}", L is None)
+            if L is not None:
+                meta_set(c, f"liga_data:{tag}", L)
+                build_league(c, tag, L, progress)
+            meta_set(c, f"liga_error:{tag}", None)
+    except Exception as e:      # noqa: BLE001 — también lo inesperado: la recogida de guerras ya está guardada
+        with c:
+            meta_set(c, f"liga_error:{tag}", str(e) if isinstance(e, RuntimeError) else f"No se pudo calcular la liga: {e}")
+
+
+def save_liga_cfg(body):
+    """Cupos de ascenso y descenso y cuentas que atacarán o no. Recalcula sin pedir nada a la API."""
+    s = settings()
+    tag = s.get("clan_tag")
+    if not tag:
+        raise ValueError("Primero hace falta el tag del clan.")
+    c = db()
+    try:
+        L = meta_get(c, f"liga_data:{tag}")
+        size = len(L["clans"]) if L else 8
+        cfg = {}
+        for k in ("promote", "demote"):
+            v = body.get(k)
+            if v is None or v == "":
+                continue
+            v = int(v)
+            if not 0 <= v <= size // 2:
+                raise ValueError(f"Los cupos van de 0 a {size // 2}.")
+            cfg[k] = v
+        known = {m["tag"] for x in (L["clans"] if L else []) if x["tag"] == tag for m in x["roster"]}
+        for k in ("si", "no"):
+            v = body.get(k) or []
+            if not isinstance(v, list) or any(t not in known for t in v):
+                raise ValueError("Hay una cuenta que no está inscrita en la liga.")
+            cfg[k] = v
+        if set(cfg.get("si", ())) & set(cfg.get("no", ())):
+            raise ValueError("Una cuenta no puede atacar y no atacar a la vez.")
+        _save({**s, "liga": {**(s.get("liga") or {}), tag: cfg}})
+        if L:
+            P = Progress("admin", first="modelo")
+            try:
+                with c:
+                    build_league(c, tag, L, P)
+            except Exception as e:
+                P.finish(False, str(e))
+                raise
+            P("publicar")
+            c.close()
+            almacen.publicar_db()
+            P.finish()
+            return
+    finally:
+        c.close()
+    almacen.publicar_db()
+
+
+def escenarios_view():
+    c = db()
+    try:
+        out = {"meta": meta_info(c)}
+        tag = out["meta"]["clan_tag"]
+        if not tag:
+            return out
+        view = meta_get(c, f"liga:{tag}")
+        roster = {m["tag"] for m in (view or {}).get("bench", {}).get("roster", [])}
+        cards = {}
+        for p in load_plays(c, tag, "all"):
+            cards.setdefault(p["player"], []).append(p)
+        members = members_state(c, tag)
+        spare = [{"tag": t, "name": m["name"], "th": m["th"], "index": scorecard(cards[t])["index"] if t in cards else None}
+                 for t, m in members.items() if t not in roster]
+        spare.sort(key=lambda x: (-(x["th"] or 0), -(x["index"] or 0)))
+        return {**out, "clan": clan_head(c, tag), "liga": view, "off": meta_get(c, f"liga_off:{tag}", False), "liga_error": meta_get(c, f"liga_error:{tag}"),
+                "has_key": bool(api_key()), "cfg": liga_cfg(tag), "spare": spare, "progress": progress_state()}
+    finally:
+        c.close()
 
 
 # ---------------- KPIs ----------------
@@ -525,10 +820,21 @@ def league_pcts(plays):
     return [a["pct"] for p in plays if p["kind"] == "cwl" for a in p["attacks"]]
 
 
+def stars_given(p):
+    """Estrellas que el rival saca a su aldea en una guerra: como en el juego, sólo cuenta el mejor ataque."""
+    return max((d["stars"] for d in p["defenses"]), default=0)
+
+
+def defense_plays(plays):
+    """Guerras que cuentan para la defensa: las del clan siempre; las de otros clanes sólo si traen datos."""
+    tag = settings().get("clan_tag")
+    return [p for p in plays if p["clan_tag"] == tag or p["attacks"] or p["defenses"]]
+
+
 def kpi_values(plays):
     avail = sum(p["per"] for p in plays)
     atk = [a for p in plays for a in p["attacks"]]
-    dfs = [d for p in plays for d in p["defenses"]]
+    guarded = defense_plays(plays)
     harder = [a["stars"] for p in plays for a in p["attacks"] if a["enemy_th"] and p["th"] and a["enemy_th"] >= p["th"]]
     stars = sum(a["stars"] for a in atk)
     return {"participacion": 100 * len(atk) / avail if avail else None,
@@ -538,7 +844,7 @@ def kpi_values(plays):
             "dano_efectivo": sum(a["pct"] for a in atk) / avail if avail else None,
             "dano": mean([a["pct"] for a in atk]),
             "exigencia": mean(harder),
-            "defensa": mean([d["stars"] for d in dfs]),
+            "defensa": mean([stars_given(p) for p in guarded]),
             "constancia": 100 * sum(len(p["attacks"]) >= p["per"] for p in plays) / len(plays) if plays else None}
 
 
@@ -577,10 +883,12 @@ def scorecard(plays):
     atk = [a for p in plays for a in p["attacks"]]
     avail = sum(p["per"] for p in plays)
     liga = league_pcts(plays)
+    guarded = defense_plays(plays)
     return {"values": {k: (round(x, 2) if x is not None else None) for k, x in v.items()}, "scores": scores, "index": index,
             "level": level_of(index), "trend": trend(plays), "wars": len(plays), "avail": avail, "used": len(atk),
             "missed": avail - len(atk), "stars": sum(a["stars"] for a in atk), "few": avail < MIN_ATTACKS,
             "liga_total": round(sum(liga), 1), "liga_attacks": len(liga),
+            "def_total": sum(stars_given(p) for p in guarded), "def_max": 3 * len(guarded),
             "wins": sum(p["result"] == "win" for p in plays), "loses": sum(p["result"] == "lose" for p in plays)}
 
 
@@ -681,7 +989,7 @@ def mean_card(cards):
     return {"values": {k["id"]: avg([c["values"][k["id"]] for c in played]) for k in KPIS},
             "scores": {k["id"]: avg([c["scores"][k["id"]] for c in played], 0) for k in KPIS}, "index": index, "level": level_of(index),
             "trend": avg([c["trend"] for c in played]), "few": all(c["few"] for c in cards),
-            **{k: sum(c[k] for c in cards) for k in ("wars", "avail", "used", "missed", "stars", "wins", "loses", "liga_total", "liga_attacks")}}
+            **{k: sum(c[k] for c in cards) for k in ("wars", "avail", "used", "missed", "stars", "wins", "loses", "liga_total", "liga_attacks", "def_total", "def_max")}}
 
 
 def mean_record(records):
@@ -786,7 +1094,7 @@ def status():
     c = db()
     try:
         maybe_light_sync(c)
-        return meta_info(c)
+        return {**meta_info(c), "progress": progress_state()}
     finally:
         c.close()
 
@@ -958,7 +1266,7 @@ def player_view(tag, kind="all", days=0, scope="clan"):
             roll.append({"ts": p["end_ts"], "avg": round(mean(recent), 2)})
         timeline = [{"ts": p["end_ts"], "opponent": p["opponent"], "clan": p["clan_name"], "kind": p["kind"], "result": p["result"], "per": p["per"],
                      "pos": p["pos"], "th": p["th"], "size": p["size"],
-                     "stars": sum(a["stars"] for a in p["attacks"]), "conceded": sum(d["stars"] for d in p["defenses"]),
+                     "stars": sum(a["stars"] for a in p["attacks"]), "conceded": stars_given(p),
                      "defenses": len(p["defenses"]), "attacks": [{k: a[k] for k in ("stars", "pct", "enemy", "enemy_th", "enemy_pos", "duration")} for a in p["attacks"]]}
                     for p in plays]
         dist = [sum(a["stars"] == n for _, a in atk) for n in range(4)]

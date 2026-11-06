@@ -4,3 +4,4 @@ clan.db*
 __pycache__
 *.bat
 *.ps1
+tests

@@ -43,3 +43,18 @@ asistente: una vez publicada no necesita BlueStacks ni el PC encendido.
 **Jugadores y cuentas.** En *Resumen → Jugadores y sus cuentas* arrastras cada cuenta a su jugador. El jugador lleva la media de
 sus cuentas con guerras (las cuentas sin guerras no bajan la media), los ataques y las estrellas se suman, y cada cuenta conserva
 sus KPIs. Quien no esté en ningún grupo cuenta como jugador de una sola cuenta, así que los miembros nuevos entran solos.
+
+## Escenarios de liga
+
+Pestaña que responde dónde puede acabar el clan en la Liga de Guerras. El cálculo está en `liga.py`, sin red ni base de datos; `clan.py` baja los datos en cada recogida (las guerras terminadas no se vuelven a pedir), calcula y guarda el resultado, así que abrir la web no gasta nada.
+
+- **Asegurado y descartado:** `rank_bounds` calcula el mejor y el peor final posibles. Nunca puede marcar como seguro algo que no lo es: `tests/test_liga.py` lo compara con todos los resultados posibles de ligas pequeñas, también con guerras a medias.
+- **% de pleno:** `modelo.py` se entrena en cada recogida con los ataques de la liga y el historial de todos los inscritos, propios y rivales. Da el reparto de estrellas de cada cuenta contra cada aldea. Elige solo cuánta memoria usar y cuánto pesa cada jugador, y mide su acierto sobre ataques que no ha visto.
+- **Plan de ataque:** `plan.py` busca el reparto con más plenos esperados sin atacar por encima del propio puesto. Quien se queda sin aldea queda de reserva para rematar.
+- **Probabilidades:** `simulate` juega cada guerra pendiente con esos porcentajes, la asistencia de cada cuenta, la puntería de cada clan y días buenos y malos, y combina miles de finales.
+- **Avance:** los cálculos corren en la recogida, nunca al abrir la web. `clan.Progress` publica la fase y el % en `clan/progreso.json` y la web lo enseña a cualquiera que la tenga abierta, también si lo lanzó el cron.
+- **Datos:** la memoria de ataques y las aldeas se guardan en `book`, `war_use` y `village`, y sobreviven a los cambios de clan. La primera recogida de una liga tarda unos 2 minutos; las demás, unos 20 segundos.
+- **Cupos de ascenso y descenso:** la API no los da y Supercell no publica una tabla actual. Por defecto 2 y 2; se cambian en Admin por clan.
+- **Requiere** la clave de la API oficial: los grupos de liga no están en ClashKing.
+
+Pruebas: `python tests/test_liga.py`.

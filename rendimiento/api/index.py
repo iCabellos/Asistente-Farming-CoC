@@ -53,15 +53,20 @@ class handler(BaseHTTPRequestHandler):
         try:
             if q.get("fresh"):
                 almacen.leer_ajustes(fresco=True)      # el panel admin debe ver lo que acaba de guardar
+                almacen.refrescar_db()                 # y quien vio acabar una recogida, sus datos nuevos
             args = (q.get("kind", "all"), int(q.get("days", 0)))
             if path == "status":
                 return self.send_json(clan.status())
+            if path == "progress":
+                return self.send_json(clan.progress_state())
             if path == "overview":
                 return self.send_json(clan.overview(*args))
             if path == "wars":
                 return self.send_json(clan.wars_view(*args))
             if path == "leagues":
                 return self.send_json(clan.leagues_view())
+            if path == "escenarios":
+                return self.send_json(clan.escenarios_view())
             if path == "player":
                 return self.send_json(clan.player_view(q.get("tag"), *args, q.get("scope", "clan")))
             if path == "owner":
@@ -74,7 +79,7 @@ class handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path, _ = self.route()
-        if path not in ("login", "admin", "groups", "sync", "tag", "key", "password"):
+        if path not in ("login", "admin", "groups", "sync", "tag", "key", "password", "liga"):
             return self.send_json({"error": "No existe."}, 404)
         if not self.is_admin():
             return self.send_json({"error": "Usuario o contraseña incorrectos."}, 401)
@@ -85,7 +90,7 @@ class handler(BaseHTTPRequestHandler):
             if path == "groups":
                 clan.save_groups(body.get("groups"))
             elif path == "sync":
-                started = not clan._running.locked()
+                started = not clan._running.locked() and not clan.progress_state().get("active")   # puede ir en otra instancia
                 if started:
                     clan.start_sync()
                 return self.send_json({"started": started})
@@ -95,6 +100,8 @@ class handler(BaseHTTPRequestHandler):
                 clan.save_key(body.get("key"))
             elif path == "password":
                 clan.set_admin(body.get("user"), body.get("password"))
+            elif path == "liga":
+                clan.save_liga_cfg(body)
             return self.send_json({"ok": True})
         except (ValueError, RuntimeError, AttributeError) as e:
             return self.send_json({"error": str(e)}, 400)

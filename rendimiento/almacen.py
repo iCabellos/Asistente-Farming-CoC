@@ -21,12 +21,14 @@ EN_NUBE = bool(os.environ.get("VERCEL"))
 SETTINGS = Path(os.environ.get("CLAN_SETTINGS", ROOT / "clan.json"))
 DB = Path(os.environ.get("CLAN_DB", ROOT / "clan.db"))
 TMP_DB = Path(tempfile.gettempdir()) / "clan.db"
-BLOB_DB, BLOB_AJUSTES = "clan/clan.db", "clan/ajustes.json"
-TTL_DB, TTL_AJUSTES = 600, 20    # cada consulta al almacén gasta cuota: los datos cambian poco
+BLOB_DB, BLOB_AJUSTES, BLOB_PROGRESO = "clan/clan.db", "clan/ajustes.json", "clan/progreso.json"
+PROGRESO = Path(str(DB) + ".progreso")
+TTL_DB, TTL_AJUSTES = 180, 20    # cada consulta al almacén gasta cuota: los datos cambian poco
 GET_INTENTOS, GET_ESPERA = 12, 0.5
 _lock = threading.RLock()
 _copia = {"etag": None, "visto": 0.0}
 _ajustes = {"datos": None, "etag": None, "visto": 0.0, "forzado": 0.0}
+_progreso = {"datos": None, "etag": None}
 
 
 def _etag(pathname):
@@ -50,6 +52,42 @@ def _bajar(pathname, etag):
             return bytes(r.body)
         time.sleep(GET_ESPERA)
     raise RuntimeError("El almacén aún no sirve la última versión; reinténtalo en unos segundos.")
+
+
+def guardar_progreso(p):
+    """Avance de una recogida. Está aparte de la base de datos para que lo vea cualquier instancia, y si falla da igual:
+    nunca debe parar el trabajo que está contando."""
+    try:
+        data = json.dumps(p, ensure_ascii=False).encode("utf-8")
+        if EN_NUBE:
+            _progreso.update(datos=p, etag=subir(BLOB_PROGRESO, data, "application/json"))
+        else:
+            tmp = PROGRESO.with_suffix(".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(PROGRESO)
+    except Exception:           # noqa: BLE001
+        pass
+
+
+def leer_progreso():
+    try:
+        if not EN_NUBE:
+            return json.loads(PROGRESO.read_text(encoding="utf-8")) if PROGRESO.exists() else {}
+        etag = _etag(BLOB_PROGRESO)
+        if not etag:
+            return {}
+        if etag != _progreso["etag"]:
+            _progreso.update(datos=json.loads(_bajar(BLOB_PROGRESO, etag)), etag=etag)
+        return _progreso["datos"] or {}
+    except Exception:           # noqa: BLE001 — un fallo al leer no significa que haya terminado
+        return _progreso["datos"] or {"unknown": True}
+
+
+def refrescar_db():
+    """Tras una recogida: la próxima consulta mira si hay datos nuevos sin esperar a que caduque la copia."""
+    with _lock:
+        if time.time() - _copia["visto"] > 1:
+            _copia["visto"] = 0.0
 
 
 def subir(pathname, data, content_type):
