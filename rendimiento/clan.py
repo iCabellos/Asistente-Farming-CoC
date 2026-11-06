@@ -11,6 +11,7 @@ ClashKing no da la lista de miembros, así que hay dos modos:
 La clave va por el proxy de RoyaleAPI (IP fija), así sirve desde cualquier sitio y no caduca si cambia
 la IP. Se lee de COC_API_KEY o de clan.json.
 """
+import contextvars
 import hashlib
 import hmac
 import json
@@ -30,6 +31,7 @@ import httpx
 import almacen
 import liga
 import modelo
+import prediccion
 
 ACCOUNTS = Path(__file__).parent.parent / "asistente" / "config.json"
 API = os.environ.get("CLASHKING_API", "https://api.clashk.ing")
@@ -41,9 +43,13 @@ GROUP_ID_RE = re.compile(r"^[a-z0-9]{1,16}$")
 ROSTER_DAYS = 180     # quien jugó con el clan en estos días cuenta como miembro
 LIGHT_S = 1800        # con el panel abierto, refresco ligero cada 30 min
 MIN_ATTACKS = 3       # con menos ataques posibles se marca «Pocos datos»
+PAST_SHOWN = 14       # guerras pasadas que se enseñan con todo su detalle
 VILLAGE_DAYS, HISTORY_DAYS = 3, 6     # cada cuánto se renueva lo que se sabe de un jugador de la liga
 INTEL_SECONDS = 120   # tiempo máximo por recogida para renovarlo
+PRED_SECONDS = 45     # tiempo máximo por recogida para predecir guerras pendientes; el resto, en la siguiente
+LIVE_SECONDS = 45     # una guerra en juego se pide a la API como mucho una vez en este tiempo
 DAILY_HOUR, DAILY_MINUTE = 11, 1
+MAX_CLANS = 12        # cada clan gasta una recogida diaria de API y de almacén
 
 # Sistema de KPIs. Nota 0–100: lineal entre `floor` (0) y `target` (100). Si un KPI no se puede medir,
 # su peso se reparte entre los demás en vez de penalizar.
@@ -89,13 +95,105 @@ CREATE TABLE IF NOT EXISTS book(a TEXT, d TEXT, end_ts REAL, ord INT, a_th INT, 
 CREATE TABLE IF NOT EXISTS war_use(tag TEXT, end_ts REAL, cwl INT, per INT, used INT, PRIMARY KEY(tag, end_ts));
 CREATE TABLE IF NOT EXISTS village(tag TEXT PRIMARY KEY, ts INT, data TEXT);
 CREATE TABLE IF NOT EXISTS intel(tag TEXT PRIMARY KEY, ts INT);
+CREATE TABLE IF NOT EXISTS battles(end_ts INT PRIMARY KEY, kind TEXT, state TEXT, rival TEXT, data TEXT, forecast TEXT, review TEXT);
 """
-_running = threading.Lock()
+_locks = {}           # una recogida a la vez por clan; dos clanes distintos sí pueden ir a la par
+_locks_guard = threading.Lock()
 
 
-# ---------------- ajustes ----------------
-settings = almacen.leer_ajustes
+# ---------------- ajustes y clanes ----------------
+# Los ajustes son uno solo; `settings()` los enseña ya mirando al clan de esta petición, así el resto del código no cambia.
 _save = almacen.guardar_ajustes
+
+
+def running():
+    with _locks_guard:
+        return _locks.setdefault(almacen.archivo(), threading.Lock())
+
+
+def _raw():
+    """Ajustes tal cual, recién leídos: lo que se vaya a escribir no debe partir de una copia vieja."""
+    return almacen.leer_ajustes(fresco=True)
+
+
+def clan_list(s=None):
+    s = almacen.leer_ajustes() if s is None else s
+    rows = s.get("clans")
+    if rows is None:      # de cuando solo se podía seguir uno
+        return [{"tag": s["clan_tag"], "file": almacen.PRIMERO, "name": s.get("clan_name")}] if s.get("clan_tag") else []
+    return rows
+
+
+def _active(s):
+    rows, f = clan_list(s), almacen.archivo()
+    return next((r for r in rows if r["file"] == f), rows[0] if rows else None)
+
+
+def settings():
+    s = almacen.leer_ajustes()
+    e = _active(s)
+    if not e:
+        return {**s, "clan_tag": None}
+    return {**s, "clan_tag": e["tag"], "groups": e["groups"] if "groups" in e else s.get("groups") if e["file"] == almacen.PRIMERO else None}
+
+
+def use_clan(tag=None):
+    """Elige el clan de esta petición. Sin tag, o con uno que ya no se sigue, el primero de la lista."""
+    rows = clan_list()
+    wanted = str(tag or "").strip().upper().lstrip("#")
+    e = next((r for r in rows if r["tag"][1:] == wanted), rows[0] if rows else None)
+    almacen.usar(e["file"] if e else None)
+    return e
+
+
+def _update_clan(tag, **fields):
+    s = _raw()
+    rows = [dict(r) for r in clan_list(s)]
+    for r in rows:
+        if r["tag"] == tag:
+            r.update(fields)
+    _save({**s, "clans": rows})
+
+
+def add_clan(tag):
+    """Añade un clan a la lista. La API oficial es quien sabe si existe: ClashKing solo conoce los clanes que sigue."""
+    tag = clean_tag(tag)
+    s = _raw()
+    rows = [dict(r) for r in clan_list(s)]
+    if any(r["tag"] == tag for r in rows):
+        raise ValueError("Ese clan ya está en la lista.")
+    if len(rows) >= MAX_CLANS:
+        raise ValueError(f"Como mucho se pueden seguir {MAX_CLANS} clanes.")
+    name = None
+    if api_key():
+        try:
+            name = official(f"/clans/{enc(tag)}").get("name")
+        except NotFound:
+            raise ValueError(f"No existe ningún clan con el tag {tag}. Revisa que sea el del clan, no el de tu perfil.") from None
+        except RuntimeError as e:
+            raise ValueError(str(e)) from e
+    elif not ((get(f"/v2/clan/{enc(tag)}/wars?limit=1") or {}).get("items") or (get(f"/v2/cwl/{enc(tag)}/seasons?limit=1") or {}).get("items")):
+        raise ValueError(f"ClashKing no tiene guerras del clan {tag}. Revisa que sea el tag del clan, no el de tu perfil.")
+    off = [dict(r) for r in s.get("clans_off") or []]
+    back = next((r for r in off if r["tag"] == tag), None)    # si ya se siguió, recupera sus datos
+    entry = {**(back or {"tag": tag, "file": tag[1:]}), "name": name or (back or {}).get("name") or tag}
+    _save({**s, "clans": rows + [entry], "clans_off": [r for r in off if r["tag"] != tag]})
+    return {"tag": tag, "name": entry["name"]}
+
+
+def remove_clan(tag):
+    """Deja de seguir un clan. Sus datos se conservan por si vuelve."""
+    tag = clean_tag(tag)
+    s = _raw()
+    rows = [dict(r) for r in clan_list(s)]
+    out = next((r for r in rows if r["tag"] == tag), None)
+    if not out:
+        raise ValueError("Ese clan no está en la lista.")
+    if len(rows) == 1:
+        raise ValueError("Tiene que quedar al menos un clan.")
+    if out["file"] == almacen.PRIMERO and "groups" not in out and s.get("groups") is not None:
+        out["groups"] = s["groups"]
+    _save({**s, "clans": [r for r in rows if r["tag"] != tag], "clans_off": [*(s.get("clans_off") or []), out]})
 
 
 def clean_tag(tag):
@@ -112,11 +210,9 @@ def enc(tag):
 
 
 def save_tag(tag):
-    tag = clean_tag(tag)
-    if not ((get(f"/v2/clan/{enc(tag)}/wars?limit=1") or {}).get("items")
-            or (get(f"/v2/cwl/{enc(tag)}/seasons?limit=1") or {}).get("items")):
-        raise ValueError(f"ClashKing no tiene guerras del clan {tag}. Revisa que sea el tag del clan, no el de tu perfil.")
-    _save({**settings(), "clan_tag": tag})
+    """Primer clan: al instalar aún no hay ninguno, así que se añade y se empieza a recoger."""
+    info = add_clan(tag)
+    use_clan(info["tag"])
     start_sync()
 
 
@@ -131,15 +227,15 @@ class NotFound(RuntimeError):
 # ---------------- avance de los cálculos ----------------
 # Una recogida o un recálculo tardan: se publica por qué parte van y la web lo enseña a quien la tenga abierta,
 # también si lo lanzó el cron. Cada fase ocupa un tramo de la barra según lo que suele tardar.
-STAGES = {"recoger": (0, 12, "Recogiendo guerras del clan"), "jugadores": (12, 30, "Actualizando jugadores"), "grupo": (30, 36, "Bajando el grupo de liga"),
-          "aldeas": (36, 54, "Revisando aldeas e historial"), "modelo": (54, 68, "Entrenando el modelo de ataques"), "plan": (68, 72, "Calculando el plan de ataque"),
-          "sim": (72, 90, "Simulando la liga"), "rondas": (90, 96, "Repasando las rondas jugadas"), "publicar": (96, 100, "Publicando los resultados")}
+STAGES = {"recoger": (0, 12, "Recogiendo guerras del clan"), "jugadores": (12, 28, "Actualizando jugadores"), "grupo": (28, 34, "Bajando el grupo de liga"),
+          "aldeas": (34, 50, "Revisando aldeas e historial"), "modelo": (50, 64, "Entrenando el modelo de ataques"), "plan": (64, 68, "Calculando el plan de ataque"),
+          "sim": (68, 84, "Simulando la liga"), "rondas": (84, 90, "Repasando las rondas jugadas"), "batallas": (90, 97, "Comparando lo previsto con lo real"), "publicar": (97, 100, "Publicando los resultados")}
 STALLED_S = 150           # sin noticias en este tiempo, el trabajo se dio por muerto (una función cortada no avisa)
 
 
 class Progress:
     def __init__(self, source, quiet=False, first="recoger"):
-        self.source, self.quiet, self.first = source, quiet, first
+        self.source, self.quiet, self.first, self.file = source, quiet, first, almacen.archivo()
         self.names = list(STAGES)
         self.names = self.names[self.names.index(first):]
         self.start = STAGES[first][0]
@@ -162,7 +258,7 @@ class Progress:
     def _send(self, active, detail=None, **extra):
         stage = self.stage or self.first
         almacen.guardar_progreso({"active": active, "pct": self.pct, "stage": stage, "label": STAGES[stage][2], "detail": detail, "source": self.source, "started": self.t0, "updated": int(time.time()),
-                                  "step": self.names.index(stage) + 1, "steps": [STAGES[n][2] for n in self.names], **extra})
+                                  "step": self.names.index(stage) + 1, "steps": [STAGES[n][2] for n in self.names], **extra}, self.file)
 
     def finish(self, ok=True, error=None):
         if not self.quiet:
@@ -191,6 +287,8 @@ def official(path, key=None):
         reason = ""
     if reason == "accessDenied.invalidIp":
         raise RuntimeError(f"La clave no admite esta conexión: al crearla, la IP debe ser {PROXY_IP}.")
+    if r.status_code == 403 and "private" in str(r.text).lower():
+        raise RuntimeError("El clan tiene privado su registro de guerras: la API no da la guerra en curso.")
     if r.status_code == 403:
         raise RuntimeError("Supercell rechaza la clave. Revisa que esté bien copiada y que siga activa.")
     if r.status_code == 503:
@@ -212,7 +310,7 @@ def save_key(key):
         official(f"/clans/{enc(s['clan_tag'])}", key)
     except RuntimeError as e:
         raise ValueError(str(e)) from e
-    _save({**s, "api_key": key})
+    _save({**_raw(), "api_key": key})
     start_sync()
 
 
@@ -236,7 +334,7 @@ def set_admin(user, password):
     if len(password) < 8:
         raise ValueError("La contraseña necesita al menos 8 caracteres.")
     salt = os.urandom(16).hex()
-    _save({**settings(), "admin": {"user": user, "salt": salt, "hash": _hash(password, salt)}})
+    _save({**_raw(), "admin": {"user": user, "salt": salt, "hash": _hash(password, salt)}})
 
 
 def admin_info():
@@ -334,6 +432,7 @@ def store_clan_war(c, w, tag, kind):
     a = (us.get("stars", 0), us.get("destructionPercentage", 0))
     b = (them.get("stars", 0), them.get("destructionPercentage", 0))
     res = result_of(a, b)
+    store_battle(c, w, tag, kind)
     put(c, "wars", {"end_ts": end, "clan_tag": tag, "start_ts": api_ts(w.get("startTime")), "kind": kind, "opponent": them.get("name"),
                     "opponent_tag": them.get("tag"), "size": w.get("teamSize"), "per": per, "stars": a[0], "opp_stars": b[0],
                     "pct": round(a[1], 1), "opp_pct": round(b[1], 1), "result": res})
@@ -357,6 +456,26 @@ def store_clan_war(c, w, tag, kind):
                                 "pct": x.get("destructionPercentage", 0), "duration": x.get("duration"), "fresh": None,
                                 "enemy": e.get("name"), "enemy_th": e.get("townhallLevel"), "enemy_pos": e.get("mapPosition")})
     return list(ours)
+
+
+def store_battle(c, w, tag, kind):
+    """Guarda la guerra entera, con nuestro clan a un lado: hace falta para comparar lo previsto con lo que pasó."""
+    us, them = w.get("clan") or {}, w.get("opponent") or {}
+    if them.get("tag") == tag:
+        w = {**w, "clan": them, "opponent": us}
+    elif us.get("tag") != tag:
+        return
+    end = api_ts(w.get("endTime"))
+    if not end or w.get("state") not in ("preparation", "inWar", "warEnded"):
+        return
+    t = trim_war(w)
+    old = c.execute("SELECT data FROM battles WHERE end_ts=?", (end,)).fetchone()
+    if old:                              # ClashKing no sabe la ronda; la liga, sí
+        prev = json.loads(old["data"])
+        t["round"], t["tag"] = t.get("round") or prev.get("round"), t.get("tag") or prev.get("tag")
+    c.execute("""INSERT INTO battles(end_ts, kind, state, rival, data) VALUES(?,?,?,?,?)
+                 ON CONFLICT(end_ts) DO UPDATE SET kind=excluded.kind, state=excluded.state, rival=excluded.rival, data=excluded.data""",
+              (end, kind, w["state"], (w.get("opponent") or {}).get("name"), json.dumps(t, ensure_ascii=False)))
 
 
 def store_player_war(c, tag, w):
@@ -422,8 +541,9 @@ def rival_names(c, data, tag):
 
 
 def sync(light=False, source="panel"):
-    """Recoge y guarda. Devuelve False si ya había otra en marcha."""
-    if not _running.acquire(blocking=False):
+    """Recoge y guarda el clan de esta petición. Devuelve False si ya había otra en marcha."""
+    lock = running()
+    if not lock.acquire(blocking=False):
         return False
     c = None
     done = False
@@ -447,6 +567,8 @@ def sync(light=False, source="panel"):
             try:
                 info = official(f"/clans/{enc(tag)}")
                 listed, league = info.get("memberList"), (info.get("warLeague") or {}).get("name")
+                if info.get("name") and info["name"] != _active(s).get("name"):
+                    _update_clan(tag, name=info["name"])
             except RuntimeError as e:      # sin lista oficial la recogida sigue: no se pierden las guerras
                 official_error = str(e)
         with c:
@@ -502,6 +624,8 @@ def sync(light=False, source="panel"):
                 if "error" in d:
                     continue
                 c.execute("UPDATE players SET timers=?, timers_ts=? WHERE tag=?", (json.dumps(d["timers"]), now, d["tag"]))
+                if "wars" in d:              # su historial también entrena el modelo: así no se pide dos veces
+                    store_history(c, d["tag"], *modelo.rows_from_history(d["tag"], d["wars"]), now)
                 for w in d.get("wars", []):
                     store_player_war(c, d["tag"], w)
                     me = w.get("player") or {}
@@ -518,6 +642,7 @@ def sync(light=False, source="panel"):
             log = meta_get(c, "sync_log", [])
             meta_set(c, "sync_log", ([{"ts": now, "source": source, "light": light, "players": len(roster), "failed": len(failed)}] + log)[:15])
         refresh_league(c, tag, league, P)
+        refresh_battles(c, tag, P)
         done = True
         return True
     except Exception as e:             # también lo inesperado: si no, una recogida fallida no dejaría rastro
@@ -536,7 +661,7 @@ def sync(light=False, source="panel"):
             c.close()
             almacen.publicar_db()
         P.finish(done, fail)
-        _running.release()
+        lock.release()
 
 
 def start_sync(light=False, source="panel"):
@@ -547,8 +672,8 @@ def start_sync(light=False, source="panel"):
             pass                 # queda en last_error y el panel lo enseña
     if almacen.EN_NUBE:
         run()                    # en la nube un hilo moriría con la petición
-    else:
-        threading.Thread(target=run, daemon=True).start()
+    else:                        # el hilo nuevo debe seguir con el clan de esta petición
+        threading.Thread(target=contextvars.copy_context().run, args=(run,), daemon=True).start()
 
 
 def daily(retries=3, wait=300):
@@ -572,7 +697,7 @@ def liga_cfg(tag):
 
 
 def trim_war(w):
-    keep = ("tag", "round", "state", "teamSize", "startTime", "endTime")
+    keep = ("tag", "round", "state", "teamSize", "attacksPerMember", "startTime", "endTime", "partial")
     def side(s):
         return {"tag": s["tag"], "name": s.get("name"), "stars": s.get("stars", 0), "destructionPercentage": s.get("destructionPercentage", 0), "attacks": s.get("attacks", 0),
                 "members": [{"tag": m["tag"], "name": m.get("name"), "townhallLevel": m.get("townhallLevel"), "mapPosition": m.get("mapPosition"),
@@ -607,14 +732,23 @@ def fetch_league(c, tag, league, progress=None):
         fresh = list(ex.map(one, todo))
     wars = list(stored.values()) + [trim_war(w) for w in fresh]
     meta_set(c, key, {w["tag"]: w for w in wars if w.get("state") == "warEnded"})
+    with c:
+        for w in wars:
+            store_battle(c, w, tag, "cwl")
     return {**liga.normalize(group, wars, tag, league), "now": time.time()}
 
 
-def refresh_intel(c, L, progress=None):
-    """Aldeas e historial de todos los inscritos, propios y rivales. Cambian despacio: se piden sólo si están viejos,
-    primero los que más lo necesitan y con tiempo limitado; lo que no dé tiempo llega en la siguiente recogida."""
+def store_history(c, tag, rows, usage, now):
+    c.executemany("INSERT OR REPLACE INTO book VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  [(r["a"], r["d"], r["end"], r["ord"], r["a_th"], r["d_th"], r["a_pos"], r["d_pos"], r["size"], r["cwl"], r["stars"], r["pct"], r["fresh"], r["clan"]) for r in rows])
+    c.executemany("INSERT OR REPLACE INTO war_use VALUES(?,?,?,?,?)", [(u["tag"], u["end"], u["cwl"], u["per"], u["used"]) for u in usage])
+    c.execute("INSERT OR REPLACE INTO intel VALUES(?,?)", (tag, now))
+
+
+def refresh_intel(c, tags, progress=None):
+    """Aldeas e historial de los jugadores de una liga o una guerra, propios y rivales. Cambian despacio: se piden sólo si
+    están viejos, primero los que más lo necesitan y con tiempo limitado; lo que no dé tiempo llega en la siguiente recogida."""
     now = int(time.time())
-    tags = [m["tag"] for x in L["clans"] for m in x["roster"]]
     last_v = {r["tag"]: r["ts"] for r in c.execute("SELECT tag, ts FROM village")}
     last_h = {r["tag"]: r["ts"] for r in c.execute("SELECT tag, ts FROM intel")}
     stop = time.time() + INTEL_SECONDS
@@ -655,10 +789,7 @@ def refresh_intel(c, L, progress=None):
     with c:
         c.executemany("INSERT OR REPLACE INTO village VALUES(?,?,?)", [(t, now, json.dumps(v, ensure_ascii=False)) for t, v in villages])
         for t, rows, usage in hist:
-            c.executemany("INSERT OR REPLACE INTO book VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                          [(r["a"], r["d"], r["end"], r["ord"], r["a_th"], r["d_th"], r["a_pos"], r["d_pos"], r["size"], r["cwl"], r["stars"], r["pct"], r["fresh"], r["clan"]) for r in rows])
-            c.executemany("INSERT OR REPLACE INTO war_use VALUES(?,?,?,?,?)", [(u["tag"], u["end"], u["cwl"], u["per"], u["used"]) for u in usage])
-            c.execute("INSERT OR REPLACE INTO intel VALUES(?,?)", (t, now))
+            store_history(c, t, rows, usage, now)
     return len(villages), len(hist)
 
 
@@ -681,8 +812,12 @@ def build_league(c, tag, L, progress=None):
     meta_set(c, key, view.pop("hist"))
     view["ts"] = int(time.time())
     meta_set(c, f"liga:{tag}", view)
-    if not data["hp"] and view["model"].get("hp"):
-        meta_set(c, "model_hp", {"rows": view["model"].get("rows", 0), "hp": view["model"]["hp"]})
+    info, saved = view["model"], meta_get(c, "model_hp", {})
+    if not data["hp"] and info.get("hp"):
+        saved = {**saved, "rows": info.get("rows", 0), "hp": info["hp"]}
+    if info.get("calib") is not None:
+        saved = {**saved, "sigma": info.get("war_sigma"), "calib": info["calib"]}
+    meta_set(c, "model_hp", saved)
     return view
 
 
@@ -693,7 +828,7 @@ def refresh_league(c, tag, league, progress=None):
     try:
         L = fetch_league(c, tag, league, progress)
         if L is not None:
-            refresh_intel(c, L, progress)
+            refresh_intel(c, [m["tag"] for x in L["clans"] for m in x["roster"]], progress)
         with c:
             meta_set(c, f"liga_off:{tag}", L is None)
             if L is not None:
@@ -703,6 +838,158 @@ def refresh_league(c, tag, league, progress=None):
     except Exception as e:      # noqa: BLE001 — también lo inesperado: la recogida de guerras ya está guardada
         with c:
             meta_set(c, f"liga_error:{tag}", str(e) if isinstance(e, RuntimeError) else f"No se pudo calcular la liga: {e}")
+
+
+# ---------------- previsto y real ----------------
+# La liga llega por fetch_league; la guerra normal, por la API oficial, porque ClashKing puede no seguir ese clan.
+def fetch_current_war(c, tag):
+    """Guerra normal en curso. Si ya terminó y sigue visible, además queda guardada como cualquier otra guerra."""
+    try:
+        w = official(f"/clans/{enc(tag)}/currentwar")
+    except NotFound:
+        return
+    if w.get("state") in ("preparation", "inWar", "warEnded"):
+        with c:
+            if w["state"] == "warEnded":
+                store_clan_war(c, w, tag, "war")
+            else:
+                store_battle(c, w, tag, "war")
+
+
+def close_stale(c, tag):
+    """Guerra que seguíamos y ya no aparece porque empezó otra entre dos recogidas: se cierra con lo último visto y el
+    marcador final del registro del clan. Sus últimos ataques pueden faltar: queda marcada como parcial."""
+    now = time.time()
+    rows = c.execute("SELECT end_ts, kind, data FROM battles WHERE state IN ('preparation','inWar') AND end_ts<?", (now - 600,)).fetchall()
+    if not rows:
+        return
+    try:
+        log = (official(f"/clans/{enc(tag)}/warlog?limit=20") or {}).get("items", [])
+    except RuntimeError:
+        log = []
+    with c:
+        for r in rows:
+            t = json.loads(r["data"])
+            them = t["opponent"]["tag"] if t["clan"]["tag"] == tag else t["clan"]["tag"]
+            x = next((w for w in log if (w.get("opponent") or {}).get("tag") == them), None)
+            if x:
+                for side, src in ((t["clan"], x.get("clan") or {}), (t["opponent"], x.get("opponent") or {})):
+                    side.update({k: src[k] for k in ("stars", "destructionPercentage") if src.get(k) is not None})
+            t.update(state="warEnded", partial=True)
+            store_clan_war(c, t, tag, r["kind"])
+
+
+def forecast_rows(c, tag):
+    data = league_data(c)
+    saved = meta_get(c, "model_hp", {})
+    data.update(sigma=saved.get("sigma"), calib=saved.get("calib"))
+    L = meta_get(c, f"liga_data:{tag}")
+    if L:
+        data["rows"] = modelo.merge(data["rows"], modelo.rows_from_league(L))
+    return data, L
+
+
+def refresh_forecasts(c, tag, on):
+    """Predice las guerras que aún no lo están, de la más reciente a la más antigua, y cierra las que han terminado."""
+    rows = c.execute("SELECT end_ts, kind, state, data, forecast, review FROM battles ORDER BY (state='warEnded'), end_ts DESC").fetchall()
+    todo = [r for r in rows if not r["review"]]
+    if not todo:
+        return
+    data, L = forecast_rows(c, tag)
+    cfg = liga_cfg(tag)
+    skip = ((set(liga.auto_inactive(L, tag)) if L else set()) - set(cfg.get("si") or ())) | set(cfg.get("no") or ())
+    stop = time.time() + PRED_SECONDS
+    for i, r in enumerate(todo):
+        on("batallas", .9 * i / len(todo), f"guerra {i + 1} de {len(todo)}")
+        war = prediccion.standard(json.loads(r["data"]), tag, r["kind"])
+        if not war["a"]["members"] or not war["b"]["members"]:
+            continue
+        ended = r["state"] == "warEnded"
+        snap = json.loads(r["forecast"]) if r["forecast"] else None
+        if not snap or snap["sig"] != prediccion.signature(war):      # si cambió la alineación se repite: sigue usando solo lo anterior
+            if time.time() > stop:
+                continue
+            snap = prediccion.forecast(war, tag, data, seed=f"{tag}|{r['end_ts']}", inactive=() if ended else skip)
+        with c:
+            if ended:        # ya no hace falta seguirla: solo se conserva lo que se dijo y cómo salió
+                c.execute("UPDATE battles SET forecast=?, review=? WHERE end_ts=?", (json.dumps({"before": snap["before"]}), json.dumps(prediccion.finished(war, snap), ensure_ascii=False), r["end_ts"]))
+            else:
+                c.execute("UPDATE battles SET forecast=? WHERE end_ts=?", (json.dumps(snap), r["end_ts"]))
+
+
+def active_battle(c):
+    """La guerra que importa ahora: la que está en juego y, si no hay, la que esté en preparación."""
+    now = time.time()
+    return c.execute("SELECT * FROM battles WHERE state IN ('inWar','preparation') AND end_ts>=? ORDER BY (state!='inWar'), end_ts LIMIT 1", (now,)).fetchone()
+
+
+def battle_now(c, tag, r, raw=None):
+    t = raw or json.loads(r["data"])
+    t["round"], t["tag"] = t.get("round") or json.loads(r["data"]).get("round"), t.get("tag") or json.loads(r["data"]).get("tag")
+    return prediccion.battle_view(prediccion.standard(t, tag, r["kind"]), tag, json.loads(r["forecast"]) if r["forecast"] else None, time.time(), seed=f"{tag}|{r['end_ts']}")
+
+
+def past_reviews(c):
+    return [{**json.loads(r["review"]), "end_ts": r["end_ts"]} for r in c.execute("SELECT end_ts, review FROM battles WHERE review IS NOT NULL ORDER BY end_ts DESC")]
+
+
+def refresh_battles(c, tag, progress=None):
+    """Nunca tumba la recogida: lo ya guardado sigue valiendo aunque falle la guerra en curso."""
+    if not api_key():
+        return
+    on = progress or (lambda *a, **k: None)
+    on("batallas")
+    error = None
+    try:
+        fetch_current_war(c, tag)
+    except RuntimeError as e:
+        error = str(e)
+    try:
+        close_stale(c, tag)
+        r = active_battle(c)
+        if r and r["kind"] == "war":      # los rivales de una guerra normal no estaban en ninguna liga: hay que conocerlos
+            t = json.loads(r["data"])
+            refresh_intel(c, [m["tag"] for s in (t["clan"], t["opponent"]) for m in s["members"]], lambda s, f=0, d=None: on("batallas", .3 * f, d))
+        refresh_forecasts(c, tag, on)
+        r = active_battle(c)
+        with c:
+            meta_set(c, "battle_now", battle_now(c, tag, r) if r else None)
+            items = past_reviews(c)
+            meta_set(c, "pred_sum", {k: prediccion.summary([x for x in items if x["kind"] == k]) for k in ("cwl", "war")})
+            meta_set(c, "battle_error", error)
+    except Exception as e:      # noqa: BLE001
+        with c:
+            meta_set(c, "battle_error", error or f"No se pudo calcular la previsión: {e}")
+
+
+_live = {}                # última respuesta de la guerra en juego, por clan: la API se pide como mucho cada LIVE_SECONDS
+
+
+def live_view():
+    """La guerra en juego al minuto, con la previsión guardada. No entrena ni escribe nada: abrir la web no cuesta."""
+    c = db()
+    try:
+        tag = settings().get("clan_tag")
+        r = active_battle(c) if tag else None
+        if not r:
+            return {"battle": None}
+        key = (almacen.archivo(), r["end_ts"])
+        hit = _live.get(key)
+        if hit and time.time() - hit[0] < LIVE_SECONDS:
+            return hit[1]
+        out = {"battle": None}
+        if api_key():
+            try:
+                stored = json.loads(r["data"])
+                raw = official(f"/clanwarleagues/wars/{quote(stored['tag'], safe='')}") if r["kind"] == "cwl" else official(f"/clans/{enc(tag)}/currentwar")
+                if api_ts(raw.get("endTime")) == r["end_ts"]:
+                    out = {"battle": battle_now(c, tag, r, trim_war(raw)), "live": True}
+            except (RuntimeError, KeyError, TypeError) as e:
+                out = {"battle": None, "error": str(e)}
+        _live[key] = (time.time(), out)
+        return out
+    finally:
+        c.close()
 
 
 def save_liga_cfg(body):
@@ -732,7 +1019,8 @@ def save_liga_cfg(body):
             cfg[k] = v
         if set(cfg.get("si", ())) & set(cfg.get("no", ())):
             raise ValueError("Una cuenta no puede atacar y no atacar a la vez.")
-        _save({**s, "liga": {**(s.get("liga") or {}), tag: cfg}})
+        raw = _raw()
+        _save({**raw, "liga": {**(raw.get("liga") or {}), tag: cfg}})
         if L:
             P = Progress("admin", first="modelo")
             try:
@@ -767,8 +1055,19 @@ def escenarios_view():
         spare = [{"tag": t, "name": m["name"], "th": m["th"], "index": scorecard(cards[t])["index"] if t in cards else None}
                  for t, m in members.items() if t not in roster]
         spare.sort(key=lambda x: (-(x["th"] or 0), -(x["index"] or 0)))
-        return {**out, "clan": clan_head(c, tag), "liga": view, "off": meta_get(c, f"liga_off:{tag}", False), "liga_error": meta_get(c, f"liga_error:{tag}"),
-                "has_key": bool(api_key()), "cfg": liga_cfg(tag), "spare": spare, "progress": progress_state()}
+        off = meta_get(c, f"liga_off:{tag}", False)
+        battle = meta_get(c, "battle_now")
+        if battle and battle["ends"] < time.time():      # la recogida la vio en juego, pero ya ha terminado
+            battle = None
+        # lo que manda es en qué está el clan ahora: una guerra normal, una liga o nada
+        mode = "guerra" if battle and battle["kind"] == "war" else "liga" if view and not off else "nada"
+        kind = "war" if mode == "guerra" else "cwl" if mode == "liga" else None
+        past = past_reviews(c)
+        summ = meta_get(c, "pred_sum") or {}
+        if not kind:                                     # sin nada en juego, lo último que jugó
+            kind = past[0]["kind"] if past else "cwl"
+        return {**out, "clan": clan_head(c, tag), "liga": view, "off": off, "liga_error": meta_get(c, f"liga_error:{tag}"), "has_key": bool(api_key()), "cfg": liga_cfg(tag), "spare": spare, "progress": progress_state(),
+                "mode": mode, "battle": battle, "battle_error": meta_get(c, "battle_error"), "past": [x for x in past if x["kind"] == kind][:PAST_SHOWN], "past_kind": kind, "summary": summ.get(kind)}
     finally:
         c.close()
 
@@ -911,10 +1210,18 @@ def members_state(c, tag):
     official_list = meta_get(c, "official_ts")
     names = {**meta_get(c, "rivals", {}), **{r["opponent_tag"]: r["opponent"] for r in c.execute("SELECT opponent_tag, opponent FROM wars")}}
     out = {}
+    act, battle = active_battle(c), None
+    if act:
+        t = json.loads(act["data"])
+        me, ot = (t["clan"], t["opponent"]) if t["clan"]["tag"] == tag else (t["opponent"], t["clan"])
+        battle = ({m["tag"] for m in me.get("members") or []}, ot, "cwl" if act["kind"] == "cwl" else "random", act["end_ts"])
     for r in c.execute("SELECT * FROM players WHERE roster=1"):
         live = live_wars(r, tag)
         for w in live:
             w["rival_name"] = names.get(w["rival"])
+        if battle and r["tag"] in battle[0]:      # ClashKing puede no seguir este clan: la guerra en curso también sale de la oficial
+            if not any(w["rival"] == battle[1]["tag"] for w in live):
+                live.append({"type": battle[2], "ends": battle[3], "rival": battle[1]["tag"], "rival_name": battle[1]["name"]})
         last = c.execute("SELECT end_ts, clan_tag, clan_name FROM plays WHERE player=? ORDER BY end_ts DESC LIMIT 1", (r["tag"],)).fetchone()
         # con lista oficial sabemos que sigue en el clan, aunque su última guerra fuese en otro
         state = "war" if live else "gone" if not official_list and last and last["clan_tag"] != tag else "idle"
@@ -974,7 +1281,7 @@ def save_groups(groups):
                 dest = {**g, "accounts": []}
                 out.append(dest)
             dest["accounts"] += away
-    _save({**settings(), "groups": [g for g in out if g["accounts"]]})
+    _update_clan(settings()["clan_tag"], groups=[g for g in out if g["accounts"]])
 
 
 def mean_card(cards):
@@ -1074,20 +1381,21 @@ def next_daily():
 def meta_info(c):
     s = settings()
     syncing = meta_get(c, "syncing")
-    return {"clan_tag": s.get("clan_tag"), "stamp": meta_get(c, "stamp"), "full_ts": meta_get(c, "full_ts"), "error": meta_get(c, "last_error"),
+    return {"clan_tag": s.get("clan_tag"), "clans": [{"tag": r["tag"], "name": r.get("name") or r["tag"]} for r in clan_list(s)], "stamp": meta_get(c, "stamp"), "full_ts": meta_get(c, "full_ts"), "error": meta_get(c, "last_error"),
             "syncing": bool(syncing and time.time() - syncing["ts"] < 600), "next": next_daily(), "log": meta_get(c, "sync_log", [])[:5],
             "official": bool(meta_get(c, "official_ts")), "has_key": bool(api_key()), "proxy_ip": PROXY_IP, "cloud": almacen.EN_NUBE}
 
 
 def maybe_light_sync(c):
-    if not almacen.EN_NUBE and settings().get("clan_tag") and time.time() - (meta_get(c, "light_ts") or 0) > LIGHT_S and not _running.locked():
+    if not almacen.EN_NUBE and settings().get("clan_tag") and time.time() - (meta_get(c, "light_ts") or 0) > LIGHT_S and not running().locked():
         start_sync(light=True, source="panel")
 
 
 def clan_head(c, tag):
     w = c.execute("SELECT clan_name FROM plays WHERE clan_tag=? ORDER BY end_ts DESC LIMIT 1", (tag,)).fetchone()
     s = c.execute("SELECT * FROM seasons WHERE clan_tag=? ORDER BY season DESC LIMIT 1", (tag,)).fetchone()
-    return {"tag": tag, "name": w["clan_name"] if w else tag, "season": dict(s) if s else None}
+    known = next((r.get("name") for r in clan_list() if r["tag"] == tag), None)
+    return {"tag": tag, "name": w["clan_name"] if w else known or tag, "season": dict(s) if s else None}
 
 
 def status():
@@ -1167,6 +1475,11 @@ def war_record(plays):
             "tied": sum(r == "tie" for r in wars.values())}
 
 
+def war_predictions(c):
+    """Por guerra: lo previsto y el % de pleno de cada ataque, para enseñarlo junto al resultado."""
+    return {x["end_ts"]: {"before": x["before"], "t": x["t"], "p": {r["o"]: r["p3"] for r in x["rows"]}} for x in past_reviews(c)}
+
+
 def wars_view(kind="all", days=0):
     c = db()
     try:
@@ -1181,7 +1494,7 @@ def wars_view(kind="all", days=0):
             if p["end_ts"] in wars:
                 wars[p["end_ts"]]["lineup"].append({
                     "tag": p["player"], "name": names.get(p["player"]) or p["player"], "th": p["th"], "pos": p["pos"], "per": p["per"],
-                    "attacks": [{k: a[k] for k in ("stars", "pct", "enemy", "enemy_th", "enemy_pos", "duration")} for a in p["attacks"]],
+                    "attacks": [{k: a[k] for k in ("ord", "stars", "pct", "enemy", "enemy_th", "enemy_pos", "duration")} for a in p["attacks"]],
                     "defenses": [{k: d[k] for k in ("stars", "pct", "enemy", "enemy_th")} for d in p["defenses"]]})
         rows = sorted((w for w in wars.values() if w["lineup"]), key=lambda w: w["end_ts"], reverse=True)
         for w in rows:
@@ -1201,7 +1514,7 @@ def wars_view(kind="all", days=0):
         others.sort(key=lambda o: (o["index"] is None, -(o["index"] or 0)))
         groups = account_groups(c)
         return {**out, "clan": clan_head(c, tag), "wars": rows, "heat": heat, "summary": war_record(plays), "others": others,
-                "owners": owner_rows(c, groups, plays), "owner_names": owner_names(groups)}
+                "owners": owner_rows(c, groups, plays), "owner_names": owner_names(groups), "pred": war_predictions(c), "battle": meta_get(c, "battle_now")}
     finally:
         c.close()
 
@@ -1238,7 +1551,7 @@ def leagues_view():
             by_month.setdefault(month_of(p["end_ts"]), []).append(p)
         return {**out, "clan": clan_head(c, tag), "seasons": seasons, "matrix": table, "rounds": detail["wars"], "heat": detail["heat"],
                 "owners": {m: owner_rows(c, groups, v) for m, v in by_month.items()}, "owner_names": detail["owner_names"],
-                "live": live_rounds(members_state(c, tag))}
+                "live": live_rounds(members_state(c, tag)), "pred": detail["pred"], "battle": detail["battle"]}
     finally:
         c.close()
 

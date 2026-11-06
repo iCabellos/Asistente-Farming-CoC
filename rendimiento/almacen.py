@@ -3,12 +3,15 @@
 - En tu PC: clan.db y clan.json, junto a este archivo.
 - En Vercel el disco se borra, así que ambos están en Vercel Blob (almacén privado). Cada función copia
   clan.db a /tmp y lo consulta como siempre; la recogida lo vuelve a subir entero al terminar.
-  Con un solo clan y una recogida al día basta, y las consultas siguen siendo las mismas.
+  Con una recogida al día basta, y las consultas siguen siendo las mismas.
+- Cada clan tiene su propia base (`usar`): así dos recogidas nunca se pisan al subir, y un clan no ve los datos de otro.
+  El primero sigue en clan.db; los demás van en clan.db.<tag> en el PC y en clan/<tag>.db en el almacén.
 
 Vercel reparte las peticiones entre varias instancias y el Blob tiene caché: head_blob siempre dice cuál es
 la versión actual, pero get_blob puede devolver una anterior durante un rato tras escribir. Por eso aquí se
 pregunta primero con head y se pide con get hasta recibir justo esa versión.
 """
+import contextvars
 import json
 import os
 import tempfile
@@ -20,15 +23,51 @@ ROOT = Path(__file__).parent
 EN_NUBE = bool(os.environ.get("VERCEL"))
 SETTINGS = Path(os.environ.get("CLAN_SETTINGS", ROOT / "clan.json"))
 DB = Path(os.environ.get("CLAN_DB", ROOT / "clan.db"))
-TMP_DB = Path(tempfile.gettempdir()) / "clan.db"
-BLOB_DB, BLOB_AJUSTES, BLOB_PROGRESO = "clan/clan.db", "clan/ajustes.json", "clan/progreso.json"
-PROGRESO = Path(str(DB) + ".progreso")
+PRIMERO = "clan"                 # archivo del clan que ya había antes de poder seguir varios
+BLOB_AJUSTES = "clan/ajustes.json"
 TTL_DB, TTL_AJUSTES = 180, 20    # cada consulta al almacén gasta cuota: los datos cambian poco
 GET_INTENTOS, GET_ESPERA = 12, 0.5
 _lock = threading.RLock()
-_copia = {"etag": None, "visto": 0.0}
+_clan = contextvars.ContextVar("clan", default=None)     # cada petición lleva el suyo, aunque compartan instancia
+_copias, _progresos = {}, {}
 _ajustes = {"datos": None, "etag": None, "visto": 0.0, "forzado": 0.0}
-_progreso = {"datos": None, "etag": None}
+
+
+def usar(archivo):
+    """Fija el clan con el que trabaja esta petición."""
+    _clan.set(archivo)
+
+
+def archivo():
+    return _clan.get() or PRIMERO
+
+
+def _local(f):
+    return DB if f == PRIMERO else Path(f"{DB}.{f}")
+
+
+def _tmp(f):
+    return Path(tempfile.gettempdir()) / f"{f}.db"
+
+
+def _blob_db(f):
+    return f"clan/{f}.db"
+
+
+def _blob_progreso(f):
+    return "clan/progreso.json" if f == PRIMERO else f"clan/progreso-{f}.json"
+
+
+def _ruta_progreso(f):
+    return Path(f"{_local(f)}.progreso")
+
+
+def _copia(f):
+    return _copias.setdefault(f, {"etag": None, "visto": 0.0})
+
+
+def _progreso(f):
+    return _progresos.setdefault(f, {"datos": None, "etag": None})
 
 
 def _etag(pathname):
@@ -54,40 +93,46 @@ def _bajar(pathname, etag):
     raise RuntimeError("El almacén aún no sirve la última versión; reinténtalo en unos segundos.")
 
 
-def guardar_progreso(p):
+def guardar_progreso(p, f=None):
     """Avance de una recogida. Está aparte de la base de datos para que lo vea cualquier instancia, y si falla da igual:
-    nunca debe parar el trabajo que está contando."""
+    nunca debe parar el trabajo que está contando. Llega también desde hilos: `f` dice de qué clan es."""
+    f = f or archivo()
     try:
         data = json.dumps(p, ensure_ascii=False).encode("utf-8")
         if EN_NUBE:
-            _progreso.update(datos=p, etag=subir(BLOB_PROGRESO, data, "application/json"))
+            _progreso(f).update(datos=p, etag=subir(_blob_progreso(f), data, "application/json"))
         else:
-            tmp = PROGRESO.with_suffix(".tmp")
+            ruta = _ruta_progreso(f)
+            tmp = ruta.with_suffix(".tmp")
             tmp.write_bytes(data)
-            tmp.replace(PROGRESO)
+            tmp.replace(ruta)
     except Exception:           # noqa: BLE001
         pass
 
 
 def leer_progreso():
+    f = archivo()
+    x = _progreso(f)
     try:
         if not EN_NUBE:
-            return json.loads(PROGRESO.read_text(encoding="utf-8")) if PROGRESO.exists() else {}
-        etag = _etag(BLOB_PROGRESO)
+            ruta = _ruta_progreso(f)
+            return json.loads(ruta.read_text(encoding="utf-8")) if ruta.exists() else {}
+        etag = _etag(_blob_progreso(f))
         if not etag:
             return {}
-        if etag != _progreso["etag"]:
-            _progreso.update(datos=json.loads(_bajar(BLOB_PROGRESO, etag)), etag=etag)
-        return _progreso["datos"] or {}
+        if etag != x["etag"]:
+            x.update(datos=json.loads(_bajar(_blob_progreso(f), etag)), etag=etag)
+        return x["datos"] or {}
     except Exception:           # noqa: BLE001 — un fallo al leer no significa que haya terminado
-        return _progreso["datos"] or {"unknown": True}
+        return x["datos"] or {"unknown": True}
 
 
 def refrescar_db():
     """Tras una recogida: la próxima consulta mira si hay datos nuevos sin esperar a que caduque la copia."""
     with _lock:
-        if time.time() - _copia["visto"] > 1:
-            _copia["visto"] = 0.0
+        x = _copia(archivo())
+        if time.time() - x["visto"] > 1:
+            x["visto"] = 0.0
 
 
 def subir(pathname, data, content_type):
@@ -98,30 +143,34 @@ def subir(pathname, data, content_type):
 def ruta_db():
     """Ruta de la base de datos, al día. Si no se sabe qué hay en el almacén y aún no hay copia, falla:
     seguir con una base vacía acabaría pisando el histórico en la siguiente recogida."""
+    f = archivo()
     if not EN_NUBE:
-        return DB
+        return _local(f)
     with _lock:
-        if time.time() - _copia["visto"] > TTL_DB:
+        x = _copia(f)
+        if time.time() - x["visto"] > TTL_DB:
             try:
-                etag = _etag(BLOB_DB)
-                if etag and etag != _copia["etag"]:
-                    tmp = TMP_DB.with_suffix(".nuevo")
-                    tmp.write_bytes(_bajar(BLOB_DB, etag))
-                    tmp.replace(TMP_DB)
-                    _copia["etag"] = etag
-                _copia["visto"] = time.time()
+                etag = _etag(_blob_db(f))
+                if etag and etag != x["etag"]:
+                    tmp = _tmp(f).with_suffix(".nuevo")
+                    tmp.write_bytes(_bajar(_blob_db(f), etag))
+                    tmp.replace(_tmp(f))
+                    x["etag"] = etag
+                x["visto"] = time.time()
             except Exception:
-                if _copia["etag"] is None:
+                if x["etag"] is None:
                     raise
-    return TMP_DB
+    return _tmp(f)
 
 
 def publicar_db():
     """Tras una recogida, sube la base entera. En el PC no hace nada."""
     if EN_NUBE:
+        f = archivo()
         with _lock:
-            _copia["etag"] = subir(BLOB_DB, TMP_DB.read_bytes(), "application/octet-stream")
-            _copia["visto"] = time.time()
+            x = _copia(f)
+            x["etag"] = subir(_blob_db(f), _tmp(f).read_bytes(), "application/octet-stream")
+            x["visto"] = time.time()
 
 
 def leer_ajustes(fresco=False):

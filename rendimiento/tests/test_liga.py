@@ -437,6 +437,282 @@ def test_plan_live_state():
     assert all(r["b_pos"] != 1 for r in p["assign"]) and p["done"] == 1      # la aldea con 3★ ya no se ataca
 
 
+class MatrixProb:
+    """Modelo de mentira que responde con una tabla de % de pleno, para probar el plan con casos exactos."""
+    pct, info, recent_a, recent_d, ua, ud, form_a, form_d = {0: 30, 1: 60, 2: 80, 3: 100}, {"calib": .02}, {}, {}, {}, {}, {}, {}
+
+    def __init__(self, m):
+        self.m = m
+
+    def dist(self, a, b, fresh=True, cwl=True, size=15, shift=0.0):
+        p = self.m[a["pos"]][b["pos"]] / 100
+        rest = 1 - p
+        return (rest * .1, rest * .2, rest * .7, p)
+
+
+def _bases(ths):
+    return [{"tag": f"#B{i}", "name": f"B{i}", "th": t, "pos": i} for i, t in enumerate(ths, 1)]
+
+
+def _atk(positions):
+    return [{"tag": f"#A{p}", "name": f"A{p}", "th": 14, "pos": p} for p in positions]
+
+
+# la matriz de la captura del usuario: 1, 2, 3 y 5 contra las aldeas 1 a 5
+CAPTURA = {1: {1: 94, 2: 94, 3: 95, 4: 99, 5: 99}, 2: {1: 66, 2: 57, 3: 62, 4: 97, 5: 96}, 3: {1: 46, 2: 36, 3: 41, 4: 94, 5: 91}, 5: {1: 9, 2: 9, 3: 11, 4: 67, 5: 58}}
+
+
+def test_alternative_helps_the_weakest():
+    p = plan.build(MatrixProb(CAPTURA), _atk([1, 2, 3, 5]), _bases([15, 14, 14, 12, 12]), 5, seed=1)
+    main = {a["a_pos"]: a["b_pos"] for a in p["assign"]}
+    assert all(b >= a for a, b in main.items()), main           # el plan principal nunca sube
+    alt = p["alt"]
+    assert alt, "tenía que proponer alternativa"
+    chosen = {a["a_pos"]: a["b_pos"] for a in alt["assign"]}
+    assert chosen[5] == 4 and chosen[3] == 5, chosen            # el 3 cede el 4 al 5: pierde 3, gana 9
+    assert chosen[2] == 1, chosen                               # el 2 sube al 1, donde tiene más que en su sitio
+    assert alt["ups"] == sum(1 for a, b in chosen.items() if b < a) >= 2
+    total = lambda m: sum(CAPTURA[a][b] for a, b in m.items())
+    assert total(chosen) > total(main), (chosen, main)
+    assert alt["gain_t"] > 0 and alt["verdict"] == "mejor", alt["verdict"]
+    assert round(sum(s["net"] for s in alt["swaps"]), 2) == round((total(chosen) - total(main)) / 100, 2), alt["swaps"]
+    for s in alt["swaps"]:
+        assert s["net"] > 0, s                                  # ningún grupo de cambios resta
+
+
+def test_alternative_needs_a_real_gain():
+    # subir ganaría 1 punto, menos que el error del modelo: no se mueve a nadie
+    m = {1: {1: 90, 2: 90}, 2: {1: 61, 2: 60}}
+    assert plan.build(MatrixProb(m), _atk([1, 2]), _bases([14, 14]), 2, seed=1)["alt"] is None
+    # sin ninguna subida que compense tampoco hay alternativa
+    m = {1: {1: 95, 2: 90}, 2: {1: 20, 2: 70}}
+    assert plan.build(MatrixProb(m), _atk([1, 2]), _bases([14, 14]), 2, seed=1)["alt"] is None
+
+
+def test_alternative_never_repeats():
+    rng = random.Random(4)
+    for _ in range(40):
+        n = rng.randint(3, 12)
+        m = {i: {j: rng.randint(5, 99) for j in range(1, n + 1)} for i in range(1, n + 1)}
+        p = plan.build(MatrixProb(m), _atk(range(1, n + 1)), _bases([14] * n), n, seed=rng.random())
+        for x in (p, p["alt"]) if p["alt"] else (p,):
+            assert len({a["b_pos"] for a in x["assign"]}) == len(x["assign"])
+            assert len({a["a_pos"] for a in x["assign"]}) == len(x["assign"])
+            assert len(x["assign"]) + sum(r["n"] for r in x["reserves"]) == n
+        if p["alt"]:
+            assert p["alt"]["ups"] >= 1 and p["alt"]["base"]["triples"] >= 0
+
+
+def test_two_attacks_per_war():
+    """Guerra normal: cada cuenta aparece una vez por ataque libre y nunca repite una aldea que ya atacó."""
+    m = {1: {1: 90, 2: 95, 3: 99}, 2: {1: 50, 2: 80, 3: 90}, 3: {1: 20, 2: 40, 3: 85}}
+    atk = _atk([1, 2, 3]) + _atk([1, 2, 3])
+    atk[0] = {**atk[0], "hit": ["#B1"]}          # el 1 ya atacó la aldea 1 con su primer ataque
+    atk[3] = {**atk[3], "hit": ["#B1"]}
+    p = plan.build(MatrixProb(m), atk, _bases([14, 14, 14]), 3, cwl=False, seed=1)
+    assert not any(a["a_pos"] == 1 and a["b_pos"] == 1 for a in p["assign"]), p["assign"]
+    assert len({a["b_pos"] for a in p["assign"]}) == len(p["assign"])
+    assert len(p["matrix"]["a"]) == 3                 # la matriz enseña cada cuenta una vez
+    assert sum(r["n"] for r in p["reserves"]) + len(p["assign"]) == 6
+
+
+# ---------------- guerras normales y previsto frente a real ----------------
+def raw_war(state="inWar", size=5, per=2, attacks=None, end="20261107T074638.000Z", start="20261106T074638.000Z", kind="war"):
+    """Guerra con la forma de la API. attacks: [(lado, puesto del atacante, puesto de la aldea, estrellas, %)]"""
+    def side(tag, th):
+        return {"tag": tag, "name": "Clan " + tag, "stars": 0, "destructionPercentage": 0.0, "attacks": 0,
+                "members": [{"tag": f"{tag}P{i}", "name": f"J{tag}{i}", "townhallLevel": th - i // 2, "mapPosition": i, "attacks": []} for i in range(1, size + 1)]}
+    w = {"state": state, "teamSize": size, "attacksPerMember": per, "startTime": start, "endTime": end, "clan": side("#US", 14), "opponent": side("#TH", 14)}
+    order = 0
+    for who, a, b, stars, pct in attacks or []:
+        me, ot = (w["clan"], w["opponent"]) if who == "us" else (w["opponent"], w["clan"])
+        order += 1
+        me["members"][a - 1]["attacks"].append({"defenderTag": ot["members"][b - 1]["tag"], "stars": stars, "destructionPercentage": pct, "order": order})
+        me["attacks"] += 1
+    return w
+
+
+def history(n=300, end=1700000000.0):
+    """Ataques pasados, algunos de los jugadores de la guerra."""
+    rng = random.Random(9)
+    rows = []
+    for i in range(n):
+        a, d = f"#USP{rng.randint(1, 5)}", f"#THP{rng.randint(1, 5)}"
+        rows.append({"a": a, "d": d, "end": end - i * 3600, "ord": i, "a_th": 14, "d_th": 14, "a_pos": 3, "d_pos": 3, "size": 5, "cwl": 0, "stars": rng.choice((1, 2, 3, 3)), "pct": 80.0, "fresh": 1, "clan": "#US"})
+    return rows
+
+
+def test_forecast_cannot_see_its_own_attacks():
+    import prediccion
+    start = modelo._ts("20261106T074638.000Z")
+    war = prediccion.standard(clan_trim(raw_war()), "#US", "war")
+    base = history(end=start - 3600)
+    leak = [{**r, "end": start + 3600, "ord": 900 + i, "stars": 3} for i, r in enumerate(base[:200])]     # ataques de esta misma guerra o posteriores
+    one = prediccion.forecast(war, "#US", {"rows": base, "usage": [], "villages": {}}, seed=1)
+    two = prediccion.forecast(war, "#US", {"rows": base + leak, "usage": [], "villages": {}}, seed=1)
+    assert one["rows"] == two["rows"] == len(base)
+    assert one["ab"] == two["ab"] and one["before"] == two["before"], "la previsión ha mirado el futuro"
+
+
+def clan_trim(w):
+    import clan
+    return clan.trim_war(w)
+
+
+def test_frozen_answers_like_the_model():
+    import prediccion
+    war = prediccion.standard(clan_trim(raw_war()), "#US", "war")
+    prob = modelo.train(history(), {}, hp=modelo.DEFAULT_HP, tune=False, report=False, steps=120)
+    k = modelo.NAMES.index("fresh")
+    snap = {"th": prob.th, "fresh": prob.beta[k], "pct": prob.pct, "ua": {}, "ud": {}, "form_a": {}, "form_d": {}, "recent_a": {}, "recent_d": {}, "a": [m["tag"] for m in war["a"]["members"]], "b": [m["tag"] for m in war["b"]["members"]],
+            "ab": [[prob.eta(m, d, True, False, 5) for d in war["b"]["members"]] for m in war["a"]["members"]], "ba": [[prob.eta(m, d, True, False, 5) for d in war["a"]["members"]] for m in war["b"]["members"]]}
+    frozen = prediccion.Frozen(snap)
+    for a in war["a"]["members"]:
+        for b in war["b"]["members"]:
+            for fresh in (True, False):
+                x, y = prob.dist(a, b, fresh=fresh, cwl=False, size=5), frozen.dist(a, b, fresh=fresh, cwl=False, size=5)
+                assert all(abs(i - j) < 1e-9 for i, j in zip(x, y)), (x, y)
+
+
+def test_review_knows_who_was_first():
+    import prediccion
+    w = raw_war(attacks=[("us", 1, 1, 2, 80), ("them", 2, 2, 3, 100), ("us", 2, 1, 3, 100), ("us", 3, 3, 0, 20)])
+    war = prediccion.standard(clan_trim(w), "#US", "war")
+    prob = modelo.train(history(), {}, hp=modelo.DEFAULT_HP, tune=False, report=False, steps=120)
+    rows = prediccion.review(war, prob)
+    assert [r["o"] for r in rows] == [1, 3, 4] and [r["a_pos"] for r in rows] == [1, 2, 3]       # solo los nuestros, por orden
+    second = prob.dist(war["a"]["members"][1], war["b"]["members"][0], fresh=False, cwl=False, size=5)
+    assert abs(rows[1]["p3"] - round(second[3], 3)) < 1e-9, "el segundo ataque a una aldea no llega fresco"
+    t = prediccion.tally(rows)
+    assert t["n"] == 3 and t["triples"] == 1 and t["stars"] == 5
+
+
+def test_two_attacks_in_simulation():
+    import prediccion
+    w = raw_war(attacks=[("us", 1, 1, 3, 100), ("us", 1, 2, 3, 100), ("us", 2, 3, 2, 70)])
+    war = prediccion.standard(clan_trim(w), "#US", "war")
+    prob = modelo.train(history(), {}, hp=modelo.DEFAULT_HP, tune=False, report=False, steps=120)
+    model = {"prob": prob, "use": {}, "aim": {}, "sigma": .3}
+    P = liga._prep_side(model, war["a"], war["b"], 5, True, per=2, cwl=False)
+    assert len(P["probs"]) == 10 - 3, len(P["probs"])     # 10 ataques posibles, 3 ya hechos
+    assert sorted(P["best"], reverse=True)[:3] == [3, 3, 2]
+    done = {m["tag"]: len(m["atk"]) for m in war["a"]["members"]}
+    assert done["#USP1"] == 2 and done["#USP2"] == 1
+
+
+def _snap(war, us="#US"):
+    import prediccion
+    return prediccion.forecast(war, us, {"rows": history(end=modelo._ts(war["start"]) - 3600), "usage": [], "villages": {}}, seed=2)
+
+
+def test_battle_of_a_normal_war():
+    import prediccion
+    w = raw_war(attacks=[("us", 1, 1, 3, 100), ("them", 1, 1, 2, 80), ("us", 2, 2, 2, 90)])
+    w["clan"].update(stars=5, destructionPercentage=38.0)
+    w["opponent"].update(stars=2, destructionPercentage=16.0)
+    war = prediccion.standard(clan_trim(w), "#US", "war")
+    now = modelo._ts("20261106T174638.000Z")
+    b = prediccion.battle_view(war, "#US", _snap(war), now)
+    assert b["kind"] == "war" and b["us"]["max"] == 10 and b["us"]["stars"] == 5
+    assert b["before"] and b["now"] and 0 <= b["now"]["win"] <= 1 and b["t"]["n"] == 2
+    assert b["now"]["us"] >= 5, "lo ya hecho no se puede perder"
+    p = b["plan"]
+    total = sum(1 for a in p["assign"]) + sum(r["n"] for r in p["reserves"])
+    assert total == 10 - 2, total                          # ataques que quedan, entre plan y reservas
+    assert not any(a["a_pos"] == 1 and a["b_pos"] == 1 for a in p["assign"]), "aldea ya hecha o repetida"
+    assert p["title"] == "Guerra normal" and p["round"] is None
+
+
+def test_battle_without_forecast_still_shows_the_score():
+    import prediccion
+    war = prediccion.standard(clan_trim(raw_war()), "#US", "war")
+    b = prediccion.battle_view(war, "#US", None, modelo._ts("20261106T174638.000Z"))
+    assert b["before"] is None and b["plan"] is None and b["us"]["max"] == 10
+
+
+def test_finished_war_is_compared():
+    import prediccion
+    w = raw_war(state="warEnded", attacks=[("us", 1, 1, 3, 100), ("us", 2, 2, 3, 100), ("them", 1, 1, 1, 50)])
+    w["clan"].update(stars=6, destructionPercentage=40.0)
+    w["opponent"].update(stars=1, destructionPercentage=10.0)
+    war = prediccion.standard(clan_trim(w), "#US", "war")
+    x = prediccion.finished(war, _snap(war))
+    assert x["result"] == "win" and x["t"]["n"] == 2 and x["t"]["triples"] == 2 and x["before"]["us"] >= 0
+    s = prediccion.summary([{**x, "end_ts": 1}])
+    assert s["wars"] == 1 and s["n"] == 2 and s["players"][0]["n"] == 1
+
+
+def test_many_clans_are_kept_apart():
+    import importlib, tempfile, os as _os
+    import almacen, clan
+    with tempfile.TemporaryDirectory() as d:
+        db_, js = Path(d) / "clan.db", Path(d) / "clan.json"
+        js.write_text(json.dumps({"clan_tag": "#PPP", "clan_name": "Uno", "api_key": "x" * 50, "groups": [{"id": "yo", "name": "Yo", "accounts": ["#P1"]}]}), encoding="utf8")
+        old = almacen.DB, almacen.SETTINGS, clan.official
+        almacen.DB, almacen.SETTINGS = db_, js
+        clan.official = lambda path, key=None: {"name": "Dos"}
+        try:
+            almacen.usar(None)
+            assert [r["tag"] for r in clan.clan_list()] == ["#PPP"]         # los ajustes de siempre siguen valiendo
+            assert clan.settings()["groups"][0]["id"] == "yo"
+            assert clan.add_clan("#QQQ")["name"] == "Dos"
+            assert [r["file"] for r in clan.clan_list()] == ["clan", "QQQ"]
+            try:
+                clan.add_clan("QQQ")
+                raise AssertionError("repetido")
+            except ValueError:
+                pass
+            clan.use_clan("#QQQ")
+            assert clan.settings()["clan_tag"] == "#QQQ" and not clan.settings()["groups"]
+            assert str(almacen.ruta_db()).endswith("clan.db.QQQ")
+            c = clan.db()
+            with c:
+                clan.meta_set(c, "stamp", 22)
+            c.close()
+            clan.use_clan("#PPP")
+            assert str(almacen.ruta_db()).endswith("clan.db") and clan.settings()["groups"][0]["id"] == "yo"
+            c = clan.db()
+            assert clan.meta_get(c, "stamp") is None, "un clan ve los datos de otro"
+            c.close()
+            clan.use_clan("#RRR")                                           # uno que ya no se sigue: el primero
+            assert clan.settings()["clan_tag"] == "#PPP"
+            a, b = clan.running(), None
+            clan.use_clan("#QQQ")
+            b = clan.running()
+            assert a is not b, "un clan bloquea las recogidas del otro"
+            clan.remove_clan("#PPP")
+            assert [r["tag"] for r in clan.clan_list()] == ["#QQQ"]
+            assert clan.settings()["clan_tag"] == "#QQQ"
+            try:
+                clan.remove_clan("#QQQ")
+                raise AssertionError("no puede quedarse sin clanes")
+            except ValueError:
+                pass
+            clan.add_clan("#PPP")                                           # vuelve con sus datos y sus jugadores
+            clan.use_clan("#PPP")
+            assert clan.settings()["groups"][0]["id"] == "yo" and str(almacen.ruta_db()).endswith("clan.db")
+        finally:
+            almacen.DB, almacen.SETTINGS, clan.official = old
+            almacen.usar(None)
+
+
+def test_progress_is_per_clan():
+    import tempfile
+    import almacen, clan
+    with tempfile.TemporaryDirectory() as d:
+        old = almacen.DB
+        almacen.DB = Path(d) / "clan.db"
+        try:
+            almacen.usar("BBB")
+            clan.Progress("panel")("recoger")
+            assert almacen.leer_progreso().get("active")
+            almacen.usar(None)
+            assert not almacen.leer_progreso(), "el avance de un clan aparece en otro"
+        finally:
+            almacen.DB = old
+            almacen.usar(None)
+
+
 def test_map_rank_not_roster_number():
     L = fake_league(roster=22, rounds_done=1, live=True)
     for w in L["wars"]:
@@ -506,7 +782,7 @@ def test_progress_bar_rules():
     import almacen
     import clan
     sent, keep = [], almacen.guardar_progreso
-    almacen.guardar_progreso = lambda p: sent.append(p)
+    almacen.guardar_progreso = lambda p, f=None: sent.append(p)
     try:
         P = clan.Progress("test")
         P.gap = 0
@@ -517,13 +793,13 @@ def test_progress_bar_rules():
         P.finish()
         pcts = [p["pct"] for p in sent]
         assert pcts == sorted(pcts) and pcts[-1] == 100 and not sent[-1]["active"] and sent[-1]["ok"]
-        assert sent[1]["detail"] == "8 de 16" and sent[1]["label"] == clan.STAGES["jugadores"][2] and sent[1]["step"] == 2 and len(sent[1]["steps"]) == 9
+        assert sent[1]["detail"] == "8 de 16" and sent[1]["label"] == clan.STAGES["jugadores"][2] and sent[1]["step"] == 2 and len(sent[1]["steps"]) == 10
         sent.clear()
         Q = clan.Progress("admin", first="modelo")
         Q.gap = 0
         Q("modelo")
         Q.finish()
-        assert sent[0]["pct"] == 0 and sent[0]["step"] == 1 and len(sent[0]["steps"]) == 5 and sent[-1]["pct"] == 100     # un recálculo también va de 0 a 100
+        assert sent[0]["pct"] == 0 and sent[0]["step"] == 1 and len(sent[0]["steps"]) == 6 and sent[-1]["pct"] == 100     # un recálculo también va de 0 a 100
         sent.clear()
         R = clan.Progress("x", quiet=True)
         R("recoger")

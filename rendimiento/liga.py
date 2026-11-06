@@ -332,7 +332,7 @@ def fit(L, rng=None, data=None, hp=None, light=False, on=None):
         n = sum(v for k, v in seen.items() if k[0] == c["tag"])
         rate[c["tag"]] = (sum(v for k, v in used.items() if k[0] == c["tag"]) + modelo.PRIOR["use"] * USE_PRIOR_WEIGHT) / (n + USE_PRIOR_WEIGHT)
     now = L.get("now") or cut or 0
-    hist = modelo.usage_rates(data.get("usage") or [], now, skip=set(ends)) if now else {}
+    hist = modelo.usage_rates(data.get("usage") or [], now, skip=set(ends), cwl=L.get("cwl", True)) if now else {}
     model = {"prob": prob, "seen": seen, "used": used, "rate": rate, "hist": hist, "sigma": prob.info.get("war_sigma", modelo.PRIOR["war_sigma"]), "aim": {}, "levels": {}}
     for c in L["clans"]:
         model["aim"][c["tag"]], model["levels"][c["tag"]] = _clan_habits(L, model, c["tag"])
@@ -362,6 +362,8 @@ def use_prob(model, clan, tag, inactive=()):
     """Probabilidad de que una cuenta ataque: lo de esta liga pesa entero y lo anterior según lo reciente que sea."""
     if tag in inactive:
         return 0.0
+    if "use" in model:           # previsión ya guardada: no se vuelve a calcular
+        return model["use"].get(tag, modelo.PRIOR["use"])
     n, u = model["seen"].get((clan, tag), 0), model["used"].get((clan, tag), 0)
     hu, hn = model["hist"].get(tag, (0.0, 0.0))
     return (u + hu + model["rate"][clan] * USE_PRIOR_WEIGHT) / (n + hn + USE_PRIOR_WEIGHT)
@@ -381,8 +383,9 @@ def auto_inactive(L, tag):
 
 
 # ---------------- simulación ----------------
-def _prep_side(model, me, ot, size, live, inactive=None, force=None, plan_=None, left=None):
-    """Deja calculado lo que no cambia entre tiradas: una guerra se simula cientos de veces."""
+def _prep_side(model, me, ot, size, live, inactive=None, force=None, plan_=None, left=None, per=1, cwl=True):
+    """Deja calculado lo que no cambia entre tiradas: una guerra se simula cientos de veces.
+    `per` son los ataques de cada cuenta: 1 en liga y 2 en guerra normal. `cwl` dice si el % es de liga."""
     clan = me["tag"]
     prob = model["prob"]
     bases = ot["members"]
@@ -390,16 +393,18 @@ def _prep_side(model, me, ot, size, live, inactive=None, force=None, plan_=None,
     best, pcts = [0] * len(bases), [0.0] * len(bases)
     pending_, have = [], 0
     for m in me["members"]:
-        if live and m["atk"]:
-            have += 1
+        done = len(m["atk"]) if live else 0
+        if done:
+            have += done
             for a in m["atk"]:
                 i = index.get(a["def"])
                 if i is not None:
                     best[i] = max(best[i], a["stars"])
                     pcts[i] = max(pcts[i], a["pct"])
+        if done >= per:
             continue
         p = force[m["tag"]] if force is not None and m["tag"] in force else use_prob(model, clan, m["tag"], inactive or ())
-        pending_.append((m, p))
+        pending_.extend((m, p) for _ in range(per - done))
     if live and have:          # quien aún no ha atacado con la guerra avanzada, es menos probable que lo haga
         total = have + sum(p for _, p in pending_)
         q = min(.95, max(have / total if total else 0, left or 0))
@@ -413,15 +418,20 @@ def _prep_side(model, me, ot, size, live, inactive=None, force=None, plan_=None,
             for m, _ in pending_:
                 row = []
                 for b in bases:
-                    d = prob.dist(m, b, fresh=fresh, size=size, shift=shift * sigma)
+                    d = prob.dist(m, b, fresh=fresh, cwl=cwl, size=size, shift=shift * sigma)
                     c0, c1, c2 = d[0], d[0] + d[1], d[0] + d[1] + d[2]
                     row.append(((c0, c1, c2), tuple(sum(d[k] * max(0, k - x) for k in range(4)) for x in range(4)), d[3]))
                 rows.append(row)
             table[(s, fresh)] = rows
-    pos = {m["tag"]: i for i, (m, _) in enumerate(pending_)}
     route = None
     if plan_ is not None:
-        route = {pos[a["a_tag"]]: index[a["b_tag"]] for a in plan_ if a["a_tag"] in pos and a["b_tag"] in index}
+        free = {}
+        for i, (m, _) in enumerate(pending_):
+            free.setdefault(m["tag"], []).append(i)
+        route = {}
+        for a in plan_:                      # con dos ataques, cada línea del plan gasta uno
+            if free.get(a["a_tag"]) and a["b_tag"] in index:
+                route[free[a["a_tag"]].pop(0)] = index[a["b_tag"]]
     return {"probs": [p for _, p in pending_], "table": table, "best": best, "pcts": pcts, "ths": [b["th"] for b in bases], "aim": model["aim"].get(clan, .6), "pct": prob.pct, "route": route,
             "touched": [x > 0 for x in pcts], "n": len(bases) or 1, "positions": [b.get("pos") or 0 for b in bases], "own": [m.get("pos") or 0 for m, _ in pending_]}
 
@@ -620,11 +630,15 @@ def war_plan(L, model, game, tag, inactive=()):
     rival = game["b"] if game["a"] == tag else game["a"]
     ot = _members(L, game, rival)
     live = game["state"] == "inWar"
-    attackers = [m for m in me["members"] if m["tag"] not in inactive and not (live and m["atk"])]
+    attackers = []
+    for m in me["members"]:              # un elemento por ataque que le quede
+        if m["tag"] not in inactive:
+            hit = [a["def"] for a in m["atk"]] if live else []
+            attackers += [{**m, "pos": m.get("pos"), "hit": hit} for _ in range(L.get("per", 1) - len(hit))]
     bases = _base_state(me, ot, live)
     size = (game.get("war") or {}).get("size") or L["size"]
     seed = f"{tag}|{_key(game)}|{sum(b['best'] for b in bases)}|{len(attackers)}"
-    return planner.build(model["prob"], [{**m, "pos": m.get("pos")} for m in attackers], bases, size, seed=seed, stars_now=me["stars"] if live else 0)
+    return planner.build(model["prob"], attackers, bases, size, cwl=L.get("cwl", True), seed=seed, stars_now=me["stars"] if live else 0)
 
 
 # ---------------- qué hace falta ----------------
@@ -1006,15 +1020,15 @@ def build(L, cfg=None, hist=None, seed=None, data=None, progress=None):
 
     def sim_tick(a, b, what):
         return lambda i, k: on("sim", a + (b - a) * i / max(k, 1), f"{what}: guerra {i + 1} de {k}")
-    sim = simulate(L, model, rng, inactive, tick=sim_tick(0, .6, "con sus hábitos"))
+    sim = simulate(L, model, rng, inactive, tick=sim_tick(0, .5, "con sus hábitos"))
     bounds = {c["tag"]: rank_bounds(L, c["tag"], inactive if c["tag"] == tag else ()) for c in L["clans"]}
     table = standings(L)
     tiers = _labels(list(model["levels"].values()))
     skill = lambda x: {"facil": "Alto", "media": "Medio", "dificil": "Bajo"}[tiers(x)]
     force = {m["tag"]: 1.0 for m in next(c for c in L["clans"] if c["tag"] == tag)["roster"] if m["tag"] not in inactive}
-    all_in = simulate(L, model, rng, inactive, force, game_sims=GAME_SIMS // 2, season_sims=SEASON_SIMS // 2, tick=sim_tick(.6, .8, "si atacan todos"))
+    all_in = simulate(L, model, rng, inactive, force, game_sims=GAME_SIMS // 2, season_sims=SEASON_SIMS // 2, tick=sim_tick(.5, .7, "si atacan todos"))
     routes = {k: p["assign"] for k, p in plans.items()}
-    with_plan = simulate(L, model, rng, inactive, force, game_sims=GAME_SIMS // 2, season_sims=SEASON_SIMS // 2, plans=routes, tick=sim_tick(.8, 1, "siguiendo el plan"))
+    with_plan = simulate(L, model, rng, inactive, force, game_sims=GAME_SIMS // 2, season_sims=SEASON_SIMS // 2, plans=routes, tick=sim_tick(.7, 1, "siguiendo el plan"))
     need = needs(L, model, sim, tag, inactive, bounds[tag], zones, plans)
     hist = dict(hist or {})
     errs = hist.pop("_bt", None)

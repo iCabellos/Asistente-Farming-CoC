@@ -7,9 +7,11 @@ import hmac
 import json
 import os
 import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import almacen  # noqa: E402
@@ -41,16 +43,32 @@ class handler(BaseHTTPRequestHandler):
         user, _, password = unquote(self.headers.get("X-Clave", "")).partition(":")
         return clan.check_admin(user, password)
 
-    def cron(self):
+    def cron(self, q):
         secret = os.environ.get("CRON_SECRET")
         if not secret or not same(self.headers.get("Authorization", ""), f"Bearer {secret}"):
             return self.send_json({"error": "No autorizado."}, 401)
-        code = clan.daily(retries=2, wait=20)
-        self.send_json({"ok": code == 0}, 200 if code == 0 else 500)   # el 500 deja la recogida fallida marcada en Vercel
+        rows = clan.clan_list()
+        if q.get("clan") or len(rows) < 2:
+            code = clan.daily(retries=2, wait=20)
+            return self.send_json({"ok": code == 0}, 200 if code == 0 else 500)   # el 500 deja la recogida fallida marcada en Vercel
+        # varios clanes: cada uno se recoge en su propia ejecución, con sus 5 minutos, y uno lento no retrasa a los demás
+        host = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL") or self.headers.get("Host")
+
+        def one(r):
+            url = f"https://{host}/api/cron?clan={quote(r['tag'][1:])}"
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers={"Authorization": f"Bearer {secret}", "User-Agent": "coc-rendimiento"}), timeout=295) as x:
+                    return x.status == 200
+            except OSError:
+                return False
+        with ThreadPoolExecutor(len(rows)) as ex:
+            done = list(ex.map(one, rows))
+        self.send_json({"ok": all(done), "clans": len(rows), "failed": done.count(False)}, 200 if all(done) else 500)
 
     def do_GET(self):
         path, q = self.route()
         try:
+            clan.use_clan(q.get("clan"))
             if q.get("fresh"):
                 almacen.leer_ajustes(fresco=True)      # el panel admin debe ver lo que acaba de guardar
                 almacen.refrescar_db()                 # y quien vio acabar una recogida, sus datos nuevos
@@ -67,35 +85,43 @@ class handler(BaseHTTPRequestHandler):
                 return self.send_json(clan.leagues_view())
             if path == "escenarios":
                 return self.send_json(clan.escenarios_view())
+            if path == "vivo":
+                return self.send_json(clan.live_view())
             if path == "player":
                 return self.send_json(clan.player_view(q.get("tag"), *args, q.get("scope", "clan")))
             if path == "owner":
                 return self.send_json(clan.owner_view(q.get("id"), *args, q.get("scope", "clan")))
             if path == "cron":
-                return self.cron()
+                return self.cron(q)
         except ValueError as e:
             return self.send_json({"error": str(e)}, 400)
         self.send_json({"error": "No existe."}, 404)
 
     def do_POST(self):
-        path, _ = self.route()
-        if path not in ("login", "admin", "groups", "sync", "tag", "key", "password", "liga"):
+        path, q = self.route()
+        if path not in ("login", "admin", "groups", "sync", "tag", "key", "password", "liga", "clans"):
             return self.send_json({"error": "No existe."}, 404)
         if not self.is_admin():
             return self.send_json({"error": "Usuario o contraseña incorrectos."}, 401)
         try:
+            clan.use_clan(q.get("clan"))
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
             if path == "admin":
                 return self.send_json(clan.admin_info())
             if path == "groups":
                 clan.save_groups(body.get("groups"))
             elif path == "sync":
-                started = not clan._running.locked() and not clan.progress_state().get("active")   # puede ir en otra instancia
+                started = not clan.running().locked() and not clan.progress_state().get("active")   # puede ir en otra instancia
                 if started:
                     clan.start_sync()
                 return self.send_json({"started": started})
             elif path == "tag":
                 clan.save_tag(body.get("clan_tag"))
+            elif path == "clans":
+                if body.get("action") == "remove":
+                    clan.remove_clan(body.get("tag"))
+                else:
+                    return self.send_json(clan.add_clan(body.get("tag")))
             elif path == "key":
                 clan.save_key(body.get("key"))
             elif path == "password":

@@ -30,7 +30,7 @@ const ownerBadge = (name, id, own = '') => name && name !== own ? `<span class="
 const q = () => `kind=${S.kind}&days=${S.days}`;
 const plural = (n, a, b) => `${num(n)} ${n === 1 ? a : b}`;
 const empty = t => `<div class="text-secondary text-center py-5">${esc(t)}</div>`;
-const hitsHtml = w => `${w.attacks.map(a => `<span class="hit">${stars(a.stars)} <span class="small text-secondary">${a.pct}%${a.enemy_th ? ' · TH' + a.enemy_th : ''}</span></span>`).join('')}${w.per > w.attacks.length ? `<span class="badge bg-red-lt ms-1">${w.per - w.attacks.length} sin usar</span>` : ''}`;
+const hitsHtml = (w, pred) => `${w.attacks.map(a => `<span class="hit">${stars(a.stars)} <span class="small text-secondary">${a.pct}%${a.enemy_th ? ' · TH' + a.enemy_th : ''}</span>${pred?.[a.ord] != null ? `<span class="hit-p" title="% de pleno que se le daba antes de la guerra">previsto ${esPct(pred[a.ord])}</span>` : ''}</span>`).join('')}${w.per > w.attacks.length ? `<span class="badge bg-red-lt ms-1">${w.per - w.attacks.length} sin usar</span>` : ''}`;
 
 function trendHtml(t) {
   if (t == null) return '<span class="text-secondary">–</span>';
@@ -49,14 +49,16 @@ const PAGES = {
   miembros: ['Miembros', 'Quién hay en el clan, si está en guerra ahora y cómo le está yendo. Cambia entre jugadores y cuentas con «Ver por».'],
   guerras: ['Guerras normales', 'Guerras fuera de la liga. Cada jugador tiene 2 ataques. Aquí no entran las rondas de liga.'],
   ligas: ['Ligas', 'Liga de Guerras de Clanes: 8 clanes, 7 rondas y 1 ataque por jugador en cada ronda. Aquí no entran las guerras normales.'],
-  escenarios: ['Escenarios de liga', 'Dónde podemos acabar esta liga, qué hace falta para cada puesto y cómo va cambiando día a día. Se actualiza solo con cada recogida.'],
-  admin: ['Administración', 'Cuentas ligadas a cada jugador, clan que se sigue, recogidas de datos y acceso.'],
+  escenarios: ['Predicciones', 'Lo que se espera del clan, en liga o en guerra según lo que esté jugando.'],
+  admin: ['Administración', 'Clanes que sigue la web y, del clan elegido arriba, sus cuentas, su liga y sus recogidas de datos. También el acceso.'],
   jugador: ['Ficha de la cuenta', 'Todo sobre una cuenta: cómo ataca, cómo defiende y su evolución. Usa «Este clan» o «Todo su historial» para cambiar qué guerras cuentan.'],
   persona: ['Ficha del jugador', 'Una persona con todas sus cuentas: sus KPIs son la media de las cuentas que han jugado guerras, y cada cuenta mantiene los suyos.'],
 };
 const DESC = {
-  eplan: ['Quién ataca a quién para sacar el mayor número de plenos, con el % de cada ataque. Nadie ataca por encima de su puesto. Se recalcula con cada recogida.'],
-  echat: ['Avisos listos para el chat del clan: copia un bloque, pégalo en el juego y ya. Van de 5 en 5, empezando por el jugador más bajo. Las reservas no salen: esperan y rematan.'],
+  eplan: ['Quién ataca a quién para sacar el mayor número de plenos, con el % de cada ataque. El plan principal nunca ataca por encima del puesto; si dejar subir a alguien sale más rentable, se propone como alternativa. Se recalcula con cada recogida.'],
+  ebat: ['La guerra que se está jugando: el marcador, lo que se esperaba antes de empezar y cómo va ahora. Se actualiza sola cada minuto.'],
+  eprev: ['Lo que se previó antes de cada guerra frente a lo que pasó. Cada previsión se hizo solo con lo terminado antes de empezar, y no se retoca. La flecha dice si un ataque salió mejor o peor de lo esperado.'],
+  echat: ['Avisos listos para el chat del clan: copia un bloque, pégalo en el juego y ya. Van de 5 en 5, empezando por el jugador más bajo, y siguen el plan que tengas elegido en cada ronda. Las reservas no salen: esperan y rematan.'],
   epos: ['Cada puesto, en verde si ya está asegurado, en ámbar si es posible y en rojo si está descartado. Pulsa uno para ver qué hace falta.'],
   etab: ['Cómo va el grupo ahora, con qué estrellas se espera que acabe cada clan y entre qué puestos puede moverse.'],
   elog: ['Lo que ha pasado cada ronda y si cada guerra nos ha ayudado o no a mejorar nuestro puesto.'],
@@ -68,7 +70,7 @@ const DESC = {
   aliga: ['Cuántos clanes suben y bajan en tu liga, y qué cuentas no van a atacar. Al guardar se recalculan los escenarios.'],
   ranking: ['Ordenado por índice. Cambia entre jugadores y cuentas con «Ver por». Pulsa una fila para ver sus cuentas y cómo le va en liga y en normales.'],
   grupos: ['Arrastra las cuentas para decir de quién es cada una. El jugador recibe la media de sus cuentas y cada cuenta sigue teniendo sus propios KPIs. Se guarda solo.'],
-  aclan: ['El clan que sigue la web. Al cambiarlo se recogen sus datos; el histórico del clan anterior se conserva.'],
+  aclan: ['Los clanes que sigue la web: cada uno sale como pestaña arriba, con sus datos aparte. Al añadir uno se recogen sus datos; si quitas uno, su histórico se conserva por si vuelve.'],
   arec: ['Cuándo se recogieron los datos por última vez y si hubo errores.'],
   aapi: ['Clave gratuita de Supercell para ver la lista exacta de miembros. Nunca se muestra aquí.'],
   apass: ['Sustituye el acceso inicial. Sólo se guarda un hash de la contraseña.'],
@@ -375,8 +377,8 @@ function renderAdmin(d) {
     ${a.cloud && a.default ? '<div class="alert alert-danger"><i class="ti ti-alert-triangle me-1"></i>Sigues con el acceso inicial <b>admin/admin</b>. La web es pública: cualquiera que lo pruebe podría cambiar el clan. Cámbialo abajo.</div>' : ''}
     ${a.cloud ? `<div class="d-flex align-items-center gap-2 mb-3 small text-secondary"><i class="ti ti-user"></i>Sesión de ${esc(a.user)}<button class="btn btn-sm btn-ghost-secondary ms-auto" id="adminOut"><i class="ti ti-logout me-1"></i>Salir</button></div>` : ''}
     ${sec('grupos', 'Cuentas ligadas a cada jugador', '', ownerBoard(d), true)}
-    ${sec('aclan', 'Clan', '', `<div class="card-body"><form class="d-flex flex-wrap gap-2" id="adminTag" style="max-width:26rem"><input class="form-control flex-fill" style="width:auto" id="adminTagInput" value="${esc(a.clan_tag || '')}" aria-label="Tag del clan" autocomplete="off" autocapitalize="characters"><button class="btn btn-primary" type="submit">Cambiar clan</button></form>
-      <div class="small text-secondary mt-2">Ahora: ${esc(d.clan?.name || '–')} · ${plural(a.members, 'cuenta', 'cuentas')}</div></div>`, true)}
+    ${sec('aclan', 'Clanes', '', `<div class="card-body"><div class="mb-3">${a.clans.map(c => `<div class="cl-row"><i class="ti ti-shield text-secondary"></i><span class="flex-fill text-truncate"><b>${esc(c.name)}</b> <small>${esc(c.tag)}${c.tag === a.clan_tag ? ` · viendo este · ${plural(a.members, 'cuenta', 'cuentas')}` : ''}</small></span>${a.clans.length > 1 ? `<button class="btn btn-sm btn-ghost-danger" type="button" data-clan-out="${esc(c.tag)}" aria-label="Dejar de seguir ${esc(c.name)}"><i class="ti ti-trash me-1"></i>Quitar</button>` : ''}</div>`).join('')}</div>
+      <form class="d-flex flex-wrap gap-2" id="adminTag" style="max-width:26rem"><input class="form-control flex-fill" style="width:auto" id="adminTagInput" placeholder="#2PP0JYLJ9" aria-label="Tag del clan que añadir" autocomplete="off" autocapitalize="characters"><button class="btn btn-primary" type="submit"><i class="ti ti-plus me-1"></i>Añadir clan</button></form></div>`, true)}
     ${esAdminSection(a)}
     ${sec('arec', 'Recogida de datos', '', `<div class="card-body"><div class="d-flex flex-wrap align-items-center gap-2 mb-3"><div>Última completa: <b>${when(a.full_ts)}</b></div><button class="btn btn-primary ms-md-auto" id="adminSync"><i class="ti ti-refresh me-1"></i>Recoger ahora</button></div>
       ${a.error ? `<div class="alert alert-warning">${esc(a.error)}</div>` : ''}
@@ -389,9 +391,12 @@ function renderAdmin(d) {
   const done = t => () => { toast(`<i class="ti ti-check me-1"></i>${t}`); load(); }, fail = err => toast(esc(err.message), 'danger');
   document.getElementById('adminOut')?.addEventListener('click', () => { sessionStorage.removeItem('clave'); load(); });
   $('adminSync').onclick = e => { e.currentTarget.disabled = true; watchProgress(12000); api('api/sync', {}).then(j => { if (!j.started) toast('Ya hay una recogida en marcha', 'secondary'); }).catch(fail); };
-  $('adminTag').onsubmit = e => { e.preventDefault(); const tag = $('adminTagInput').value.trim();
-    if (tag === a.clan_tag || !confirm(`¿Seguir el clan ${tag}? La web pasará a enseñar sus datos.`)) return;
-    api('api/tag', {clan_tag: tag}).then(done('Clan cambiado')).catch(fail); };
+  $('adminTag').onsubmit = e => { e.preventDefault(); const tag = $('adminTagInput').value.trim(), btn = e.target.querySelector('button'); if (!tag) return;
+    btn.disabled = true;
+    api('api/clans', {tag}).then(c => { toast(`<i class="ti ti-check me-1"></i>${esc(c.name)} añadido: recogiendo sus datos…`); Clan.use(c.tag); watchProgress(12000); return api('api/sync', {}); }).catch(fail).finally(() => { btn.disabled = false; }); };
+  $('clanView').querySelectorAll('[data-clan-out]').forEach(b => { b.onclick = () => { const tag = b.dataset.clanOut, name = a.clans.find(c => c.tag === tag)?.name || tag;
+    if (!confirm(`¿Dejar de seguir ${name}? Su histórico se conserva y volverá si lo añades otra vez.`)) return;
+    api('api/clans', {action: 'remove', tag}).then(() => { if (tag === a.clan_tag) { curClan = ''; localStorage.removeItem('clan'); history.replaceState(null, '', location.pathname + location.hash); } done('Clan quitado')(); }).catch(fail); }; });
   esAdminWire(done, fail);
   $('adminKey').onsubmit = e => { e.preventDefault(); api('api/key', {key: $('adminKeyInput').value}).then(done('Clave guardada')).catch(fail); };
   const pf = document.getElementById('adminPass');
@@ -440,6 +445,12 @@ function renderMembers(d) {
     api('api/key', {key: $('keyInput').value}).then(() => { toast('<i class="ti ti-check me-1"></i>Lista oficial conectada; recogiendo datos…'); load(); }).catch(err => toast(esc(err.message), 'danger')); };
 }
 
+// La guerra en juego también se ve desde Guerras y Ligas: un aviso corto que lleva a Predicciones.
+function battleLink(b, kind) {
+  if (!b || b.kind !== kind || b.ends < Date.now() / 1000) return '';
+  const live = b.state === 'inWar', x = b.now || b.before;
+  return `<a class="card card-link lift mb-3 text-reset text-decoration-none" href="#predicciones"><div class="card-body d-flex flex-wrap align-items-center gap-2 py-2"><span class="badge ${live ? 'bg-green-lt' : 'bg-blue-lt'}">${live ? 'En juego' : 'En preparación'}</span><b>vs ${esc(b.them.name)}</b>${live ? `<span>${b.us.stars} – ${b.them.stars}</span>` : ''}${x ? `<span class="small text-secondary">Ganar: ${esPct(x.win)}</span>` : ''}<span class="ms-auto small">Ver predicción <i class="ti ti-arrow-right"></i></span></div></a>`;
+}
 // ---------- guerras normales: sólo normales; las de otros clanes van aparte y nunca suman al clan
 function warCards(rows, opts) {
   const shown = opts.round ? rows.slice().reverse() : rows, open = rows.find(w => w.end_ts === S.openWar);
@@ -449,13 +460,14 @@ function warCards(rows, opts) {
       <div class="fw-bold text-truncate mt-1">vs ${esc(w.opponent)}</div>
       <div class="d-flex align-items-center mt-2"><span class="score">${w.stars}<span class="text-secondary"> – </span>${w.opp_stars}</span><span class="ms-auto">${resultBadge(w.result)}</span></div>
       <div class="vs" aria-hidden="true"><i class="us" style="flex:${w.stars / total}"></i><i class="them" style="flex:${w.opp_stars / total}"></i></div>
-      <div class="d-flex small text-secondary mt-1"><span>${dec(w.pct)} %</span><span class="ms-auto">${dec(w.opp_pct)} %</span></div></div></div></div>`; });
+      <div class="d-flex small text-secondary mt-1"><span>${dec(w.pct)} %</span><span class="ms-auto">${dec(w.opp_pct)} %</span></div>
+      ${opts.pred?.[w.end_ts] ? `<div class="es-prev">Se preveía ${esPct(opts.pred[w.end_ts].before.win)} de ganar · ${dec(opts.pred[w.end_ts].before.us, 0)}★</div>` : ''}</div></div></div>`; });
   (opts.live || []).forEach((w, i) => cards.push(`<div class="col-sm-6 col-lg-4 col-xl-3"><div class="card war-card ghost"><div class="card-body">
       <div class="d-flex small text-secondary"><span class="fw-medium">Ronda ${rows.length + i + 1}</span><span class="ms-auto">${w.phase === 'battle' ? '<span class="text-green"><i class="ti ti-swords me-1"></i>En batalla</span>' : '<i class="ti ti-hourglass me-1"></i>Preparación'}</span></div>
       <div class="fw-bold text-truncate mt-1">vs ${esc(w.rival_name || w.rival)}</div><div class="score mt-2 text-secondary">? – ?</div>
       <div class="small text-secondary mt-2">Acaba en ${fmtMin(w.ends - Date.now() / 1000)}; el resultado entra al terminar</div></div></div></div>`));
   return `<div class="card-body"><div class="row g-3">${cards.join('')}</div>${open ? `<div class="mt-3 fade-in"><div class="fw-medium mb-2">Quién hizo qué vs ${esc(open.opponent)}</div><div class="table-responsive"><table class="table table-sm table-vcenter mb-0"><thead><tr><th>#</th><th>Cuenta</th><th>Ataques</th><th>Defensa</th></tr></thead><tbody>${open.lineup.map(m => `<tr><td class="text-secondary">${m.pos ?? ''}</td><td><a class="player-name" href="${hash(m.tag)}">${esc(m.name)}</a> <span class="text-secondary small">TH${m.th ?? '?'}</span>${ownerBadge(opts.owners?.[m.tag], null, m.name)}</td>
-      <td>${hitsHtml(m)}</td><td>${m.defenses.map(x => `<span class="hit">${stars(x.stars)}</span>`).join('') || '<span class="text-secondary small">–</span>'}</td></tr>`).join('')}</tbody></table></div></div>` : ''}</div>`;
+      <td>${hitsHtml(m, opts.pred?.[open.end_ts]?.p)}</td><td>${m.defenses.map(x => `<span class="hit">${stars(x.stars)}</span>`).join('') || '<span class="text-secondary small">–</span>'}</td></tr>`).join('')}</tbody></table></div></div>` : ''}</div>`;
 }
 const heatCell = (w, t) => { const m = w.lineup.find(x => x.tag === t); if (!m) return '<td class="heat-off"></td>';
   const s = m.attacks.reduce((a, x) => a + x.stars, 0), max = m.per * 3, miss = m.per - m.attacks.length;
@@ -478,9 +490,10 @@ function renderWars(d) {
   const others = `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Cuenta</th><th>TH</th><th>Índice</th><th class="text-end">Guerras</th><th class="text-end">Ataques</th><th class="text-end">Daño efectivo</th><th class="text-end">Media</th><th class="text-end">Clanes</th><th>Último clan</th><th class="text-end">Última</th></tr></thead>
     <tbody>${d.others.map(o => `<tr><td><a class="player-name" href="${hash(o.tag)}">${esc(o.name)}</a>${ownerBadge(d.owner_names[o.tag], null, o.name)}</td><td>${o.th ?? '–'}</td><td><b>${o.index ?? '–'}</b> ${levelBadge(o.level)}</td><td class="text-end">${o.wars}</td><td class="text-end">${o.used}/${o.avail}</td><td class="text-end">${pctTxt(o.values.dano_efectivo)}</td><td class="text-end">${dec(o.values.estrellas, 2)} ★</td><td class="text-end">${o.clans}</td><td class="small">${esc(o.last_clan)}</td><td class="text-end text-secondary">${fechaLarga(o.last_ts)}</td></tr>`).join('') || `<tr><td colspan="10">${empty('Sin guerras con otros clanes')}</td></tr>`}</tbody></table></div>`;
   $('clanView').innerHTML = `
+    ${battleLink(d.battle, 'war')}
     ${has ? `<div class="row row-cards mb-3">${splitCard('war', 'Guerras normales del clan', 'ti-swords', r, null, '', '')}</div>` : `<div class="card mb-3"><div class="empty-state"><i class="ti ti-swords"></i><div class="h3 mt-2 mb-1">Aún no hay guerras normales</div><div class="text-secondary">Este apartado se irá llenando con las próximas guerras del clan.</div><a class="btn btn-sm btn-ghost-primary mt-3" href="#ligas">Ver las rondas de liga <i class="ti ti-arrow-right ms-1"></i></a></div></div>`}
     ${has ? sec('wplay', 'Jugadores en guerras normales', '', ownerTable(d.owners, 'Sin guerras normales'), true) : ''}
-    ${has ? warBlock('w', d.wars, d.heat, {title: 'Guerras', one: 'guerra', many: 'guerras', label: w => fecha(w.end_ts), owners: d.owner_names}) : ''}
+    ${has ? warBlock('w', d.wars, d.heat, {title: 'Guerras', one: 'guerra', many: 'guerras', label: w => fecha(w.end_ts), owners: d.owner_names, pred: d.pred}) : ''}
     ${sec('wother', 'Tus miembros en otros clanes', `Guerras normales fuera de ${esc(d.clan.name)}; no cuentan para el clan`, others, !has)}`;
 }
 
@@ -494,6 +507,7 @@ function renderLeagues(d) {
   const lab = months.map(m => { const [y, mo] = m.split('-'); return `${mo}/${y.slice(2)}`; });
   const liveCwl = live ? d.live.filter(w => w.type === 'cwl') : [];
   $('clanView').innerHTML = `
+    ${battleLink(d.battle, 'cwl')}
     ${months.length > 1 ? `<div class="d-flex align-items-center gap-2 mb-3"><span class="small text-secondary">Temporada</span><select class="form-select form-select-sm w-auto" id="seasonPick" aria-label="Temporada">${months.slice().reverse().map(m => `<option ${m === month ? 'selected' : ''}>${m}</option>`).join('')}</select></div>` : ''}
     ${cur ? `<div class="card hero mb-3"><div class="card-body d-flex flex-wrap align-items-center gap-4">
       <div style="flex:1 1 220px"><div class="subheader">${live ? 'Liga en curso' : 'Liga'}</div><div class="h1 mb-0">${esc(cur.league || '–')}</div></div>
@@ -502,7 +516,7 @@ function renderLeagues(d) {
       <div class="text-center"><div class="subheader" title="Si hay empate a estrellas, desempata la destrucción acumulada">Destrucción acumulada</div><div class="h1 mb-0">${cur.destruction == null ? '–' : dec(cur.destruction, 1) + ' %'}</div></div>
       <div class="text-center"><div class="subheader">Victorias-Empates-Derrotas</div><div class="h1 mb-0">${cur.won ?? 0}-${cur.tied ?? 0}-${cur.lost ?? 0}</div></div>
       <div class="hero-tracker">${tracker(rd, liveCwl)}</div></div></div>` : ''}
-    ${rows.length ? warBlock('l', rows, d.heat, {title: 'Rondas', one: 'ronda', many: 'rondas', label, live: liveCwl, round: w => `Ronda ${num_[w.end_ts]}`, owners: d.owner_names}) : sec('lnone', 'Rondas', '', warCards([], {live: liveCwl}), true)}
+    ${rows.length ? warBlock('l', rows, d.heat, {title: 'Rondas', one: 'ronda', many: 'rondas', label, live: liveCwl, round: w => `Ronda ${num_[w.end_ts]}`, owners: d.owner_names, pred: d.pred}) : sec('lnone', 'Rondas', '', warCards([], {live: liveCwl}), true)}
     ${d.owners[month] ? sec('lplay', 'Jugadores de la temporada', '', ownerTable(d.owners[month], 'Sin rondas', true), true) : ''}
     ${sec('ljug', 'Cuentas por temporada', 'Estrellas · ataques usados · % total y % medio', `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Cuenta</th>${months.map(m => `<th class="text-end">${m}</th>`).join('')}</tr></thead>
       <tbody>${d.matrix.map(r => `<tr><td><a class="player-name" href="${hash(r.tag)}">${esc(r.name)}</a>${ownerBadge(d.owner_names[r.tag], null, r.name)}</td>${months.map(m => { const c = r.cells[m]; return `<td class="text-end">${c ? `${c.stars} ★ <span class="text-secondary small">${c.used}/${c.avail}</span>${c.used ? `<div class="small text-secondary">${Math.round(c.pct)} % · media ${Math.round(c.pct / c.used)} %</div>` : ''}` : '<span class="text-secondary">–</span>'}</td>`; }).join('')}</tr>`).join('') || `<tr><td colspan="9">${empty('Sin datos')}</td></tr>`}</tbody></table></div>`)}
@@ -616,6 +630,12 @@ function cardTables() {
 }
 
 // ---------- marco: filtros, cabecera y carga
+// Pestañas de clan: solo si se sigue más de uno. Lo de debajo no cambia: mismas subpestañas con los datos de ese clan.
+function paintClans(m) {
+  const rows = m.clans || [], box = document.querySelector('.clan-pick');
+  box.classList.toggle('d-none', rows.length < 2);
+  $('clanPick').innerHTML = rows.map(c => `<li class="nav-item" role="presentation"><a class="nav-link ${c.tag === m.clan_tag ? 'active' : ''}" href="#" role="tab" aria-selected="${c.tag === m.clan_tag}" data-clan="${esc(c.tag)}"><i class="ti ti-shield me-1"></i>${esc(c.name)}</a></li>`).join('');
+}
 function paintHead(m) {
   const syncing = m.syncing, full = m.full_ts ? new Date(m.full_ts * 1000).toLocaleString('es-ES', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'}) : 'nunca';
   const next = m.next ? new Date(m.next * 1000).toLocaleString('es-ES', {weekday: 'long', hour: '2-digit', minute: '2-digit'}).replace(', ', ' a las ') : null;
@@ -637,7 +657,7 @@ function paint() {
   $('clanTabs').querySelectorAll('.nav-link').forEach(a => a.classList.toggle('active', a.dataset.v === (['jugador', 'persona'].includes(S.sub) ? 'miembros' : S.sub)));
   if (d.clan) { $('clanName').textContent = d.clan.name; $('clanMeta').textContent = `${d.clan.tag}${d.clan.season ? ' · ' + (d.clan.season.league || '') : ''}`; }
   ({resumen: renderResumen, miembros: renderMembers, guerras: renderWars, ligas: renderLeagues, escenarios: renderEscenarios, jugador: renderPlayer, persona: renderOwner, admin: renderAdmin})[S.sub](d);
-  const page = PAGES[S.sub];
+  const page = S.sub === 'escenarios' ? ES_PAGE[d.mode] || PAGES.escenarios : PAGES[S.sub];
   $('clanView').insertAdjacentHTML('afterbegin', `<div class="page-intro"><h2 class="mb-1">${page[0]}</h2><p class="text-secondary mb-3">${page[1]}</p></div>`);
   cardTables();
   fitCtx();
@@ -661,7 +681,9 @@ function watchProgress(wait = 0) {
   if (S.watching) return;
   S.watching = true;
   let seen = false, misses = 0;
-  const tick = () => api('api/progress').then(p => {
+  const gen = S.watchGen = (S.watchGen || 0) + 1;        // al cambiar de clan se deja de mirar el avance del anterior
+  const tick = () => gen !== S.watchGen ? undefined : api('api/progress').then(p => {
+    if (gen !== S.watchGen) return;
     if (!('active' in p) && seen && ++misses <= 6) { setTimeout(tick, 1500); return; }   // una lectura fallida no significa que haya acabado
     misses = 0;
     S.progress = p;
@@ -692,7 +714,7 @@ function load() {
     if (d.progress?.active) { S.progress = d.progress; watchProgress(); }
     if (seq !== S.seq || S.dragging) return;    // llegó otra petición más nueva, o repintar cortaría el arrastre
     S.stamp = d.meta.stamp; S.syncing = d.meta.syncing; S.cloud = d.meta.cloud;
-    paintHead(d.meta);
+    paintHead(d.meta); paintClans(d.meta);
     const noTag = !d.meta.clan_tag;
     $('clanSetup').classList.toggle('d-none', !noTag); $('clanBody').classList.toggle('d-none', noTag);
     if (noTag) return;
@@ -708,15 +730,23 @@ function poll() {
 }
 window.Clan = {
   show() {
-    const [sub, tag] = location.hash.slice(1).split('/');
+    const [raw, tag] = location.hash.slice(1).split('/'), sub = raw === 'predicciones' ? 'escenarios' : raw;      // los enlaces antiguos siguen valiendo
     S.sub = ['resumen', 'miembros', 'guerras', 'ligas', 'escenarios', 'jugador', 'persona', 'admin'].includes(sub) ? sub : 'resumen';
     S.tag = sub === 'jugador' && tag ? '#' + decodeURIComponent(tag) : sub === 'persona' && tag ? decodeURIComponent(tag) : null;
     S.openWar = S.openRow = null; S.data = null; clearCharts(); $('clanView').innerHTML = skeleton(); S.enter = true;
     if (['jugador', 'persona'].includes(S.sub) && !S.tag) S.sub = 'miembros';
     window.scrollTo(0, 0); load();
   },
-  repaint() { paint(); }     // cambio de tema: las gráficas toman los colores nuevos
+  repaint() { paint(); },    // cambio de tema: las gráficas toman los colores nuevos
+  use(tag) {                 // otro clan: mismas subpestañas con sus datos
+    curClan = tag.replace('#', ''); localStorage.setItem('clan', curClan);
+    history.replaceState(null, '', `?clan=${encodeURIComponent(curClan)}${location.hash}`);
+    S.watching = false; S.watchGen = (S.watchGen || 0) + 1; S.expect = 0; S.progress = null; paintProgress(null);
+    S.planAlt = S.planOpen = S.chatDone = S.whatIf = S.whatFor = null; S.season = null; S.stamp = null;
+    if (['jugador', 'persona'].includes(S.sub)) location.hash = '#miembros'; else Clan.show();
+  }
 };
+$('clanPick').addEventListener('click', e => { const a = e.target.closest('[data-clan]'); if (!a) return; e.preventDefault(); if (!a.classList.contains('active')) Clan.use(a.dataset.clan); });
 $('clanKind').addEventListener('click', e => {
   const a = e.target.closest('[data-k]'); if (!a) return; e.preventDefault(); S.kind = a.dataset.k;
   $('clanKind').querySelectorAll('.nav-link').forEach(x => x.classList.toggle('active', x === a)); load();

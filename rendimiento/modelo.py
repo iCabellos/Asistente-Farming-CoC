@@ -131,11 +131,11 @@ def equip_z(villages):
     return out
 
 
-def usage_rates(rows, now, skip=()):
-    """Asistencia ponderada de cada jugador en liga: lo reciente manda. Devuelve {tag: (ataques, guerras)}."""
+def usage_rates(rows, now, skip=(), cwl=1):
+    """Asistencia ponderada de cada jugador, en liga o en guerras normales: lo reciente manda. Devuelve {tag: (ataques, guerras)}."""
     u, n = defaultdict(float), defaultdict(float)
     for r in rows:
-        if not r["cwl"] or r["end"] in skip:
+        if bool(r["cwl"]) != bool(cwl) or r["end"] in skip:
             continue
         w = .5 ** (max(now - r["end"], 0) / (USE_HALF_DAYS * 86400))
         n[r["tag"]] += w
@@ -367,5 +367,6 @@ def _report(D, tr, va, hp, np):
             if slope > 1e-6:
                 extra.append((r ** 2 - float(var[ids].sum())) / slope ** 2)
     sigma = float(max(0.0, np.mean(extra)) ** .5) if extra else 0.0
+    calib = sum(abs(b["says"] - b["real"]) * b["n"] for b in bins) / max(sum(b["n"] for b in bins), 1)       # cuánto se desvía lo que dice de lo que pasa
     return {"holdout": len(va), "auc": round(auc, 3) if auc else None, "ll3": round(ll3(p3), 4), "ll3_base": round(ll3(base[:, 3]), 4), "brier": round(float(np.mean((p3 - t) ** 2)), 4),
-            "bins": bins, "war_sigma": round(min(sigma, 1.0), 3)}
+            "bins": bins, "war_sigma": round(min(sigma, 1.0), 3), "calib": round(calib, 4)}

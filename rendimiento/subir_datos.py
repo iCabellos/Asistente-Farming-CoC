@@ -22,6 +22,6 @@ if __name__ == "__main__":
         ajustes = {"groups": clan.account_groups(c), "own_names": sorted(clan.own_names())}   # nunca la clave de la API
     finally:
         c.close()
-    almacen.subir(almacen.BLOB_DB, almacen.DB.read_bytes(), "application/octet-stream")
+    almacen.subir(almacen._blob_db(almacen.PRIMERO), almacen.DB.read_bytes(), "application/octet-stream")
     almacen.subir(almacen.BLOB_AJUSTES, json.dumps(ajustes, ensure_ascii=False).encode("utf-8"), "application/json")
     print(f"Subido: {almacen.DB.stat().st_size // 1024} KB de histórico y {len(ajustes['groups'])} jugadores agrupados.")
