@@ -2,6 +2,7 @@
 <html lang="es" data-bs-theme="dark">
 <head>
 <meta charset="utf-8">
+<script>document.documentElement.dataset.bsTheme = localStorage.getItem('tema') || 'dark';</script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CoC Asistente · Panel</title>
 <link rel="preconnect" href="https://cdn.jsdelivr.net">
@@ -11,6 +12,8 @@
 <style>
   :root { --tblr-font-sans-serif: 'Inter Var', Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
           --c-gold:#f5b82e; --c-elixir:#c25ef0; --c-dark:#7c6cf5 }
+  [data-bs-theme=dark] { --tint-strong:rgba(255,255,255,.09); --chart-grid:rgba(255,255,255,.08); --chart-text:#9aa4b5; --tint:rgba(255,255,255,.02); --heat-text:#fff; --heat-miss:#ffb4b4 }
+  [data-bs-theme=light] { --tint-strong:rgba(0,0,0,.08); --chart-grid:rgba(0,0,0,.09); --chart-text:#52606f; --tint:rgba(0,0,0,.025); --heat-text:#1a1205; --heat-miss:#b42318 }
   body { font-feature-settings: "cv03", "cv04", "cv11" }
   .navbar-brand-mark { width:34px; height:34px; border-radius:9px; display:inline-grid; place-items:center;
                        background:linear-gradient(135deg,#f5b82e,#e8590c); color:#1a1205; font-size:20px }
@@ -67,11 +70,13 @@
         <span class="d-flex flex-column lh-1"><span class="fw-bold">CoC Asistente</span>
           <small class="text-secondary fw-normal" style="font-size:.72rem">Panel de control</small></span>
       </a>
+      <a class="btn btn-sm btn-ghost-secondary me-3" href="{{RENDIMIENTO_URL}}" target="_blank" rel="noopener"><i class="ti ti-trophy me-1"></i>Rendimiento <i class="ti ti-external-link ms-1"></i></a>
       <div class="d-none d-md-flex align-items-center text-truncate me-auto" style="max-width:52%">
         <span class="badge badge-outline text-secondary me-2 d-flex align-items-center" id="statusBadge"><span class="status-dot off"></span><span>Conectando…</span></span>
         <span class="text-secondary text-truncate small" id="nowText"></span>
       </div>
       <div class="d-flex align-items-center gap-2 ms-auto">
+        <button class="btn btn-icon btn-ghost-secondary" id="btnTheme" aria-label="Cambiar tema"><i class="ti ti-sun" id="themeIcon"></i></button>
         <button class="btn btn-ghost-secondary" id="btnSkip" title="Saltar el descanso y empezar la rutina ya"><i class="ti ti-player-skip-forward me-1"></i>Empezar ya</button>
         <button class="btn btn-primary" id="btnToggle" disabled><i class="ti ti-player-play me-1"></i>Iniciar</button>
       </div>
@@ -168,9 +173,10 @@
         </div>
 
       </div>
+
     </div>
     <footer class="footer footer-transparent d-print-none"><div class="container-xl text-secondary small">
-      CoC Asistente · panel local en <code>localhost:8000</code> · los datos no salen de tu PC</div></footer>
+      CoC Asistente · panel local en <code>localhost:8000</code> · nada de esto sale de tu PC</div></footer>
   </div>
 </div>
 
@@ -187,7 +193,7 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 const hhmm = ts => new Date(ts * 1000).toLocaleTimeString('es-ES', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
 const num = n => n == null ? '–' : Number(n).toLocaleString('es-ES');
 const short = n => n == null ? '–' : n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 1 : 2).replace('.', ',') + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(Math.round(n));
-const fmtMin = s => s <= 0 ? 'ya' : (s >= 3600 ? Math.floor(s / 3600) + ' h ' : '') + Math.ceil((s % 3600) / 60) + ' min';
+const fmtMin = s => { if (s <= 0) return 'ya'; const m = Math.ceil(s / 60), h = Math.floor(m / 60); return h ? `${h} h${m % 60 ? ` ${m % 60} min` : ''}` : `${m} min`; };
 const api = (url, body) => fetch(url, body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
   .then(r => r.json().then(j => { if (!r.ok) throw new Error(j.error || r.statusText); return j; }));
 function toast(msg, kind = 'success') {
@@ -345,7 +351,9 @@ $('storage').addEventListener('input', e => {
 
 // ============================================================ botín (Chart.js + tabla + KPIs)
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-Chart.defaults.color = '#9aa4b5'; Chart.defaults.font.family = "Inter, sans-serif"; Chart.defaults.borderColor = 'rgba(255,255,255,.06)';
+Chart.defaults.font.family = "Inter, sans-serif";
+function chartTheme() { Chart.defaults.color = css('--chart-text'); Chart.defaults.borderColor = css('--chart-grid'); }
+chartTheme();
 const chart = new Chart($('lootChart'), {type: 'bar', data: {labels: [], datasets: [
     {label: 'Oro', data: [], backgroundColor: '#f5b82e', borderRadius: 3, stack: 's'},
     {label: 'Elixir', data: [], backgroundColor: '#c25ef0', borderRadius: 3, stack: 's'}]},
@@ -432,6 +440,19 @@ function frame() {
     if (prevUrl) URL.revokeObjectURL(prevUrl); prevUrl = url;
   }).catch(() => {}).finally(() => setTimeout(frame, 70));
 }
+
+// ============================================================ tema claro / oscuro
+function paintThemeButton() {
+  const dark = document.documentElement.dataset.bsTheme === 'dark';
+  $('themeIcon').className = 'ti ' + (dark ? 'ti-sun' : 'ti-moon');
+  $('btnTheme').title = dark ? 'Cambiar a modo claro' : 'Cambiar a modo oscuro';
+}
+$('btnTheme').onclick = () => {
+  const next = document.documentElement.dataset.bsTheme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.bsTheme = next; localStorage.setItem('tema', next);
+  paintThemeButton(); chartTheme(); chart.update();
+};
+paintThemeButton();
 
 // ============================================================ arranque
 function renderAll() { paintStatus(); renderRoutine(); renderStorage(); renderLoot(); }

@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 import av
 
 ROOT = Path(__file__).parent
+RENDIMIENTO_URL = os.environ.get("COC_RENDIMIENTO_URL", "https://coc-rendimiento-clan.vercel.app")   # la web del clan
 LOG = ROOT / "log.jsonl"
 LOOT = ROOT / "loot.jsonl"   # botín conseguido por ataque
 def _cfg():
@@ -180,7 +181,7 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/":
-            body = (ROOT / "index.html").read_bytes()
+            body = (ROOT / "index.html").read_bytes().replace(b"{{RENDIMIENTO_URL}}", RENDIMIENTO_URL.encode())
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))

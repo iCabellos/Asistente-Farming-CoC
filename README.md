@@ -104,6 +104,11 @@ Si una cuenta te sobra, bórrala (y sus pasos en `"routine"`). Guarda el archivo
 | **🔁 Rutina en bucle** | La lista de tareas. **Arrastra** las filas para cambiar la prioridad, cambia cuenta/tarea, ⏸ desactiva, ✕ quita, ＋ añade. Pulsa **Guardar**. Iconos: ⚙️ haciéndolo · ✅ hecho/lleno · ⏳ pendiente · 🙈 saltada (estabas jugando) · ⚠️ falló · 💤 desactivada. **⏭ Empezar ya** se salta el descanso. |
 | **💰 Botín por ataque** | Cada ataque con estrellas, % y oro/elixir/oscuro, y el TOTAL. |
 | **Diario** | Qué ve, qué decide y qué hace, en tiempo real. |
+| **🏆 Rendimiento** | Enlace a la web del clan, que es un proyecto aparte: ver [`rendimiento/`](rendimiento/README.md). |
+
+### Rendimiento
+
+La web del clan vive en [`rendimiento/`](rendimiento/README.md): se abre aparte con `rendimiento/Abrir rendimiento.bat` y se puede publicar en Vercel. El visor sólo la enlaza; cambia el enlace con la variable `COC_RENDIMIENTO_URL`.
 
 ### Tareas disponibles
 
@@ -137,6 +142,7 @@ Si una cuenta te sobra, bórrala (y sus pasos en `"routine"`). Guarda el archivo
 | La pantalla del visor sale negra | BlueStacks está minimizado o arrancando; espera un minuto. |
 | No cambia de cuenta | `switch_label` debe coincidir con la tarjeta de *Cambiar de cuenta* (Supercell ID). |
 | Toca en sitios raros | La resolución del emulador **tiene que ser 1920 × 1080** y el zoom del juego al mínimo. |
+| No hace zoom out o no se mueve bien | Con la aldea a la vista y el asistente detenido, doble clic en **`probar_zoom.bat`**: comprueba la resolución y el táctil, y prueba el zoom. |
 | Lee mal los números | Comprueba que Ollama está instalado y que se descargó el modelo: `ollama list` debe mostrar `qwen2.5vl:7b`. |
 | El PC va muy lento | El modelo de visión necesita RAM: cierra programas o usa un PC con 16 GB+. |
 | Quiero que pare ya | `Detener asistente`. Para que deje de tocar al instante, cierra BlueStacks. |
@@ -152,8 +158,10 @@ coc-asistente/
 ├─ Iniciar asistente.bat   ← pone a farmear y abre el panel
 ├─ Detener asistente.bat   ← parada limpia
 ├─ probar_conexion.bat     ← comprueba ADB
+├─ probar_zoom.bat         ← comprueba el zoom out
 ├─ vigilante.py            ← mantiene todo vivo
 ├─ server.py · index.html  ← visor web (localhost:8000)
+├─ rendimiento/            ← web del clan, independiente (lista para Vercel)
 ├─ requirements.txt
 └─ asistente/
    ├─ asistente.py           ← el asistente
@@ -174,4 +182,4 @@ git remote add origin https://github.com/TU_USUARIO/coc-asistente.git
 git push -u origin main
 ```
 
-`asistente/config.json` (tus cuentas), los registros y las capturas **no se suben** (están en `.gitignore`).
+`asistente/config.json` (tus cuentas), `rendimiento/clan.json` y `rendimiento/clan.db` (tu clan), los registros y las capturas **no se suben** (están en `.gitignore`).

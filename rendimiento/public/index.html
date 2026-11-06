@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="es" data-bs-theme="dark">
+<head>
+<meta charset="utf-8">
+<script>document.documentElement.dataset.bsTheme = localStorage.getItem('tema') || 'dark';</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#151f2c">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23f5b82e'/%3E%3Cpath d='M9 8h14v7a7 7 0 0 1-14 0zM13 23h6v2h-6z' fill='%231a1205'/%3E%3C/svg%3E">
+<title>Rendimiento del clan</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/core@1.0.0/dist/css/tabler.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
+<style>
+  :root { --tblr-font-sans-serif: 'Inter Var', Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          --c-gold:#f5b82e; --c-elixir:#c25ef0; --c-dark:#7c6cf5 }
+  [data-bs-theme=dark] { --tint-strong:rgba(255,255,255,.09); --chart-grid:rgba(255,255,255,.08); --chart-text:#9aa4b5; --tint:rgba(255,255,255,.02); --heat-text:#fff; --heat-miss:#ffb4b4 }
+  [data-bs-theme=light] { --tint-strong:rgba(0,0,0,.08); --chart-grid:rgba(0,0,0,.09); --chart-text:#52606f; --tint:rgba(0,0,0,.025); --heat-text:#1a1205; --heat-miss:#b42318 }
+  body { font-feature-settings: "cv03", "cv04", "cv11" }
+  .navbar-brand-mark { width:34px; height:34px; border-radius:9px; display:inline-grid; place-items:center;
+                       background:linear-gradient(135deg,#f5b82e,#e8590c); color:#1a1205; font-size:20px }
+  @keyframes pulse { 70% { box-shadow:0 0 0 8px rgba(47,179,68,0) } 100% { box-shadow:0 0 0 0 rgba(47,179,68,0) } }
+  .spin { display:inline-block; animation:spin 1.6s linear infinite } @keyframes spin { to { transform:rotate(360deg) } }
+  .bg-gold { background:var(--c-gold)!important } .bg-elixir { background:var(--c-elixir)!important } .bg-darkelixir { background:var(--c-dark)!important }
+  /* rendimiento */
+  .rank-table { font-variant-numeric:tabular-nums }
+  .rank-table tbody tr.player { cursor:pointer } .rank-table tr.mine td { background:rgba(245,184,46,.06) }
+  .rank-table .pos { width:2.5rem; text-align:right; color:var(--tblr-secondary); font-weight:600 }
+  .rank-table .scorecell { width:22%; min-width:140px } .rank-table .scorecell b { width:2.4rem; flex:none; text-align:right }
+  .rank-table .sort { cursor:pointer; white-space:nowrap }
+  .rank-table .open-row > td { background:var(--tint); padding:.5rem .9rem .9rem 2rem }
+  .player-name { color:inherit; font-weight:600; text-decoration:none } a.player-name:hover { text-decoration:underline }
+  .hit { white-space:nowrap } .hit + .hit { margin-left:.9rem }
+  .heat-table th { font-size:.68rem; text-align:center; white-space:nowrap } .heat-table th:first-child { text-align:left }
+  .heat-table td { font-variant-numeric:tabular-nums } .heat-table td:first-child { white-space:nowrap }
+  .heat { text-align:center; color:var(--heat-text); font-weight:600; border:2px solid var(--tblr-bg-surface); min-width:2.2rem }
+  .heat-off { background:var(--tint); border:2px solid var(--tblr-bg-surface) } .heat .miss { color:var(--heat-miss); margin-left:2px }
+  /* rendimiento: piezas visuales */
+  #clanNav { position:sticky; top:57px; z-index:5; background:var(--tblr-body-bg); padding:.5rem 0; margin-bottom:.75rem }
+  .fade-in { animation:fadeIn .22s ease-out } @keyframes fadeIn { from { opacity:0; transform:translateY(4px) } to { opacity:1; transform:none } }
+  .lift { transition:transform .14s, box-shadow .14s, border-color .14s } .lift:hover { transform:translateY(-2px); box-shadow:0 6px 18px rgba(0,0,0,.18) }
+  [role=button]:focus-visible, a:focus-visible, summary:focus-visible { outline:2px solid var(--tblr-primary); outline-offset:2px }
+  .ring { position:relative; display:inline-grid; place-items:center; flex:none } .ring svg { position:absolute; inset:0 } .ring b { font-variant-numeric:tabular-nums; line-height:1 }
+  .ring-bg { stroke:var(--tint-strong); fill:none } .ring-fg { fill:none; stroke-linecap:round; transition:stroke-dashoffset .5s }
+  .av { width:34px; height:34px; border-radius:50%; display:inline-grid; place-items:center; flex:none; font-weight:700; font-size:.76rem; background:var(--tint-strong); color:var(--tblr-body-color) }
+  .av-mine { box-shadow:0 0 0 2px var(--c-gold) } .av-lg { width:56px; height:56px; font-size:1.05rem }
+  .strip { display:inline-flex; gap:3px; vertical-align:middle } .strip i { width:14px; height:14px; border-radius:3px; display:block; font-style:normal; background:var(--tint-strong) }
+  .strip .s1 { background:rgba(176,124,14,.35) } .strip .s2 { background:rgba(176,124,14,.65) } .strip .s3 { background:#b07c0e } .strip .sx { background:none; box-shadow:inset 0 0 0 2px var(--tblr-red) }
+  .tracker { display:flex; gap:.4rem; flex-wrap:wrap } .tracker .t { width:42px; text-align:center; font-size:.68rem; color:var(--tblr-secondary) }
+  .tracker .dot { width:30px; height:30px; margin:0 auto .15rem; border-radius:50%; display:grid; place-items:center; background:var(--tint-strong); color:var(--tblr-secondary) }
+  .tracker .win { background:var(--tblr-green); color:#fff } .tracker .lose { background:var(--tblr-red); color:#fff } .tracker .tie { background:var(--tblr-secondary); color:#fff }
+  .tracker .battle { background:none; border:2px solid var(--tblr-green); color:var(--tblr-green); animation:pulse 1.8s infinite } .tracker .prep { background:none; box-shadow:inset 0 0 0 2px var(--tblr-secondary) }
+  .bullet + .bullet { margin-top:.8rem } .bullet-track { position:relative; height:9px; border-radius:5px; background:var(--tint-strong); margin-top:.25rem }
+  .bullet-fill { position:absolute; inset:0 auto 0 0; border-radius:5px; background:#b07c0e } .bullet-mark { position:absolute; top:-3px; bottom:-3px; width:3px; margin-left:-1.5px; border-radius:2px; background:#a855f7 }
+  .war-card { cursor:pointer; border-top:3px solid var(--tblr-border-color); height:100% } .war-card.win { border-top-color:var(--tblr-green) } .war-card.lose { border-top-color:var(--tblr-red) } .war-card.open { box-shadow:0 0 0 2px var(--tblr-primary) }
+  .war-card.ghost { cursor:default; border-style:dashed; background:none } .war-card .score { font-size:1.65rem; font-weight:700; font-variant-numeric:tabular-nums; line-height:1.1 }
+  .vs { display:flex; height:7px; gap:2px; margin-top:.5rem } .vs i { display:block; border-radius:4px; min-width:3px } .vs .us { background:#b07c0e } .vs .them { background:#a855f7 }
+  .podium .card { text-align:center } .podium .first { border-top:3px solid var(--c-gold) } .medal { font-size:1.35rem; line-height:1 }
+  .hero { background:linear-gradient(120deg,rgba(245,184,46,.10),rgba(168,85,247,.08)) } .hero-line { font-size:1.05rem; line-height:1.45 }
+  .empty-state { text-align:center; padding:2.5rem 1rem } .empty-state i { font-size:2.6rem; color:var(--tblr-secondary) }
+  .sk { border-radius:var(--tblr-border-radius); background:var(--tint-strong); animation:skel 1.2s ease-in-out infinite alternate } @keyframes skel { from { opacity:.5 } to { opacity:1 } }
+  @media (prefers-reduced-motion:reduce) { .fade-in, .sk, .lift, .tracker .battle { animation:none; transition:none } }
+  .rank-table .sub-row td { font-size:.8rem; background:var(--tint) } .rank-table .sub-row td:first-child { padding-left:3.4rem }
+  .own-card { border:1px solid var(--tblr-border-color); border-radius:var(--tblr-border-radius); background:var(--tblr-bg-surface); padding:.35rem }
+  .own-head { display:flex; align-items:center; gap:.4rem; padding:.2rem .3rem } .own-handle { cursor:grab; color:var(--tblr-secondary) }
+  .own-title { flex:1 1 auto; min-width:0; font-weight:600; border-color:transparent; background:none } .own-title:hover, .own-title:focus { border-color:var(--tblr-border-color) }
+  .own-index { font-variant-numeric:tabular-nums } .own-groups { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:.75rem }
+  .own-list { min-height:46px; display:flex; flex-direction:column; gap:.3rem; padding:.25rem; border-radius:var(--tblr-border-radius) }
+  .own-pool .own-list { max-height:430px; overflow:auto }
+  .own-chip { display:flex; align-items:center; gap:.5rem; padding:.25rem .45rem; border-radius:var(--tblr-border-radius); background:var(--tint); cursor:grab; user-select:none } .own-chip:active { cursor:grabbing }
+  .own-chip .av { width:26px; height:26px; font-size:.62rem } .own-name { display:flex; align-items:baseline; gap:.4rem; min-width:0 } .own-name b { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+  .own-new { margin-top:.75rem; border-style:dashed; background:none } .own-hint { color:var(--tblr-secondary); text-align:center; font-size:.82rem; padding:.55rem }
+  .own-row { display:grid; grid-template-columns:1fr auto 2rem; gap:.5rem; align-items:baseline; padding:.15rem 0; color:inherit; text-decoration:none; border-top:1px solid var(--tblr-border-color) } .own-row b { text-align:right; font-variant-numeric:tabular-nums } a.own-row:hover { color:var(--tblr-primary) }
+  .legend-row { display:flex; flex-wrap:wrap; align-items:center; gap:.3rem .9rem; padding:.55rem 1rem; font-size:.78rem; color:var(--tblr-secondary); border-bottom:1px solid var(--tblr-border-color) }
+  .legend-inline { display:flex; flex-wrap:wrap; gap:.25rem .75rem; margin-top:.45rem; font-size:.72rem; color:var(--tblr-secondary) }
+  .lg { display:inline-flex; align-items:center; gap:.3rem; white-space:nowrap } .lg-title { font-weight:600; color:var(--tblr-body-color) } .lg-title:not(:first-child) { margin-left:.7rem }
+  .sw { width:12px; height:12px; border-radius:3px; display:inline-block; flex:none; font-style:normal; background:var(--tint-strong) } .sw.round { border-radius:50% }
+  .sw.s1 { background:rgba(176,124,14,.35) } .sw.s2 { background:rgba(176,124,14,.65) } .sw.s3 { background:#b07c0e } .sw.sx { background:none; box-shadow:inset 0 0 0 2px var(--tblr-red) }
+  .sec-desc { font-weight:400; margin-top:.15rem } .page-intro p { max-width:60rem }
+  details > summary { list-style:none; cursor:pointer } details > summary::-webkit-details-marker { display:none }
+  .sec > summary .chev { transition:transform .15s; color:var(--tblr-secondary) } .sec[open] > summary .chev { transform:rotate(90deg) }
+  .sec:not([open]) > summary { border-bottom:0 } .ctx-row > td { background:var(--tint); padding:.75rem 1rem 1rem 2rem }
+  .ctx-row:hover > td { background:var(--tint) } tr.player .row-chev { color:var(--tblr-secondary); transition:transform .15s } tr.player[aria-expanded=true] .row-chev { transform:rotate(90deg) }
+  .split-card { border-top:3px solid var(--tblr-border-color) } .split-cwl { border-top-color:#a855f7 } .split-war { border-top-color:#b07c0e }
+  /* móvil primero: esto es lo que ve el teléfono; desde 768 px se vuelve a la vista de escritorio */
+  body { padding-bottom:calc(4.4rem + env(safe-area-inset-bottom)) }
+  .toast-container { bottom:calc(4.4rem + env(safe-area-inset-bottom))!important }
+  .page-body { margin-top:.75rem } .container-xl { padding-left:.75rem; padding-right:.75rem }
+  .page-intro h2 { font-size:1.15rem } .page-intro p { font-size:.82rem; margin-bottom:.75rem!important }
+  #clanSync { flex:1 1 auto; min-width:0; text-align:left!important; font-size:.72rem } #clanHead { row-gap:.25rem!important }
+  #clanName { font-size:1.2rem } #clanNameBox { flex:1 1 100% }
+  #clanNav { position:static; display:block; padding:0; margin-bottom:.75rem } #clanFilters { margin-top:.5rem }
+  #clanBy .btn-group { flex:1 } #clanBy .btn { flex:1 }
+  #clanFilters, .hscroll { flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none; -webkit-overflow-scrolling:touch } #clanFilters::-webkit-scrollbar, .hscroll::-webkit-scrollbar { display:none }
+  #clanKind { flex-wrap:nowrap; flex:none } #clanKind .nav-link, #stateTabs .nav-link { white-space:nowrap; padding:.4rem .6rem } #clanKindLabel { display:none } #clanDays { flex:none }
+  #stateTabs { flex-wrap:nowrap; flex:none }
+  #clanTabs { position:fixed; z-index:1030; left:0; right:0; bottom:0; display:grid; grid-template-columns:repeat(4,1fr); gap:0; padding:.25rem .25rem calc(.25rem + env(safe-area-inset-bottom)); background:var(--tblr-bg-surface); border-top:1px solid var(--tblr-border-color); box-shadow:0 -4px 14px rgba(0,0,0,.18) }
+  #clanTabs .nav-link { display:flex; flex-direction:column; align-items:center; gap:.1rem; width:100%; padding:.35rem .1rem; font-size:.7rem; min-height:3.2rem; justify-content:center } #clanTabs .nav-link i { font-size:1.35rem; margin:0!important }
+  .nav-link, .btn, .form-select, .form-control { min-height:40px } .btn-group .btn { min-height:38px } .form-select, .form-control { font-size:16px }
+  .own-chip .own-move { min-height:34px; width:6.4rem; flex:none; font-size:.75rem; padding:.1rem 1.4rem .1rem .4rem } .own-title { min-height:34px; font-size:.9rem }
+  .tracker { display:grid; grid-template-columns:repeat(7,1fr); gap:.2rem; width:100% } .tracker .t { width:auto } .tracker .dot { width:28px; height:28px } .hero .card-body { gap:1rem!important } .hero-tracker { width:100% }
+  .podium .text-truncate { white-space:normal } .podium .col-4 { padding-left:.2rem; padding-right:.2rem }
+  .own-pool .own-list { max-height:none } .own-groups { grid-template-columns:minmax(0,1fr) }
+  .card-table td:first-child, .card-table th:first-child { padding-left:.75rem } .heat-table td:first-child { position:sticky; left:0; z-index:1; background:var(--tblr-bg-surface) } .heat-table th:first-child { position:sticky; left:0; z-index:2; background:var(--tblr-bg-surface) }
+  /* tablas como tarjetas: la etiqueta de cada dato sale de su cabecera (ver cardTables en rendimiento.js) */
+  @media (max-width:767.98px) {
+    .m-cards, .m-cards > tbody { display:block; width:100% } .m-cards > thead { display:none }
+    .m-cards > tbody > tr { display:flex; flex-wrap:wrap; align-items:flex-end; gap:.35rem .9rem; padding:.6rem .75rem; border-bottom:1px solid var(--tblr-border-color) }
+    .m-cards > tbody > tr > td { display:block; width:auto!important; min-width:0; padding:0!important; border:0; text-align:left!important; background:none }
+    .m-cards > tbody > tr > td:empty { display:none }
+    .m-cards > tbody > tr > td[data-l]::before { content:attr(data-l); display:block; font-size:.64rem; letter-spacing:.02em; color:var(--tblr-secondary); margin-bottom:.05rem }
+    .m-cards > tbody > tr > td.m-main { flex:1 1 calc(100% - 2.4rem); align-self:center } .m-cards > tbody > tr > td.m-main::before { display:none!important }
+    .m-cards > tbody > tr > td.pos { width:1.5rem!important; flex:none; align-self:center; text-align:right!important }
+    .m-cards > tbody > tr > td.scorecell { flex:1 1 100%; order:1 } .m-cards > tbody > tr > td.scorecell::before { display:none!important }
+    .m-cards > tbody > tr > td:not(.m-main):not(.pos):not(.scorecell) { order:2 }
+    .m-cards > tbody > tr > td[colspan] { flex:1 1 100% } .m-cards .ctx-row > td { padding:.25rem 0 0!important; overflow:hidden }
+    .m-cards > tbody > tr.ctx-row { background:var(--tint) } .m-cards > tbody > tr.mine { background:rgba(245,184,46,.06) }
+    .rank-table .sub-row { padding-left:1.6rem!important; background:var(--tint) } .rank-table .sub-row td:first-child { padding-left:0!important }
+    .ctx-row table:not(.m-cards) { font-size:.76rem }
+  }
+  @media (min-width:768px) {
+    body { padding-bottom:0 } .toast-container { bottom:0!important } .container-xl { padding-left:var(--tblr-gutter-x,1.5rem); padding-right:var(--tblr-gutter-x,1.5rem) }
+    .page-intro h2 { font-size:1.25rem } .page-intro p { font-size:inherit }
+    #clanSync { flex:initial; text-align:right!important; font-size:.8rem; margin-left:auto } #clanName { font-size:1.5rem } #clanNameBox { flex:initial }
+    #clanNav { position:sticky; top:57px; display:flex; padding:.5rem 0 } #clanFilters { margin-top:0; overflow:visible } #clanKindLabel { display:inline } #clanBy .btn-group, #clanBy .btn { flex:initial }
+    #clanTabs { position:static; display:flex; padding:0; background:none; border:0; box-shadow:none } #clanTabs .nav-link { flex-direction:row; width:auto; padding:.5rem .75rem; font-size:inherit; min-height:0; gap:0 } #clanTabs .nav-link i { font-size:inherit; margin-right:.25rem!important }
+    .nav-link, .btn, .form-select, .form-control, .btn-group .btn { min-height:0 } .form-select, .form-control { font-size:.875rem }
+    .tracker { display:flex; flex-wrap:wrap; width:auto; gap:.4rem } .tracker .t { width:42px } .tracker .dot { width:30px; height:30px } .hero-tracker { width:auto } .own-pool .own-list { max-height:430px } .own-groups { grid-template-columns:repeat(auto-fill,minmax(250px,1fr)) }
+    .podium .text-truncate { white-space:nowrap } .heat-table td:first-child, .heat-table th:first-child { position:static }
+  }
+  @media (hover:none) { .lift:hover { transform:none; box-shadow:none } }
+  .own-chip.sortable-ghost { opacity:.35 }
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="navbar navbar-expand-md d-print-none sticky-top border-bottom">
+    <div class="container-xl">
+      <a class="navbar-brand d-flex align-items-center gap-2 me-auto" href="#">
+        <span class="navbar-brand-mark"><i class="ti ti-trophy"></i></span>
+        <span class="d-flex flex-column lh-1"><span class="fw-bold">Rendimiento</span>
+          <small class="text-secondary fw-normal" style="font-size:.72rem">Panel del clan</small></span>
+      </a>
+      <form class="d-none align-items-center gap-2 me-2" id="loginForm"><input class="form-control form-control-sm" style="width:11rem" type="password" id="loginInput" placeholder="Contraseña" aria-label="Contraseña" autocomplete="current-password"><button class="btn btn-sm btn-primary" type="submit">Entrar</button></form>
+      <button class="btn btn-sm btn-ghost-secondary me-1 d-none" id="btnEdit" title="Organizar jugadores y recoger datos"><i class="ti ti-lock me-1"></i><span>Editar</span></button>
+      <button class="btn btn-icon btn-ghost-secondary" id="btnTheme" aria-label="Cambiar tema"><i class="ti" id="themeIcon"></i></button>
+    </div>
+  </header>
+  <div class="page-wrapper"><div class="page-body">
+    <div class="container-xl">
+        <div class="alert alert-warning d-none" id="clanError" role="alert"></div>
+        <div class="card mb-3 d-none" id="clanSetup"><div class="card-body">
+          <h3 class="card-title mb-1"><i class="ti ti-hash me-1 text-secondary"></i>Falta el tag del clan</h3>
+          <p class="text-secondary">Copia el tag del perfil del clan en el juego (empieza por #).</p>
+          <form class="d-flex gap-2" id="clanForm" style="max-width:26rem">
+            <input class="form-control" id="clanTagInput" placeholder="#2PP0JYLJ9" aria-label="Tag del clan" autocomplete="off">
+            <button class="btn btn-primary" type="submit">Guardar</button></form>
+        </div></div>
+        <div class="d-none" id="clanBody">
+          <div class="d-flex flex-wrap align-items-center gap-3 mb-2" id="clanHead">
+            <div id="clanNameBox"><div class="h2 mb-0" id="clanName"></div><div class="text-secondary small" id="clanMeta"></div></div>
+            <div class="small text-secondary" id="clanSync"></div>
+            <button class="btn btn-icon btn-ghost-secondary" id="clanRefresh" title="Recoger datos ahora" aria-label="Recoger datos ahora"><i class="ti ti-refresh"></i></button>
+          </div>
+          <div class="d-flex flex-wrap align-items-center gap-2" id="clanNav">
+            <ul class="nav nav-pills" id="clanTabs">
+              <li class="nav-item"><a class="nav-link" data-v="resumen" href="#resumen"><i class="ti ti-layout-dashboard me-1"></i>Resumen</a></li>
+              <li class="nav-item"><a class="nav-link" data-v="miembros" href="#miembros"><i class="ti ti-users me-1"></i>Miembros</a></li>
+              <li class="nav-item"><a class="nav-link" data-v="guerras" href="#guerras"><i class="ti ti-swords me-1"></i><span class="d-none d-md-inline">Guerras normales</span><span class="d-md-none">Guerras</span></a></li>
+              <li class="nav-item"><a class="nav-link" data-v="ligas" href="#ligas"><i class="ti ti-shield-star me-1"></i>Ligas</a></li>
+            </ul>
+            <div class="d-flex align-items-center gap-2" id="clanBy"><span class="small text-secondary">Ver por</span>
+              <div class="btn-group" role="group" aria-label="Ver por"><button class="btn btn-sm" data-by="player">Jugador</button><button class="btn btn-sm" data-by="account">Cuenta</button></div></div>
+            <div class="ms-auto d-flex align-items-center gap-2" id="clanFilters">
+              <span class="small text-secondary" id="clanKindLabel">Mostrar</span>
+              <ul class="nav nav-pills" id="clanKind">
+                <li class="nav-item"><a class="nav-link active" data-k="all" href="#" title="Todas las guerras del clan">Todo</a></li>
+                <li class="nav-item"><a class="nav-link" data-k="cur" href="#" title="Sólo las rondas de la temporada actual">Liga actual</a></li>
+                <li class="nav-item"><a class="nav-link" data-k="cwl" href="#" title="Rondas de todas las temporadas">Ligas</a></li>
+                <li class="nav-item"><a class="nav-link" data-k="war" href="#" title="Sólo guerras normales">Normales</a></li>
+              </ul>
+              <select class="form-select form-select-sm w-auto" id="clanDays" aria-label="Periodo">
+                <option value="0">Siempre</option><option value="30">30 días</option><option value="90">90 días</option><option value="365">1 año</option></select>
+            </div>
+          </div>
+          <div id="clanView"></div>
+        </div>
+    </div>
+  </div>
+  <footer class="footer footer-transparent d-print-none"><div class="container-xl text-secondary small">
+    Datos de <a href="https://api.clashk.ing" target="_blank" rel="noopener">ClashKing</a> y de la API oficial de Clash of Clans. Sitio de aficionados, sin relación con Supercell.</div></footer>
+  </div>
+</div>
+
+<div class="toast-container position-fixed bottom-0 end-0 p-3"><div class="toast align-items-center border-0" id="toast" role="status">
+  <div class="d-flex"><div class="toast-body" id="toastBody"></div><button type="button" class="btn-close me-2 m-auto" data-bs-dismiss="toast"></button></div></div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tabler/core@1.0.0/dist/js/tabler.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.3/Sortable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const num = n => n == null ? '–' : Number(n).toLocaleString('es-ES');
+const fmtMin = s => { if (s <= 0) return 'ya'; const m = Math.ceil(s / 60), h = Math.floor(m / 60); return h ? `${h} h${m % 60 ? ` ${m % 60} min` : ''}` : `${m} min`; };
+const clave = () => sessionStorage.getItem('clave');
+const api = (url, body) => fetch(url, body === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json', ...(clave() ? {'X-Clave': encodeURIComponent(clave())} : {})}, body: JSON.stringify(body)})
+  .then(r => r.json().then(j => { if (!r.ok) throw new Error(j.error || r.statusText); return j; }));
+function toast(msg, kind = 'success') {
+  const t = $('toast'); t.className = `toast align-items-center border-0 text-bg-${kind}`; $('toastBody').innerHTML = msg;
+  bootstrap.Toast.getOrCreateInstance(t, {delay: 2600}).show();
+}
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+Chart.defaults.font.family = "Inter, sans-serif";
+function chartTheme() { Chart.defaults.color = css('--chart-text'); Chart.defaults.borderColor = css('--chart-grid'); }
+function paintThemeButton() {
+  const dark = document.documentElement.dataset.bsTheme === 'dark';
+  $('themeIcon').className = 'ti ' + (dark ? 'ti-sun' : 'ti-moon');
+  $('btnTheme').title = dark ? 'Cambiar a modo claro' : 'Cambiar a modo oscuro';
+}
+$('btnTheme').onclick = () => {
+  const next = document.documentElement.dataset.bsTheme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.bsTheme = next; localStorage.setItem('tema', next);
+  paintThemeButton(); chartTheme(); Clan.repaint();
+};
+paintThemeButton(); chartTheme();
+</script>
+<script src="rendimiento.js"></script>
+</body>
+</html>

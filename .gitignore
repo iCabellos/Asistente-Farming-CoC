@@ -8,6 +8,10 @@ __pycache__/
 # tu configuración personal (cuentas): se crea desde asistente/config.example.json
 asistente/config.json
 
+# el clan que sigue el panel y su histórico
+clan.json
+clan.db*
+
 # estado y registros de cada ejecución
 asistente/estado.json
 asistente/ENABLED
@@ -24,3 +28,8 @@ loot.jsonl
 
 # accesos directos locales
 *.lnk
+
+# Vercel: enlace del proyecto y secretos locales
+.vercel
+.env*
+!.env.example
