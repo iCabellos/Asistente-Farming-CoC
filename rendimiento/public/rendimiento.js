@@ -47,12 +47,17 @@ const PAGES = {
   miembros: ['Miembros', 'Quién hay en el clan, si está en guerra ahora y cómo le está yendo. Cambia entre jugadores y cuentas con «Ver por».'],
   guerras: ['Guerras normales', 'Guerras fuera de la liga. Cada jugador tiene 2 ataques. Aquí no entran las rondas de liga.'],
   ligas: ['Ligas', 'Liga de Guerras de Clanes: 8 clanes, 7 rondas y 1 ataque por jugador en cada ronda. Aquí no entran las guerras normales.'],
+  admin: ['Administración', 'Cuentas ligadas a cada jugador, clan que se sigue, recogidas de datos y acceso.'],
   jugador: ['Ficha de la cuenta', 'Todo sobre una cuenta: cómo ataca, cómo defiende y su evolución. Usa «Este clan» o «Todo su historial» para cambiar qué guerras cuentan.'],
   persona: ['Ficha del jugador', 'Una persona con todas sus cuentas: sus KPIs son la media de las cuentas que han jugado guerras, y cada cuenta mantiene los suyos.'],
 };
 const DESC = {
   ranking: ['Ordenado por índice. Cambia entre jugadores y cuentas con «Ver por». Pulsa una fila para ver sus cuentas y cómo le va en liga y en normales.'],
   grupos: ['Arrastra las cuentas para decir de quién es cada una. El jugador recibe la media de sus cuentas y cada cuenta sigue teniendo sus propios KPIs. Se guarda solo.'],
+  aclan: ['El clan que sigue la web. Al cambiarlo se recogen sus datos; el histórico del clan anterior se conserva.'],
+  arec: ['Cuándo se recogieron los datos por última vez y si hubo errores.'],
+  aapi: ['Clave gratuita de Supercell para ver la lista exacta de miembros. Nunca se muestra aquí.'],
+  apass: ['Sustituye el acceso inicial. Sólo se guarda un hash de la contraseña.'],
   wplay: ['Cada jugador con la media de sus cuentas en estas guerras. Debajo, los datos de cada cuenta.'],
   lplay: ['Cada jugador con la media de sus cuentas en esta temporada. Debajo, los datos de cada cuenta.'],
   oacc: ['Cada cuenta conserva sus KPIs. Pulsa una para abrir su ficha completa.'],
@@ -162,7 +167,7 @@ const chartRow = html => `<div class="card-body"><div class="row g-4">${html}</d
 // Sección desplegable: recuerda si estaba abierta y sólo dibuja sus gráficas al abrirse.
 const CLOSED = new Set(['calculo']);
 // En el teléfono se abren plegadas las secciones largas o de consulta, para llegar antes a lo importante.
-const CLOSED_MOBILE = new Set(['grupos', 'kpis', 'graficas', 'mgraf', 'wgraf', 'lgraf', 'ljug', 'lhist', 'wother', 'prival', 'pdef', 'pritmo', 'phcwl', 'phwar', 'ocmp']);
+const CLOSED_MOBILE = new Set(['kpis', 'graficas', 'mgraf', 'wgraf', 'lgraf', 'ljug', 'lhist', 'wother', 'prival', 'pdef', 'pritmo', 'phcwl', 'phwar', 'ocmp']);
 const isMobile = () => matchMedia('(max-width:767.98px)').matches;
 function sec(id, title, sub, body, open, draw_) {
   if (draw_) drawers[id] = draw_;
@@ -288,7 +293,6 @@ function renderResumen(d) {
       ${splitCard('cwl', 'Liga', 'ti-shield-star', sp.cwl, '#ligas', '', 'Sin rondas de liga guardadas.')}
       ${splitCard('war', 'Guerras normales', 'ti-swords', sp.war, '#guerras', '', `Aún sin guerras normales del clan. Tus miembros suman ${plural(d.others, 'participación', 'participaciones')} con otros clanes.`)}
     </div>
-    ${canEdit() ? sec('grupos', 'Jugadores y sus cuentas', '', ownerBoard(d), true) : ''}
     ${sec('ranking', S.by === 'player' ? 'Ranking de jugadores' : 'Ranking de cuentas', `${players.every(p => p.few) ? 'Aún pocos datos · ' : ''}${KIND_NAME[S.kind]} · pulsa uno para ver su contexto`, `<div class="d-md-none px-3 py-2 d-flex align-items-center gap-2"><label class="small text-secondary" for="sortPick">Ordenar por</label><select class="form-select form-select-sm" id="sortPick">${[['index', 'Índice'], ['name', 'Nombre'], ['th', 'Ayuntamiento'], ['used', 'Ataques usados'], ['stars', 'Estrellas'], ['missed', 'Sin usar']].map(([k, t]) => `<option value="${k}" ${S.sort.k === k ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
       <div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th class="pos">#</th>${col('name', One)}${col('th', 'TH')}${col('index', 'Índice')}<th>Nivel</th>${col('used', 'Ataques usados', 'text-end')}${col('stars', 'Estrellas', 'text-end')}${col('missed', 'Sin usar', 'text-end')}<th>Últimos ataques</th></tr></thead>
       <tbody>${sorted.map((p, i) => `<tr class="player ${p.mine ? 'mine' : ''}" data-row="${esc(p.tag)}" aria-expanded="${S.openRow === p.tag}"><td class="pos">${i + 1}</td>
@@ -317,7 +321,45 @@ function renderResumen(d) {
       ${d.kpis.map(k => `<tr><td>${esc(k.name)}</td><td class="text-secondary">${esc(k.help)}</td><td class="text-end">${k.weight} %</td><td class="text-end">${fmtKpi(k, k.floor)}</td><td class="text-end">${fmtKpi(k, k.target)}</td></tr>`).join('')}</tbody></table></div>`)}`;
   $('clanView').querySelectorAll('[data-sort]').forEach(th_ => th_.onclick = e => { e.stopPropagation(); const k = th_.dataset.sort; S.sort = {k, d: S.sort.k === k ? -S.sort.d : k === 'name' ? 1 : -1}; paint(); });
   document.getElementById('sortPick')?.addEventListener('change', e => { const k = e.target.value; S.sort = {k, d: k === 'name' ? 1 : -1}; paint(); });
-  if (canEdit()) wireBoard();
+}
+
+// ---------- administración: en la nube pide usuario y contraseña; en el PC entra directo
+function renderLogin() {
+  $('clanView').innerHTML = `<div class="card mx-auto" style="max-width:24rem"><div class="card-body"><h3 class="card-title"><i class="ti ti-lock me-1 text-secondary"></i>Entrar</h3>
+    <form id="loginForm" class="d-grid gap-2"><input class="form-control" id="loginUser" placeholder="Usuario" aria-label="Usuario" autocomplete="username" autocapitalize="none"><input class="form-control" type="password" id="loginPass" placeholder="Contraseña" aria-label="Contraseña" autocomplete="current-password"><button class="btn btn-primary" type="submit">Entrar</button></form></div></div>`;
+  $('loginForm').onsubmit = e => { e.preventDefault();
+    sessionStorage.setItem('clave', `${$('loginUser').value.trim()}:${$('loginPass').value}`);
+    api('api/login', {}).then(load).catch(err => { sessionStorage.removeItem('clave'); toast(esc(err.message), 'danger'); }); };
+}
+function renderAdmin(d) {
+  const a = d.admin; if (!canEdit() || !a) return renderLogin();
+  const when = ts => ts ? new Date(ts * 1000).toLocaleString('es-ES', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'}) : 'nunca';
+  const source = {diaria: 'Automática', panel: 'Manual'};
+  $('clanView').innerHTML = `
+    ${a.cloud && a.default ? '<div class="alert alert-danger"><i class="ti ti-alert-triangle me-1"></i>Sigues con el acceso inicial <b>admin/admin</b>. La web es pública: cualquiera que lo pruebe podría cambiar el clan. Cámbialo abajo.</div>' : ''}
+    ${a.cloud ? `<div class="d-flex align-items-center gap-2 mb-3 small text-secondary"><i class="ti ti-user"></i>Sesión de ${esc(a.user)}<button class="btn btn-sm btn-ghost-secondary ms-auto" id="adminOut"><i class="ti ti-logout me-1"></i>Salir</button></div>` : ''}
+    ${sec('grupos', 'Cuentas ligadas a cada jugador', '', ownerBoard(d), true)}
+    ${sec('aclan', 'Clan', '', `<div class="card-body"><form class="d-flex flex-wrap gap-2" id="adminTag" style="max-width:26rem"><input class="form-control flex-fill" style="width:auto" id="adminTagInput" value="${esc(a.clan_tag || '')}" aria-label="Tag del clan" autocomplete="off" autocapitalize="characters"><button class="btn btn-primary" type="submit">Cambiar clan</button></form>
+      <div class="small text-secondary mt-2">Ahora: ${esc(d.clan?.name || '–')} · ${plural(a.members, 'cuenta', 'cuentas')}</div></div>`, true)}
+    ${sec('arec', 'Recogida de datos', '', `<div class="card-body"><div class="d-flex flex-wrap align-items-center gap-2 mb-3"><div>Última completa: <b>${when(a.full_ts)}</b></div><button class="btn btn-primary ms-md-auto" id="adminSync"><i class="ti ti-refresh me-1"></i>Recoger ahora</button></div>
+      ${a.error ? `<div class="alert alert-warning">${esc(a.error)}</div>` : ''}
+      <div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>Cuándo</th><th>Tipo</th><th class="text-end">Cuentas</th><th class="text-end">Fallidas</th></tr></thead><tbody>${a.log.map(l => `<tr><td>${when(l.ts)}</td><td>${source[l.source] || esc(l.source)}</td><td class="text-end">${l.players}</td><td class="text-end ${l.failed ? 'text-red fw-bold' : 'text-secondary'}">${l.failed}</td></tr>`).join('') || `<tr><td colspan="4">${empty('Aún no hay recogidas')}</td></tr>`}</tbody></table></div></div>`, true)}
+    ${sec('aapi', 'API oficial de Supercell', '', `<div class="card-body"><div class="mb-2">${a.official ? '<i class="ti ti-circle-check text-green me-1"></i>Conectada' : '<i class="ti ti-alert-circle text-yellow me-1"></i>Sin conectar'}</div>
+      <form class="d-flex flex-wrap gap-2" id="adminKey" style="max-width:40rem"><input class="form-control flex-fill" style="width:auto" type="password" id="adminKeyInput" placeholder="Nueva clave (eyJ0eXAi…)" aria-label="Nueva clave de la API" autocomplete="off"><button class="btn btn-primary" type="submit">Guardar clave</button></form>
+      <div class="small text-secondary mt-2">Créala en developer.clashofclans.com con la IP <code>${esc(a.proxy_ip)}</code>.</div></div>`, false)}
+    ${a.cloud ? sec('apass', 'Usuario y contraseña', '', `<div class="card-body"><form class="d-grid gap-2" id="adminPass" style="max-width:24rem"><input class="form-control" id="passUser" value="${esc(a.user)}" aria-label="Usuario" autocomplete="username" autocapitalize="none"><input class="form-control" type="password" id="passNew" placeholder="Contraseña nueva (8 caracteres o más)" aria-label="Contraseña nueva" autocomplete="new-password"><input class="form-control" type="password" id="passRepeat" placeholder="Repite la contraseña" aria-label="Repite la contraseña" autocomplete="new-password"><button class="btn btn-primary" type="submit">Cambiar acceso</button></form></div>`, a.default) : ''}`;
+  wireBoard();
+  const done = t => () => { toast(`<i class="ti ti-check me-1"></i>${t}`); load(); }, fail = err => toast(esc(err.message), 'danger');
+  document.getElementById('adminOut')?.addEventListener('click', () => { sessionStorage.removeItem('clave'); load(); });
+  $('adminSync').onclick = e => { e.currentTarget.disabled = true; toast('Recogiendo datos…', 'info'); api('api/sync', {}).then(done('Recogida lanzada')).catch(fail); };
+  $('adminTag').onsubmit = e => { e.preventDefault(); const tag = $('adminTagInput').value.trim();
+    if (tag === a.clan_tag || !confirm(`¿Seguir el clan ${tag}? La web pasará a enseñar sus datos.`)) return;
+    api('api/tag', {clan_tag: tag}).then(done('Clan cambiado')).catch(fail); };
+  $('adminKey').onsubmit = e => { e.preventDefault(); api('api/key', {key: $('adminKeyInput').value}).then(done('Clave guardada')).catch(fail); };
+  const pf = document.getElementById('adminPass');
+  if (pf) pf.onsubmit = e => { e.preventDefault(); const user = $('passUser').value.trim(), password = $('passNew').value;
+    if (password !== $('passRepeat').value) return toast('Las contraseñas no coinciden', 'danger');
+    api('api/password', {user, password}).then(() => { sessionStorage.setItem('clave', `${user}:${password}`); done('Acceso cambiado')(); }).catch(fail); };
 }
 
 // ---------- miembros
@@ -540,22 +582,19 @@ function paintHead(m) {
   const next = m.next ? new Date(m.next * 1000).toLocaleString('es-ES', {weekday: 'long', hour: '2-digit', minute: '2-digit'}).replace(', ', ' a las ') : null;
   $('clanSync').innerHTML = syncing ? '<i class="ti ti-refresh spin me-1"></i>Recogiendo datos…' : `<i class="ti ti-clock me-1"></i>Última recogida ${full}${next ? ` · próxima ${next}` : ' · se recoge una vez al día'}`;
   $('clanRefresh').disabled = syncing; $('clanRefresh').classList.toggle('d-none', !canEdit());
-  $('btnEdit').classList.toggle('d-none', !m.cloud);
-  $('btnEdit').querySelector('i').className = `ti ${clave() ? 'ti-lock-open' : 'ti-lock'} me-1`;
-  $('btnEdit').querySelector('span').textContent = clave() ? 'Salir' : 'Editar';
   $('clanError').classList.toggle('d-none', !m.error); $('clanError').textContent = m.error || '';
 }
 function paint() {
   const d = S.data; if (!d) return;
   clearCharts();
-  $('clanFilters').classList.toggle('d-none', S.sub === 'ligas');
+  $('clanFilters').classList.toggle('d-none', ['ligas', 'admin'].includes(S.sub));
   const fixedKind = S.sub === 'guerras';                  // Guerras normales sólo enseña normales: no hay tipo que elegir
   $('clanKind').classList.toggle('d-none', fixedKind); $('clanKindLabel').classList.toggle('d-none', fixedKind);
   $('clanBy').classList.toggle('d-none', !['resumen', 'miembros'].includes(S.sub));
   $('clanBy').querySelectorAll('[data-by]').forEach(b => { b.classList.toggle('btn-primary', b.dataset.by === S.by); b.classList.toggle('btn-ghost-secondary', b.dataset.by !== S.by); });
   $('clanTabs').querySelectorAll('.nav-link').forEach(a => a.classList.toggle('active', a.dataset.v === (['jugador', 'persona'].includes(S.sub) ? 'miembros' : S.sub)));
   if (d.clan) { $('clanName').textContent = d.clan.name; $('clanMeta').textContent = `${d.clan.tag}${d.clan.season ? ' · ' + (d.clan.season.league || '') : ''}`; }
-  ({resumen: renderResumen, miembros: renderMembers, guerras: renderWars, ligas: renderLeagues, jugador: renderPlayer, persona: renderOwner})[S.sub](d);
+  ({resumen: renderResumen, miembros: renderMembers, guerras: renderWars, ligas: renderLeagues, jugador: renderPlayer, persona: renderOwner, admin: renderAdmin})[S.sub](d);
   const page = PAGES[S.sub];
   $('clanView').insertAdjacentHTML('afterbegin', `<div class="page-intro"><h2 class="mb-1">${page[0]}</h2><p class="text-secondary mb-3">${page[1]}</p></div>`);
   cardTables();
@@ -571,7 +610,9 @@ function url() {
 }
 function load() {
   const seq = ++S.seq;
-  return api(url()).then(d => {
+  const admin = S.sub === 'admin' && canEdit() ? api('api/admin', {}).catch(() => { sessionStorage.removeItem('clave'); return null; }) : null;
+  return Promise.all([api(url()), admin]).then(([d, info]) => {
+    d.admin = info;
     if (seq !== S.seq || S.dragging) return;    // llegó otra petición más nueva, o repintar cortaría el arrastre
     S.stamp = d.meta.stamp; S.syncing = d.meta.syncing; S.cloud = d.meta.cloud;
     paintHead(d.meta);
@@ -590,7 +631,7 @@ function poll() {
 window.Clan = {
   show() {
     const [sub, tag] = location.hash.slice(1).split('/');
-    S.sub = ['resumen', 'miembros', 'guerras', 'ligas', 'jugador', 'persona'].includes(sub) ? sub : 'resumen';
+    S.sub = ['resumen', 'miembros', 'guerras', 'ligas', 'jugador', 'persona', 'admin'].includes(sub) ? sub : 'resumen';
     S.tag = sub === 'jugador' && tag ? '#' + decodeURIComponent(tag) : sub === 'persona' && tag ? decodeURIComponent(tag) : null;
     S.openWar = S.openRow = null; S.data = null; clearCharts(); $('clanView').innerHTML = skeleton(); S.enter = true;
     if (['jugador', 'persona'].includes(S.sub) && !S.tag) S.sub = 'miembros';
@@ -623,13 +664,6 @@ $('clanView').addEventListener('keydown', e => {
 });
 $('clanRefresh').onclick = () => { $('clanRefresh').disabled = true; $('clanSync').innerHTML = '<i class="ti ti-refresh spin me-1"></i>Recogiendo datos…';
   api('api/sync', {}).then(j => { toast(j.started ? 'Recogiendo datos…' : 'Ya hay una recogida en marcha', j.started ? 'info' : 'secondary'); S.syncing = true; if (S.cloud) load(); }).catch(e => { toast(esc(e.message), 'danger'); load(); }); };
-$('btnEdit').onclick = () => {
-  if (clave()) { sessionStorage.removeItem('clave'); return load(); }
-  $('loginForm').classList.toggle('d-none'); $('loginForm').classList.toggle('d-flex'); $('loginInput').focus();
-};
-$('loginForm').onsubmit = e => { e.preventDefault();
-  sessionStorage.setItem('clave', $('loginInput').value); $('loginInput').value = '';
-  api('api/login', {}).then(() => { $('loginForm').classList.replace('d-flex', 'd-none'); load(); }).catch(err => { sessionStorage.removeItem('clave'); toast(esc(err.message), 'danger'); }); };
 window.addEventListener('hashchange', () => Clan.show());
 Clan.show();
 $('clanForm').onsubmit = e => { e.preventDefault();

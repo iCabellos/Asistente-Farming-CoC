@@ -20,7 +20,7 @@ asistente: una vez publicada no necesita BlueStacks ni el PC encendido.
    set BLOB_READ_WRITE_TOKEN=...
    python subir_datos.py
    ```
-5. **Despliega** y abre la URL. Con «Editar» y tu `ADMIN_PASSWORD` puedes organizar jugadores y forzar una recogida.
+5. **Despliega** y abre `/#admin`. Entra con `admin` / `admin` y **cambia el acceso** en el momento: la web es pública.
 6. **Apaga la recogida del PC** para no tener dos históricos: `schtasks /Delete /TN "CoC Asistente - Clan diario" /F`.
 
 ## Cómo funciona
@@ -35,7 +35,8 @@ asistente: una vez publicada no necesita BlueStacks ni el PC encendido.
 
 - **Recogida:** el cron corre a las 10:05 UTC: entre las 11:05 y las 11:59 en invierno y entre las 12:05 y las 12:59 en verano.
   El plan Hobby sólo garantiza una vez al día, dentro de esa hora.
-- **Quién ve qué:** leer es público para quien tenga la URL. Cambiar algo pide `ADMIN_PASSWORD`.
+- **Quién ve qué:** leer es público para quien tenga la URL. El panel `/#admin` (cuentas ligadas, tag del clan, recogidas, clave de
+  la API y contraseña) pide usuario y contraseña; de inicio son `admin` / `admin`. Lo que se guarda en el panel manda sobre las variables.
 - **Datos en directo:** «en guerra» y las cuentas atrás son de la última recogida, no de este momento.
 - **Cuota:** Blob gratuito tiene límites mensuales. Si se superan, Vercel corta el acceso al almacén hasta el mes siguiente.
 

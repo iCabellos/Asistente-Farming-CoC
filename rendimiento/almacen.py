@@ -81,7 +81,7 @@ def leer_ajustes():
         if _ajustes["datos"] is None or time.time() - _ajustes["visto"] > TTL_AJUSTES:
             _ajustes["datos"] = json.loads(_bajar(BLOB_AJUSTES)) if _etag(BLOB_AJUSTES) else {}
             _ajustes["visto"] = time.time()
-        return {**_ajustes["datos"], "clan_tag": os.environ.get("CLAN_TAG")}
+        return {"clan_tag": os.environ.get("CLAN_TAG"), **_ajustes["datos"]}    # el panel admin manda sobre la variable
 
 
 def guardar_ajustes(s):
@@ -90,7 +90,6 @@ def guardar_ajustes(s):
         tmp.write_text(json.dumps(s, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(SETTINGS)
         return
-    limpio = {k: v for k, v in s.items() if k not in ("api_key", "clan_tag")}   # esos dos van en variables de entorno
     with _lock:
-        subir(BLOB_AJUSTES, json.dumps(limpio, ensure_ascii=False).encode("utf-8"), "application/json")
-        _ajustes.update(datos=limpio, visto=time.time())
+        subir(BLOB_AJUSTES, json.dumps(s, ensure_ascii=False).encode("utf-8"), "application/json")
+        _ajustes.update(datos=s, visto=time.time())

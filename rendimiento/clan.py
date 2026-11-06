@@ -11,6 +11,8 @@ ClashKing no da la lista de miembros, así que hay dos modos:
 La clave va por el proxy de RoyaleAPI (IP fija), así sirve desde cualquier sitio y no caduca si cambia
 la IP. Se lee de COC_API_KEY o de clan.json.
 """
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -106,7 +108,7 @@ def save_tag(tag):
 
 
 def api_key():
-    return os.environ.get("COC_API_KEY") or settings().get("api_key")
+    return settings().get("api_key") or os.environ.get("COC_API_KEY")
 
 
 def official(path, key=None):
@@ -144,6 +146,39 @@ def save_key(key):
         raise ValueError(str(e)) from e
     _save({**s, "api_key": key})
     start_sync()
+
+
+# ---------------- administración ----------------
+# Sin configurar, entra admin/admin. Al cambiarla sólo se guarda un hash, nunca la contraseña.
+def _hash(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def check_admin(user, password):
+    cfg = settings().get("admin")
+    if not cfg:
+        return hmac.compare_digest(user.encode(), b"admin") and hmac.compare_digest(password.encode(), b"admin")
+    return hmac.compare_digest(user.encode(), cfg["user"].encode()) and hmac.compare_digest(_hash(password, cfg["salt"]), cfg["hash"])
+
+
+def set_admin(user, password):
+    user, password = str(user or "").strip(), str(password or "")
+    if not user or ":" in user:
+        raise ValueError("Usuario no válido.")
+    if len(password) < 8:
+        raise ValueError("La contraseña necesita al menos 8 caracteres.")
+    salt = os.urandom(16).hex()
+    _save({**settings(), "admin": {"user": user, "salt": salt, "hash": _hash(password, salt)}})
+
+
+def admin_info():
+    c = db()
+    try:
+        cfg = settings().get("admin")
+        return {**meta_info(c), "user": cfg["user"] if cfg else "admin", "default": not cfg, "log": meta_get(c, "sync_log", [])[:8],
+                "members": c.execute("SELECT COUNT(*) n FROM players WHERE roster=1").fetchone()["n"]}
+    finally:
+        c.close()
 
 
 # ---------------- API ----------------
@@ -420,7 +455,10 @@ def start_sync(light=False, source="panel"):
             sync(light, source)
         except RuntimeError:
             pass                 # queda en last_error y el panel lo enseña
-    threading.Thread(target=run, daemon=True).start()
+    if almacen.EN_NUBE:
+        run()                    # en la nube un hilo moriría con la petición
+    else:
+        threading.Thread(target=run, daemon=True).start()
 
 
 def daily(retries=3, wait=300):
