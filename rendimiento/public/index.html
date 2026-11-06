@@ -24,10 +24,10 @@
   .bg-gold { background:var(--c-gold)!important } .bg-elixir { background:var(--c-elixir)!important } .bg-darkelixir { background:var(--c-dark)!important }
   /* rendimiento */
   .rank-table { font-variant-numeric:tabular-nums }
-  .rank-table tbody tr.player { cursor:pointer } .rank-table tr.mine td { background:rgba(245,184,46,.06) }
+  .rank-table tbody tr.player { cursor:pointer }
   .rank-table .pos { width:2.5rem; text-align:right; color:var(--tblr-secondary); font-weight:600 }
-  .rank-table .scorecell { width:22%; min-width:140px } .rank-table .scorecell b { width:2.4rem; flex:none; text-align:right }
-  .rank-table .sort { cursor:pointer; white-space:nowrap }
+  .rank-table .scorecell { width:14%; min-width:90px } .rank-table .scorecell b { width:2.4rem; flex:none; text-align:right }
+  .rank-table .sort { cursor:pointer } @media (min-width:768px) { .rank-table > thead > tr > th, .rank-table > tbody > tr:not(.ctx-row) > td { padding-left:.45rem; padding-right:.45rem } }
   .rank-table .open-row > td { background:var(--tint); padding:.5rem .9rem .9rem 2rem }
   .player-name { color:inherit; font-weight:600; text-decoration:none } a.player-name:hover { text-decoration:underline }
   .hit { white-space:nowrap } .hit + .hit { margin-left:.9rem }
@@ -43,7 +43,7 @@
   .ring { position:relative; display:inline-grid; place-items:center; flex:none } .ring svg { position:absolute; inset:0 } .ring b { font-variant-numeric:tabular-nums; line-height:1 }
   .ring-bg { stroke:var(--tint-strong); fill:none } .ring-fg { fill:none; stroke-linecap:round; transition:stroke-dashoffset .5s }
   .av { width:34px; height:34px; border-radius:50%; display:inline-grid; place-items:center; flex:none; font-weight:700; font-size:.76rem; background:var(--tint-strong); color:var(--tblr-body-color) }
-  .av-mine { box-shadow:0 0 0 2px var(--c-gold) } .av-lg { width:56px; height:56px; font-size:1.05rem }
+  .av-lg { width:56px; height:56px; font-size:1.05rem }
   .strip { display:inline-flex; gap:3px; vertical-align:middle } .strip i { width:14px; height:14px; border-radius:3px; display:block; font-style:normal; background:var(--tint-strong) }
   .strip .s1 { background:rgba(176,124,14,.35) } .strip .s2 { background:rgba(176,124,14,.65) } .strip .s3 { background:#b07c0e } .strip .sx { background:none; box-shadow:inset 0 0 0 2px var(--tblr-red) }
   .tracker { display:flex; gap:.4rem; flex-wrap:wrap } .tracker .t { width:42px; text-align:center; font-size:.68rem; color:var(--tblr-secondary) }
@@ -103,6 +103,20 @@
   .own-pool .own-list { max-height:none } .own-groups { grid-template-columns:minmax(0,1fr) }
   .card-table td:first-child, .card-table th:first-child { padding-left:.75rem } .heat-table td:first-child { position:sticky; left:0; z-index:1; background:var(--tblr-bg-surface) } .heat-table th:first-child { position:sticky; left:0; z-index:2; background:var(--tblr-bg-surface) }
   /* tablas como tarjetas: la etiqueta de cada dato sale de su cabecera (ver cardTables en rendimiento.js) */
+  .xd { display:grid; gap:1rem; padding:.25rem 0 } .xd-h { font-size:.7rem; font-weight:600; letter-spacing:.04em; text-transform:uppercase; color:var(--tblr-secondary); margin-bottom:.4rem }
+  .xd-2 { display:grid; gap:1rem } .xd-2 > section { min-width:0 } .xd small { display:block; font-size:.68rem; color:var(--tblr-secondary); line-height:1.25 }
+  .xd-accs { display:grid; gap:.5rem; grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr)) }
+  .xd-acc { display:block; padding:.6rem .7rem; border:1px solid var(--tblr-border-color); border-radius:8px; background:var(--tblr-bg-surface); color:inherit; text-decoration:none }
+  .xd-acc:hover { border-color:var(--tblr-primary); text-decoration:none } .xd-top { display:flex; align-items:center; gap:.6rem } .xd-top .ring { flex:none }
+  .xd-name { flex:1; min-width:0 } .xd-name b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap } .xd-trend { font-size:.72rem; white-space:nowrap }
+  .xd-nums { display:grid; grid-template-columns:repeat(4,1fr); gap:.25rem; margin-top:.55rem; padding-top:.5rem; border-top:1px solid var(--tblr-border-color) } .xd-num b { display:block; font-size:.86rem; font-variant-numeric:tabular-nums }
+  .xd-t { width:100%; font-size:.8rem!important; font-variant-numeric:tabular-nums } .xd-t th { font-size:.68rem; font-weight:500; color:var(--tblr-secondary); text-align:right; padding:0 0 .25rem .5rem; white-space:nowrap }
+  .xd-t td { text-align:right; padding:.35rem 0 .35rem .5rem; border-top:1px solid var(--tblr-border-color); white-space:nowrap } .xd-t td:first-child, .xd-t th:first-child { text-align:left; padding-left:0; white-space:normal; font-weight:600 } .xd-t td:first-child small { font-weight:400 }
+  .xd-war { border-left:3px solid var(--tblr-secondary); padding:.05rem 0 .05rem .6rem } .xd-war + .xd-war { margin-top:.6rem } .xd-win { border-left-color:var(--tblr-green) } .xd-lose { border-left-color:var(--tblr-red) }
+  .xd-war-h { display:flex; align-items:center; gap:.45rem; font-size:.82rem } .xd-war-h b { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap } .xd-war-h span:not(.badge) { color:var(--tblr-secondary); font-size:.72rem }
+  .xd-hit { display:flex; justify-content:space-between; gap:.25rem .75rem; font-size:.76rem; color:var(--tblr-secondary); margin-top:.1rem } .xd-hit > .text-truncate { min-width:0 } .xd-hits { margin-left:auto; flex:none; text-align:right }
+  @media (min-width:992px) { .xd-2 { grid-template-columns:5fr 7fr } }
+  @media (min-width:768px) { .xd { position:sticky; left:1rem; max-width:calc(var(--vis, 100%) - 2.5rem) } }
   @media (max-width:767.98px) {
     .m-cards, .m-cards > tbody { display:block; width:100% } .m-cards > thead { display:none }
     .m-cards > tbody > tr { display:flex; flex-wrap:wrap; align-items:flex-end; gap:.35rem .9rem; padding:.6rem .75rem; border-bottom:1px solid var(--tblr-border-color) }
@@ -114,7 +128,7 @@
     .m-cards > tbody > tr > td.scorecell { flex:1 1 100%; order:1 } .m-cards > tbody > tr > td.scorecell::before { display:none!important }
     .m-cards > tbody > tr > td:not(.m-main):not(.pos):not(.scorecell) { order:2 }
     .m-cards > tbody > tr > td[colspan] { flex:1 1 100% } .m-cards .ctx-row > td { padding:.25rem 0 0!important; overflow:hidden }
-    .m-cards > tbody > tr.ctx-row { background:var(--tint) } .m-cards > tbody > tr.mine { background:rgba(245,184,46,.06) }
+    .m-cards > tbody > tr.ctx-row { background:var(--tint) }
     .rank-table .sub-row { padding-left:1.6rem!important; background:var(--tint) } .rank-table .sub-row td:first-child { padding-left:0!important }
     .ctx-row table:not(.m-cards) { font-size:.76rem }
   }

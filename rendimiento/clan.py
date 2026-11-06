@@ -58,8 +58,8 @@ KPIS = [
      "help": "Ataques de 3 estrellas sobre los usados"},
     {"id": "exigencia", "name": "Contra TH igual o mayor", "unit": "★", "weight": 5, "floor": 1, "target": 2.4,
      "help": "Estrellas medias contra rivales de su TH o superior"},
-    {"id": "defensa", "name": "Estrellas otorgadas al rival", "unit": "★", "weight": 5, "floor": 3, "target": 1.5,
-     "help": "Media que le sacan por defensa (menos es mejor)"},
+    {"id": "defensa", "name": "Estrellas otorgadas al rival", "unit": "★", "weight": 5, "floor": 3, "target": 0,
+     "help": "Media que le sacan por defensa: cuanto más cerca de 0, mejor"},
     {"id": "constancia", "name": "Guerras completas", "unit": "%", "weight": 5, "floor": 40, "target": 100,
      "help": "Guerras en las que usó todos sus ataques"},
 ]

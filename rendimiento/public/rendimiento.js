@@ -108,7 +108,7 @@ function ring(v, level, size = 96, stroke = 9) {
     <circle class="ring-fg" cx="${m}" cy="${m}" r="${r}" stroke-width="${stroke}" stroke="${LEVEL_COL[level.id]}" stroke-dasharray="${c}" stroke-dashoffset="${c * (1 - (v || 0) / 100)}" transform="rotate(-90 ${m} ${m})"/></svg><b style="font-size:${size / 3.3}px">${v ?? '–'}</b></div>`;
 }
 const initials = n => (String(n).replace(/[^\p{L}\p{N}]/gu, '').slice(0, 2) || '?').toUpperCase();
-const avatar = (p, cls = '') => `<span class="av ${p.mine ? 'av-mine' : ''} ${cls}" aria-hidden="true">${esc(initials(p.name))}</span>`;
+const avatar = (p, cls = '') => `<span class="av ${cls}" aria-hidden="true">${esc(initials(p.name))}</span>`;
 // Últimos ataques como cuadritos: más oscuro, más estrellas; borde rojo, ataque sin usar.
 function strip(wars) {
   const cells = wars.flatMap(w => [...w.attacks.map(a => [`s${a.stars}`, `${fecha(w.ts)} vs ${w.opponent}: ${a.stars} estrellas`]),
@@ -120,7 +120,7 @@ function bullet(k, c, compare) {
   const st = s == null ? ['text-secondary', 'ti-minus', 'Sin datos'] : s >= 100 ? ['text-green', 'ti-circle-check', 'Cumple'] : s >= 70 ? ['text-yellow', 'ti-alert-circle', 'Cerca'] : ['text-red', 'ti-alert-triangle', 'Lejos'];
   return `<div class="bullet" title="${esc(k.help)}"><div class="d-flex align-items-baseline gap-2"><span class="fw-medium">${esc(k.name)}</span><span class="ms-auto fw-bold">${fmtKpi(k, v)}</span><span class="small ${st[0]}" style="width:4.6rem"><i class="ti ${st[1]} me-1"></i>${st[2]}</span></div>
     <div class="bullet-track"><div class="bullet-fill" style="width:${s || 0}%"></div>${mark != null ? `<div class="bullet-mark" style="left:${mark}%" title="Media del clan"></div>` : ''}</div>
-    <div class="small text-secondary">Objetivo ${fmtKpi(k, k.target)}${compare ? ` · clan ${fmtKpi(k, compare.values[k.id])}` : ''}</div></div>`;
+    <div class="small text-secondary">Objetivo ${fmtKpi(k, k.target)}${k.target < k.floor ? " · menos es mejor" : ""}${compare ? ` · clan ${fmtKpi(k, compare.values[k.id])}` : ''}</div></div>`;
 }
 const bullets = (K, c, compare) => `<div class="row g-4"><div class="col-lg-6">${K.slice(0, 4).map(k => bullet(k, c, compare)).join('')}</div><div class="col-lg-6">${K.slice(4).map(k => bullet(k, c, compare)).join('')}</div></div>`;
 function tracker(rounds, live) {
@@ -206,26 +206,42 @@ function alerts(d) {
   return rows.length ? `<div class="list-group list-group-flush">${rows.map(r => `<div class="list-group-item d-flex gap-2"><i class="ti ${r[0]}"></i><div><div class="fw-medium">${r[1]}</div><div class="small">${r[2]}</div></div></div>`).join('')}</div>`
     : '<div class="card-body text-secondary">Nada que destacar ahora mismo.</div>';
 }
-// Contexto de una fila: liga y normales por separado, y lo último que ha hecho.
-function ctxRow(p, cols) {
-  const c = p.ctx, line = (t, x, extra = '') => `<tr><td>${t}</td>${x.wars ? `<td class="text-end">${x.index ?? '–'}</td><td>${levelBadge(x.level)}</td><td class="text-end">${x.used}/${x.avail}</td><td class="text-end">${pctTxt(x.values.dano_efectivo)}</td><td class="text-end">${x.stars}</td><td class="text-end">${dec(x.values.estrellas, 2)} ★</td><td class="text-end">${x.values.triples == null ? '–' : Math.round(x.values.triples) + ' %'}</td>` : '<td colspan="7" class="text-secondary">Sin guerras</td>'}<td class="small text-secondary">${extra}</td></tr>`;
-  return `<tr class="ctx-row"><td colspan="${cols}">${p.grouped ? `<div class="small text-secondary mb-1">Sus cuentas</div><div class="mb-3">${accountsTable(p.accounts)}</div>` : ''}<div class="row g-3"><div class="col-lg-7"><div class="small text-secondary mb-1">Rendimiento por tipo${p.grouped ? ' · media de sus cuentas' : ''}</div>
-    <table class="table table-sm mb-0"><thead><tr><th></th><th class="text-end">Índice</th><th>Nivel</th><th class="text-end">Ataques</th><th class="text-end">Daño efectivo</th><th class="text-end">Estrellas</th><th class="text-end">Media</th><th class="text-end">Triples</th><th></th></tr></thead><tbody>
-    ${line('<span class="badge bg-purple-lt">Liga</span>', c.cwl)}${line('<span class="badge bg-blue-lt">Normales</span>', c.war)}${line('<span class="badge bg-secondary-lt">Normales, otros clanes</span>', c.other, c.other_clan ? 'Última: ' + esc(c.other_clan) : '')}</tbody></table></div>
-    <div class="col-lg-5"><div class="small text-secondary mb-1">Últimas guerras en el clan</div>
-    <table class="table table-sm mb-0"><tbody>${c.recent.map(w => `<tr><td class="text-secondary">${fecha(w.ts)}</td><td>${kindBadge(w.kind)}</td>${w.account ? `<td class="small">${esc(w.account)}</td>` : ''}<td>${esc(w.opponent)}</td><td>${hitsHtml(w)}</td></tr>`).join('') || '<tr><td class="text-secondary">Sin guerras en el clan</td></tr>'}</tbody></table>
-    <a class="btn btn-sm btn-ghost-primary mt-2" href="${link(p)}">Abrir ficha completa <i class="ti ti-arrow-right ms-1"></i></a></div></div></td></tr>`;
+// Cuentas de un jugador: una tarjeta por cuenta, con lo importante a la vista y el enlace a su ficha.
+function accountCards(list) {
+  const num = (label, value) => `<span class="xd-num"><small>${label}</small><b>${value}</b></span>`;
+  return `<div class="xd-accs">${list.map(a => `<a class="xd-acc" href="${hash(a.tag)}">
+    <span class="xd-top">${ring(a.index, a.level, 44, 5)}<span class="xd-name"><b>${esc(a.name)}</b><small>TH${a.th ?? '?'} · ${esc(a.level.name)}</small></span><span class="xd-trend">${trendHtml(a.trend)}</span><i class="ti ti-chevron-right text-secondary"></i></span>
+    <span class="xd-nums">${num('% medio liga', pctTxt(a.values.dano_liga))}${num('% total liga', ligaTxt(a))}${num('★ por ataque', dec(a.values.estrellas, 2))}${num('Ataques', `${a.used}/${a.avail}`)}</span></a>`).join('')}</div>`;
 }
-// Tabla de cuentas de un jugador: lo que antes se veía por jugador sigue aquí, cuenta a cuenta.
-function accountsTable(list) {
-  return `<div class="table-responsive"><table class="table table-sm table-vcenter mb-0"><thead><tr><th>Cuenta</th><th>TH</th><th class="text-end">Índice</th><th>Nivel</th><th class="text-end">Ataques</th><th class="text-end">% total liga</th><th class="text-end">% medio liga</th><th class="text-end">Estrellas</th><th class="text-end">Media</th><th class="text-end">Triples</th><th>Forma</th></tr></thead><tbody>
-    ${list.map(a => `<tr><td><a class="player-name" href="${hash(a.tag)}">${esc(a.name)}</a></td><td>${a.th ?? '–'}</td><td class="text-end"><b>${a.index ?? '–'}</b></td><td>${levelBadge(a.level)}</td><td class="text-end">${a.used}/${a.avail}</td><td class="text-end">${ligaTxt(a)}</td><td class="text-end">${pctTxt(a.values.dano_liga)}</td><td class="text-end">${a.stars}</td><td class="text-end">${dec(a.values.estrellas, 2)} ★</td><td class="text-end">${a.values.triples == null ? '–' : Math.round(a.values.triples) + ' %'}</td><td class="small">${trendHtml(a.trend)}</td></tr>`).join('')}</tbody></table></div>`;
+// Liga, normales y otros clanes en una tabla compacta: sólo los tipos en los que ha jugado.
+function typeTable(c) {
+  const types = [['Liga', c.cwl], ['Normales', c.war], ['Otros clanes', c.other, c.other_clan]].filter(t => t[1].wars);
+  if (!types.length) return '<div class="text-secondary small">Sin guerras</div>';
+  return `<table class="xd-t"><thead><tr><th></th><th>Índice</th><th>Ataques</th><th>% medio</th><th>★</th><th class="d-none d-sm-table-cell">Triples</th></tr></thead><tbody>
+    ${types.map(([t, x, sub]) => `<tr><td>${t}${sub ? `<small>${esc(sub)}</small>` : ''}</td><td><b style="color:${LEVEL_COL[x.level.id]}" title="${esc(x.level.name)}">${x.index ?? '–'}</b></td><td>${x.used}/${x.avail}</td><td>${pctTxt(x.values.dano)}</td><td>${dec(x.values.estrellas, 2)}</td><td class="d-none d-sm-table-cell">${pctTxt(x.values.triples)}</td></tr>`).join('')}</tbody></table>`;
+}
+// Últimas guerras agrupadas: varias cuentas en la misma guerra forman un solo bloque.
+function recentWars(list) {
+  const wars = new Map();
+  list.forEach(w => { const k = `${w.ts}|${w.opponent}`; if (!wars.has(k)) wars.set(k, []); wars.get(k).push(w); });
+  if (!wars.size) return '<div class="text-secondary small">Sin guerras en el clan</div>';
+  return [...wars.values()].map(g => { const w = g[0]; return `<div class="xd-war xd-${esc(w.result)}"><div class="xd-war-h"><b>${esc(w.opponent)}</b><span>${fecha(w.ts)}</span>${kindBadge(w.kind)}</div>
+    ${g.map(x => `<div class="xd-hit">${x.account ? `<span class="text-truncate">${esc(x.account)}</span>` : ''}<span class="xd-hits">${hitsHtml(x)}</span></div>`).join('')}</div>`; }).join('');
+}
+// Desglose al pulsar una fila: mismo diseño en móvil y en escritorio.
+function ctxRow(p, cols) {
+  const c = p.ctx;
+  return `<tr class="ctx-row"><td colspan="${cols}"><div class="xd">
+    ${p.grouped ? `<section><div class="xd-h">Sus cuentas</div>${accountCards(p.accounts)}</section>` : ''}
+    <div class="xd-2"><section><div class="xd-h">Por tipo de guerra${p.grouped ? ' · media de sus cuentas' : ''}</div>${typeTable(c)}</section>
+    <section><div class="xd-h">Últimas guerras en el clan</div>${recentWars(c.recent)}</section></div>
+    <a class="btn btn-sm btn-primary w-100" href="${link(p)}">Abrir ficha completa <i class="ti ti-arrow-right ms-1"></i></a></div></td></tr>`;
 }
 // Tabla de jugadores de Guerras y Ligas: fila con la media y, debajo, una fila por cuenta.
 function ownerTable(rows, none, liga) {
   const cells = p => `<td>${p.th ? thText(p) : '–'}</td><td class="scorecell"><div class="d-flex align-items-center gap-2"><div class="progress progress-sm flex-fill"><div class="progress-bar bg-gold" style="width:${p.index ?? 0}%"></div></div><b>${p.index ?? '–'}</b></div></td><td>${levelBadge(p.level)}</td><td class="text-end">${p.used}/${p.avail}</td>${liga ? `<td class="text-end">${ligaTxt(p)}</td><td class="text-end">${pctTxt(p.values.dano_liga)}</td>` : `<td class="text-end">${pctTxt(p.values.dano_efectivo)}</td>`}<td class="text-end">${dec(p.values.estrellas, 2)} ★</td><td class="text-end">${p.values.triples == null ? '–' : Math.round(p.values.triples) + ' %'}</td><td class="text-end ${p.missed ? 'text-red fw-bold' : 'text-secondary'}">${p.missed}</td>`;
   return `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Jugador</th><th>TH</th><th>Índice</th><th>Nivel</th><th class="text-end">Ataques</th>${liga ? `<th class="text-end">% total liga</th><th class="text-end">% medio liga</th>` : `<th class="text-end">Daño efectivo</th>`}<th class="text-end">Estrellas por ataque</th><th class="text-end">Triples</th><th class="text-end">Sin usar</th></tr></thead><tbody>
-    ${rows.map(p => `<tr class="${p.mine ? 'mine' : ''}"><td><div class="d-flex align-items-center gap-2">${avatar(p)}<div><a class="player-name" href="${link(p)}">${esc(p.name)}</a>${p.grouped ? `<div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media</div>` : ''}</div></div></td>${cells(p)}</tr>
+    ${rows.map(p => `<tr><td><div class="d-flex align-items-center gap-2">${avatar(p)}<div><a class="player-name" href="${link(p)}">${esc(p.name)}</a>${p.grouped ? `<div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media</div>` : ''}</div></div></td>${cells(p)}</tr>
       ${p.grouped ? p.accounts.map(a => `<tr class="sub-row"><td><a class="player-name fw-normal" href="${hash(a.tag)}">${esc(a.name)}</a></td>${cells(a)}</tr>`).join('') : ''}`).join('') || `<tr><td colspan="${liga ? 10 : 9}">${empty(none)}</td></tr>`}</tbody></table></div>`;
 }
 // Tablero jugador → cuentas. Cada arrastre se guarda: cuentas entre jugadores, orden dentro de cada uno y orden de los jugadores.
@@ -297,9 +313,9 @@ function renderResumen(d) {
       ${splitCard('war', 'Guerras normales', 'ti-swords', sp.war, '#guerras', '', `Aún sin guerras normales del clan. Tus miembros suman ${plural(d.others, 'participación', 'participaciones')} con otros clanes.`)}
     </div>
     ${sec('ranking', S.by === 'player' ? 'Ranking de jugadores' : 'Ranking de cuentas', `${players.every(p => p.few) ? 'Aún pocos datos · ' : ''}${KIND_NAME[S.kind]} · pulsa uno para ver su contexto`, `<div class="d-md-none px-3 py-2 d-flex align-items-center gap-2"><label class="small text-secondary" for="sortPick">Ordenar por</label><select class="form-select form-select-sm" id="sortPick">${[['index', 'Índice'], ['name', 'Nombre'], ['th', 'Ayuntamiento'], ['used', 'Ataques usados'], ['stars', 'Estrellas'], ['missed', 'Sin usar']].map(([k, t]) => `<option value="${k}" ${S.sort.k === k ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
-      <div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th class="pos">#</th>${col('name', One)}${col('th', 'TH')}${col('index', 'Índice')}<th>Nivel</th>${col('used', 'Ataques usados', 'text-end')}${col('liga_total', '% total liga', 'text-end')}${col('dano_liga', '% medio liga', 'text-end')}${col('stars', 'Estrellas', 'text-end')}${col('missed', 'Sin usar', 'text-end')}<th>Últimos ataques</th></tr></thead>
-      <tbody>${sorted.map((p, i) => `<tr class="player ${p.mine ? 'mine' : ''}" data-row="${esc(p.tag)}" aria-expanded="${S.openRow === p.tag}"><td class="pos">${i + 1}</td>
-        <td><div class="d-flex align-items-center gap-2"><i class="ti ti-chevron-right row-chev"></i>${avatar(p)}<div><a class="player-name" href="${link(p)}">${esc(p.name)}</a>${p.mine ? `<span class="badge bg-yellow-lt ms-1">${S.by === 'player' ? 'Tú' : 'Tuya'}</span>` : ''}${ownerBadge(p.owner?.name, p.owner?.id, p.name)}${p.grouped ? `<div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media</div>` : ''}</div></div></td>
+      <div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th class="pos">#</th>${col('name', One)}${col('th', 'TH')}${col('index', 'Índice')}<th>Nivel</th>${col('used', 'Ataques', 'text-end')}${col('liga_total', '% total liga', 'text-end')}${col('dano_liga', '% medio liga', 'text-end')}${col('stars', 'Estrellas', 'text-end')}${col('missed', 'Sin usar', 'text-end')}<th>Últimos ataques</th></tr></thead>
+      <tbody>${sorted.map((p, i) => `<tr class="player" data-row="${esc(p.tag)}" aria-expanded="${S.openRow === p.tag}"><td class="pos">${i + 1}</td>
+        <td><div class="d-flex align-items-center gap-2"><i class="ti ti-chevron-right row-chev"></i>${avatar(p)}<div><a class="player-name" href="${link(p)}">${esc(p.name)}</a>${ownerBadge(p.owner?.name, p.owner?.id, p.name)}${p.grouped ? `<div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media</div>` : ''}</div></div></td>
         <td class="text-nowrap">${S.by === 'player' && p.ths?.length > 1 ? p.ths.join(' · ') : p.th ?? '–'}</td><td class="scorecell"><div class="d-flex align-items-center gap-2"><div class="progress progress-sm flex-fill"><div class="progress-bar bg-gold" style="width:${p.index ?? 0}%"></div></div><b>${p.index ?? '–'}</b></div></td>
         <td>${levelBadge(p.level)}</td><td class="text-end">${p.used}/${p.avail}</td><td class="text-end">${ligaTxt(p)}</td><td class="text-end">${pctTxt(p.values.dano_liga)}</td><td class="text-end">${p.stars}</td><td class="text-end ${p.missed ? 'text-red fw-bold' : 'text-secondary'}">${p.missed}</td><td>${strip(p.ctx.recent.slice().reverse())}</td></tr>
         ${S.openRow === p.tag ? ctxRow(p, 11) : ''}`).join('') || `<tr><td colspan="11">${empty('Sin guerras con estos filtros')}</td></tr>`}</tbody></table></div>`, true)}
@@ -372,15 +388,15 @@ function renderMembers(d) {
   const pill = (k, t, c) => `<li class="nav-item"><a class="nav-link ${S.state === k ? 'active' : ''}" data-state="${k}" href="#">${t} <span class="badge bg-secondary-lt ms-1">${c}</span></a></li>`;
   const ths = [...new Set(d.players.map(p => p.th).filter(Boolean))].sort((a, b) => a - b), [, , One, Many] = who();
   const ownerCard = p => `<div class="col-sm-6 col-xl-4"><div class="card lift h-100"><div class="card-body">
-      <div class="d-flex align-items-center gap-3">${avatar(p, 'av-lg')}<div class="flex-fill" style="min-width:0"><a class="fw-bold text-truncate d-block text-reset" href="${link(p)}">${esc(p.name)}</a><div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media${p.mine ? ' · Tú' : ''}</div></div>${p.index != null ? ring(p.index, p.level, 52, 6) : ''}</div>
+      <div class="d-flex align-items-center gap-3">${avatar(p, 'av-lg')}<div class="flex-fill" style="min-width:0"><a class="fw-bold text-truncate d-block text-reset" href="${link(p)}">${esc(p.name)}</a><div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media</div></div>${p.index != null ? ring(p.index, p.level, 52, 6) : ''}</div>
       <div class="d-flex align-items-center gap-2 mt-3">${stateBadge(p)}${p.index != null ? levelBadge(p.level) : ''}</div>
       <div class="mt-2">${p.accounts.map(a => `<a class="own-row" href="${hash(a.tag)}"><span class="text-truncate">${esc(a.name)}</span><span class="small text-secondary">TH${a.th ?? '?'}</span><b>${a.index ?? '–'}</b></a>`).join('')}</div></div></div></div>`;
   const cards = `<div class="row row-cards">${list.map(p => p.grouped ? ownerCard(p) : `<div class="col-sm-6 col-xl-4"><a class="card card-link lift text-reset text-decoration-none h-100" href="${hash(p.tag)}"><div class="card-body">
-      <div class="d-flex align-items-center gap-3">${avatar(p, 'av-lg')}<div class="flex-fill" style="min-width:0"><div class="fw-bold text-truncate">${esc(p.name)}</div><div class="small text-secondary">TH${p.th ?? '?'}${p.mine ? ' · Tuya' : ''}${p.owner && p.owner.name !== p.name ? ' · ' + esc(p.owner.name) : ''}</div></div>${p.index != null ? ring(p.index, p.level, 52, 6) : ''}</div>
+      <div class="d-flex align-items-center gap-3">${avatar(p, 'av-lg')}<div class="flex-fill" style="min-width:0"><div class="fw-bold text-truncate">${esc(p.name)}</div><div class="small text-secondary">TH${p.th ?? '?'}${p.owner && p.owner.name !== p.name ? ' · ' + esc(p.owner.name) : ''}</div></div>${p.index != null ? ring(p.index, p.level, 52, 6) : ''}</div>
       <div class="d-flex align-items-center gap-2 mt-3">${stateBadge(p)}${p.index != null ? levelBadge(p.level) : ''}<span class="ms-auto">${strip(p.ctx.recent.slice().reverse())}</span></div>
       <div class="small text-secondary mt-2">${liveText(p)}</div></div></a></div>`).join('') || `<div class="col-12"><div class="card">${empty('Nadie con este filtro')}</div></div>`}</div>`;
   const table = `<div class="card"><div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>${One}</th><th>TH</th><th>Estado</th><th>Detalle</th><th>Índice</th><th>Últimos ataques</th><th class="text-end">Guerras</th><th class="text-end">Sin usar</th></tr></thead>
-      <tbody>${list.map(p => `<tr class="player ${p.mine ? 'mine' : ''}" data-row="${esc(p.tag)}" aria-expanded="${S.openRow === p.tag}"><td><div class="d-flex align-items-center gap-2"><i class="ti ti-chevron-right row-chev"></i>${avatar(p)}<div><a class="player-name" href="${link(p)}">${esc(p.name)}</a>${ownerBadge(p.owner?.name, p.owner?.id, p.name)}${p.grouped ? `<div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media</div>` : ''}</div></div></td>
+      <tbody>${list.map(p => `<tr class="player" data-row="${esc(p.tag)}" aria-expanded="${S.openRow === p.tag}"><td><div class="d-flex align-items-center gap-2"><i class="ti ti-chevron-right row-chev"></i>${avatar(p)}<div><a class="player-name" href="${link(p)}">${esc(p.name)}</a>${ownerBadge(p.owner?.name, p.owner?.id, p.name)}${p.grouped ? `<div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media</div>` : ''}</div></div></td>
         <td class="text-nowrap">${S.by === 'player' && p.ths?.length > 1 ? p.ths.join(' · ') : p.th ?? '–'}</td><td>${stateBadge(p)}</td><td class="small text-secondary">${liveText(p)}</td><td><b>${p.index ?? '–'}</b> ${p.index != null ? levelBadge(p.level) : ''}</td><td>${strip(p.ctx.recent.slice().reverse())}</td><td class="text-end">${p.wars}</td><td class="text-end ${p.missed ? 'text-red fw-bold' : 'text-secondary'}">${p.missed}</td></tr>
         ${S.openRow === p.tag ? ctxRow(p, 8) : ''}`).join('') || `<tr><td colspan="8">${empty('Nadie con este filtro')}</td></tr>`}</tbody></table></div></div>`;
   $('clanView').innerHTML = `
@@ -552,7 +568,7 @@ function renderOwner(d) {
       <div class="text-center">${ring(o.index, o.level, 104, 10)}<div class="mt-1">${levelBadge(o.level)}</div><div class="small mt-1">${trendHtml(o.trend)}</div></div>
       <div class="btn-group" role="group" aria-label="Ámbito"><button class="btn btn-sm ${S.scope === 'clan' ? 'btn-primary' : 'btn-ghost-secondary'}" data-scope="clan">Este clan</button><button class="btn btn-sm ${S.scope === 'all' ? 'btn-primary' : 'btn-ghost-secondary'}" data-scope="all">Todo su historial</button></div>
     </div></div>
-    ${sec('oacc', 'Sus cuentas', '', accountsTable(acc), true)}
+    ${sec('oacc', 'Sus cuentas', '', `<div class="card-body">${accountCards(acc)}</div>`, true)}
     <div class="row row-cards mb-3">${splitCard('cwl', 'Liga · media de sus cuentas', 'ti-shield-star', d.split.cwl, null, 'Todo su historial', 'Sin rondas de liga.')}${splitCard('war', 'Guerras normales · media de sus cuentas', 'ti-swords', d.split.war, null, 'Todo su historial', 'Sin guerras normales.')}</div>
     ${sec('okpi', 'KPIs del jugador', '', `<div class="card-body">${bullets(d.kpis, c, d.clan_card)}</div>`, true)}
     ${sec('ocmp', 'Cuenta a cuenta', '', `<div class="table-responsive"><table class="table table-sm card-table rank-table mb-0"><thead><tr><th>KPI</th>${acc.map(a => `<th class="text-end">${esc(a.name)}</th>`).join('')}<th class="text-end">Jugador</th><th class="text-end">Clan</th></tr></thead><tbody>
@@ -588,6 +604,9 @@ function paintHead(m) {
   $('clanRefresh').disabled = syncing; $('clanRefresh').classList.toggle('d-none', !canEdit());
   $('clanError').classList.toggle('d-none', !m.error); $('clanError').textContent = m.error || '';
 }
+// El desglose ocupa lo visible aunque la tabla tenga scroll lateral.
+function fitCtx() { $('clanView').querySelectorAll('.ctx-row').forEach(r => { const t = r.closest('.table-responsive'); if (t) t.style.setProperty('--vis', t.clientWidth + 'px'); }); }
+window.addEventListener('resize', fitCtx);
 function paint() {
   const d = S.data; if (!d) return;
   clearCharts();
@@ -602,6 +621,7 @@ function paint() {
   const page = PAGES[S.sub];
   $('clanView').insertAdjacentHTML('afterbegin', `<div class="page-intro"><h2 class="mb-1">${page[0]}</h2><p class="text-secondary mb-3">${page[1]}</p></div>`);
   cardTables();
+  fitCtx();
   drawOpen();
   if (S.enter) { S.enter = false; $('clanView').classList.remove('fade-in'); void $('clanView').offsetWidth; $('clanView').classList.add('fade-in'); }
 }
