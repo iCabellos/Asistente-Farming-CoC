@@ -51,6 +51,8 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path, q = self.route()
         try:
+            if q.get("fresh"):
+                almacen.leer_ajustes(fresco=True)      # el panel admin debe ver lo que acaba de guardar
             args = (q.get("kind", "all"), int(q.get("days", 0)))
             if path == "status":
                 return self.send_json(clan.status())

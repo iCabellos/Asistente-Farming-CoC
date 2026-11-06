@@ -606,11 +606,11 @@ function url() {
   if (S.sub === 'ligas') return 'api/leagues';
   if (S.sub === 'jugador') return `api/player?tag=${encodeURIComponent(S.tag)}&scope=${S.scope}&${q()}`;
   if (S.sub === 'persona') return `api/owner?id=${encodeURIComponent(S.tag)}&scope=${S.scope}&${q()}`;
-  return 'api/overview?' + q();
+  return `api/overview?${q()}${S.sub === 'admin' ? '&fresh=1' : ''}`;
 }
 function load() {
   const seq = ++S.seq;
-  const admin = S.sub === 'admin' && canEdit() ? api('api/admin', {}).catch(() => { sessionStorage.removeItem('clave'); return null; }) : null;
+  const admin = S.sub === 'admin' && canEdit() ? api('api/admin', {}).catch(() => new Promise(r => setTimeout(r, 1300)).then(() => api('api/admin', {}))).catch(() => { sessionStorage.removeItem('clave'); return null; }) : null;   // un reintento antes de cerrar la sesión
   return Promise.all([api(url()), admin]).then(([d, info]) => {
     d.admin = info;
     if (seq !== S.seq || S.dragging) return;    // llegó otra petición más nueva, o repintar cortaría el arrastre

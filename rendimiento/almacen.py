@@ -4,6 +4,10 @@
 - En Vercel el disco se borra, así que ambos están en Vercel Blob (almacén privado). Cada función copia
   clan.db a /tmp y lo consulta como siempre; la recogida lo vuelve a subir entero al terminar.
   Con un solo clan y una recogida al día basta, y las consultas siguen siendo las mismas.
+
+Vercel reparte las peticiones entre varias instancias y el Blob tiene caché: head_blob siempre dice cuál es
+la versión actual, pero get_blob puede devolver una anterior durante un rato tras escribir. Por eso aquí se
+pregunta primero con head y se pide con get hasta recibir justo esa versión.
 """
 import json
 import os
@@ -18,10 +22,11 @@ SETTINGS = Path(os.environ.get("CLAN_SETTINGS", ROOT / "clan.json"))
 DB = Path(os.environ.get("CLAN_DB", ROOT / "clan.db"))
 TMP_DB = Path(tempfile.gettempdir()) / "clan.db"
 BLOB_DB, BLOB_AJUSTES = "clan/clan.db", "clan/ajustes.json"
-TTL_DB, TTL_AJUSTES = 600, 120   # cada consulta al almacén gasta cuota: los datos sólo cambian una vez al día
+TTL_DB, TTL_AJUSTES = 600, 20    # cada consulta al almacén gasta cuota: los datos cambian poco
+GET_INTENTOS, GET_ESPERA = 12, 0.5
 _lock = threading.RLock()
 _copia = {"etag": None, "visto": 0.0}
-_ajustes = {"datos": None, "visto": 0.0}
+_ajustes = {"datos": None, "etag": None, "visto": 0.0, "forzado": 0.0}
 
 
 def _etag(pathname):
@@ -32,9 +37,19 @@ def _etag(pathname):
         return None
 
 
-def _bajar(pathname):
+def _limpio(etag):
+    return str(etag or "").removeprefix("W/").strip('"')
+
+
+def _bajar(pathname, etag):
+    """Contenido de esa versión exacta; si la caché sigue dando otra, espera y reintenta."""
     from vercel.blob.sync import get_blob
-    return bytes(get_blob(pathname, access="private").body)
+    for intento in range(GET_INTENTOS):
+        r = get_blob(pathname, access="private")
+        if _limpio(r.metadata.etag) == _limpio(etag):
+            return bytes(r.body)
+        time.sleep(GET_ESPERA)
+    raise RuntimeError("El almacén aún no sirve la última versión; reinténtalo en unos segundos.")
 
 
 def subir(pathname, data, content_type):
@@ -53,7 +68,7 @@ def ruta_db():
                 etag = _etag(BLOB_DB)
                 if etag and etag != _copia["etag"]:
                     tmp = TMP_DB.with_suffix(".nuevo")
-                    tmp.write_bytes(_bajar(BLOB_DB))
+                    tmp.write_bytes(_bajar(BLOB_DB, etag))
                     tmp.replace(TMP_DB)
                     _copia["etag"] = etag
                 _copia["visto"] = time.time()
@@ -71,16 +86,25 @@ def publicar_db():
             _copia["visto"] = time.time()
 
 
-def leer_ajustes():
+def leer_ajustes(fresco=False):
+    """fresco=True comprueba el almacén ahora mismo; si falla lanza el error en vez de seguir con datos viejos."""
     if not EN_NUBE:
         try:
             return json.loads(SETTINGS.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
     with _lock:
-        if _ajustes["datos"] is None or time.time() - _ajustes["visto"] > TTL_AJUSTES:
-            _ajustes["datos"] = json.loads(_bajar(BLOB_AJUSTES)) if _etag(BLOB_AJUSTES) else {}
-            _ajustes["visto"] = time.time()
+        ahora = time.time()
+        forzar = fresco and ahora - _ajustes["forzado"] >= 1     # un intento por segundo: no se gasta cuota por ráfagas
+        if _ajustes["datos"] is None or forzar or ahora - _ajustes["visto"] > TTL_AJUSTES:
+            try:
+                etag = _etag(BLOB_AJUSTES)
+                if _ajustes["datos"] is None or etag != _ajustes["etag"]:
+                    _ajustes.update(datos=json.loads(_bajar(BLOB_AJUSTES, etag)) if etag else {}, etag=etag)
+                _ajustes.update(visto=time.time(), forzado=time.time() if forzar else _ajustes["forzado"])
+            except Exception:
+                if fresco or _ajustes["datos"] is None:
+                    raise
         return {"clan_tag": os.environ.get("CLAN_TAG"), **_ajustes["datos"]}    # el panel admin manda sobre la variable
 
 
@@ -91,5 +115,5 @@ def guardar_ajustes(s):
         tmp.replace(SETTINGS)
         return
     with _lock:
-        subir(BLOB_AJUSTES, json.dumps(s, ensure_ascii=False).encode("utf-8"), "application/json")
-        _ajustes.update(datos=s, visto=time.time())
+        etag = subir(BLOB_AJUSTES, json.dumps(s, ensure_ascii=False).encode("utf-8"), "application/json")
+        _ajustes.update(datos=s, etag=etag, visto=time.time())

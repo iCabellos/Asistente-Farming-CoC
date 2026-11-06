@@ -155,7 +155,7 @@ def _hash(password, salt):
 
 
 def check_admin(user, password):
-    cfg = settings().get("admin")
+    cfg = almacen.leer_ajustes(fresco=True).get("admin")    # nunca con una copia vieja: da igual qué instancia responda
     if not cfg:
         return hmac.compare_digest(user.encode(), b"admin") and hmac.compare_digest(password.encode(), b"admin")
     return hmac.compare_digest(user.encode(), cfg["user"].encode()) and hmac.compare_digest(_hash(password, cfg["salt"]), cfg["hash"])
