@@ -13,6 +13,8 @@ const RESULT = {win: ['bg-green-lt', 'Victoria'], lose: ['bg-red-lt', 'Derrota']
 const dec = (n, d = 1) => n == null ? '–' : Number(n).toLocaleString('es-ES', {minimumFractionDigits: d, maximumFractionDigits: d});
 const fecha = ts => ts ? new Date(ts * 1000).toLocaleDateString('es-ES', {day: '2-digit', month: '2-digit'}) : '–';
 const fechaLarga = ts => ts ? new Date(ts * 1000).toLocaleDateString('es-ES', {day: '2-digit', month: '2-digit', year: '2-digit'}) : '–';
+const pctTxt = v => v == null ? '–' : Math.round(v) + ' %';
+const ligaTxt = p => p.liga_attacks ? Math.round(p.liga_total) + ' %' : '–';
 const stars = n => `<span class="text-yellow" aria-label="${n} estrellas">${'★'.repeat(n)}</span><span class="text-secondary">${'★'.repeat(3 - n)}</span>`;
 const levelBadge = l => `<span class="badge ${LEVEL[l.id]}">${esc(l.name)}</span>`;
 const resultBadge = r => { const [c, t] = RESULT[r] || RESULT.tie; return `<span class="badge ${c}">${t}</span>`; };
@@ -61,9 +63,9 @@ const DESC = {
   wplay: ['Cada jugador con la media de sus cuentas en estas guerras. Debajo, los datos de cada cuenta.'],
   lplay: ['Cada jugador con la media de sus cuentas en esta temporada. Debajo, los datos de cada cuenta.'],
   oacc: ['Cada cuenta conserva sus KPIs. Pulsa una para abrir su ficha completa.'],
-  okpi: ['Los 7 indicadores del jugador, como media de sus cuentas, frente a su objetivo y a la media del clan.'],
+  okpi: ['Los 9 indicadores del jugador, como media de sus cuentas, frente a su objetivo y a la media del clan.'],
   ocmp: ['Qué aporta cada cuenta a la media del jugador y cómo queda frente al clan.'],
-  kpis: ['Los 7 indicadores que forman el índice, comparados con su objetivo, y quién va mejor y peor en cada uno.'],
+  kpis: ['Los 9 indicadores que forman el índice, comparados con su objetivo, y quién va mejor y peor en cada uno.'],
   graficas: ['Cómo se reparte el rendimiento dentro del clan: quién tira del carro y qué ayuntamientos rinden más.'],
   calculo: ['Qué mide cada indicador, cuánto pesa en la nota y qué valor se considera el objetivo.'],
   msrc: ['Ahora sólo se ve a quien ha jugado alguna guerra. Con una clave gratuita de Supercell, las altas y bajas entran solas. Se hace una sola vez.'],
@@ -72,13 +74,13 @@ const DESC = {
   lheat: ['Las estrellas que sacó cada cuenta en cada ronda, para ver de un vistazo quién cumple siempre.'],
   lgraf: ['Evolución del clan ronda a ronda: estrellas, destrucción, ataques usados y balance.'],
   lnone: ['Las rondas de la temporada, con su marcador cuando terminan.'],
-  ljug: ['Lo que aportó cada cuenta en cada temporada: estrellas conseguidas y ataques usados de los disponibles.'],
+  ljug: ['Lo que aportó cada cuenta en cada temporada: estrellas, ataques usados y su destrucción, la suma de sus % y la media por ataque.'],
   lhist: ['Todas las temporadas guardadas: en qué liga jugó el clan, en qué puesto acabó y cómo fue evolucionando.'],
   wlist: ['Cada guerra con su marcador. Pulsa una para ver qué hizo cada jugador.'],
   wheat: ['Las estrellas que sacó cada cuenta en cada guerra, para ver de un vistazo quién cumple siempre.'],
   wgraf: ['Evolución del clan guerra a guerra: estrellas, destrucción, ataques usados y balance.'],
   wother: ['Lo que hicieron tus miembros en guerras normales con otros clanes. Da contexto, pero no cuenta para el clan.'],
-  pkpi: ['Los 7 indicadores de la cuenta frente a su objetivo y a la media del clan.'],
+  pkpi: ['Los 9 indicadores de la cuenta frente a su objetivo y a la media del clan.'],
   pforma: ['Cómo ataca: su perfil, si va a mejor o a peor y cuántas estrellas saca.'],
   prival: ['Si rinde igual contra rivales más fuertes y en qué momento de la guerra suele atacar.'],
   pdef: ['Cuántas estrellas le sacan cuando le atacan y qué ayuntamientos le hacen más daño.'],
@@ -145,7 +147,7 @@ const AXES = {chIndex: ['Índice (0 a 100)', 'Jugador'], chLevels: ['Nivel', 'N�
   chMemberTh: ['Ayuntamiento', 'Nº de cuentas'], Stars: [null, 'Estrellas'], Pct: [null, 'Destrucción %'], Used: [null, '% de ataques usados'], Bal: [null, 'Victorias menos derrotas'],
   chRank: ['Temporada', 'Puesto (1 es el mejor)'], chSeasonStars: ['Temporada', 'Estrellas'], chSeasonWL: ['Temporada', 'Rondas'], pForm: ['Fecha', 'Media de estrellas'], pStars: ['Fecha', 'Estrellas'],
   pPct: ['Fecha del ataque', 'Daño %'], pDist: ['Resultado del ataque', 'Nº de ataques'], pDiff: ['TH rival menos el suyo', 'Estrellas medias'], pTiming: ['Momento de la guerra', 'Nº de ataques'],
-  pDef: ['Fecha', 'Estrellas cedidas'], pDefTh: ['Ayuntamiento del atacante', 'Estrellas medias'], pDur: ['Fecha del ataque', 'Segundos'], pSeasons: ['Temporada', 'Estrellas']};
+  pDef: ['Fecha', 'Estrellas otorgadas al rival'], pDefTh: ['Ayuntamiento del atacante', 'Estrellas medias'], pDur: ['Fecha del ataque', 'Segundos'], pSeasons: ['Temporada', 'Estrellas']};
 function draw(id, config) {
   const el = document.getElementById(id); if (!el || charts[id]) return;
   const o = config.options, m = id.match(/^([wl])(Stars|Pct|Used|Bal)$/), a = AXES[m ? m[2] : id];
@@ -184,9 +186,10 @@ function splitCard(kind, title, icon, r, link, sub, none) {
     <div class="d-flex align-items-center mb-1"><div class="subheader"><i class="ti ${icon} me-1"></i>${title}</div>${link ? `<a class="ms-auto small" href="${link}">Ver todo <i class="ti ti-arrow-right"></i></a>` : ''}</div>
     ${r.wars ? `<div class="d-flex align-items-baseline gap-2"><div class="display-6 fw-bold">${r.index ?? '–'}</div>${levelBadge(r.level)}<span class="ms-auto text-secondary small">${plural(r.n, 'guerra', 'guerras')}</span></div>
       <div class="row g-2 mt-2 small">
-        <div class="col-4"><div class="text-secondary" title="Victorias, empates y derrotas">Victorias-Empates-Derrotas</div><b>${r.won}-${r.tied}-${r.lost}</b></div>
-        <div class="col-4"><div class="text-secondary">Ataques usados</div><b>${v.participacion == null ? '–' : Math.round(v.participacion) + ' %'}</b></div>
-        <div class="col-4"><div class="text-secondary">Estrellas por ataque</div><b>${dec(v.estrellas, 2)} ★</b></div></div>
+        <div class="col-6"><div class="text-secondary" title="Victorias, empates y derrotas">Victorias-Empates-Derrotas</div><b>${r.won}-${r.tied}-${r.lost}</b></div>
+        ${v.dano_liga != null ? `<div class="col-6"><div class="text-secondary" title="Suma del % de sus ataques de liga">% total en liga</div><b>${ligaTxt(r)}</b></div><div class="col-6"><div class="text-secondary" title="Destrucción media de sus ataques de liga">% medio en liga</div><b>${pctTxt(v.dano_liga)}</b></div>` : `<div class="col-6"><div class="text-secondary" title="Destrucción media por ataque disponible">Daño efectivo</div><b>${pctTxt(v.dano_efectivo)}</b></div>`}
+        <div class="col-6"><div class="text-secondary">Ataques usados</div><b>${v.participacion == null ? '–' : Math.round(v.participacion) + ' %'}</b></div>
+        <div class="col-6"><div class="text-secondary">Estrellas por ataque</div><b>${dec(v.estrellas, 2)} ★</b></div></div>
       ${sub ? `<div class="small text-secondary mt-2">${sub}</div>` : ''}` : `<div class="text-secondary mt-2">${none}</div>`}</div></div></div>`;
 }
 function alerts(d) {
@@ -205,9 +208,9 @@ function alerts(d) {
 }
 // Contexto de una fila: liga y normales por separado, y lo último que ha hecho.
 function ctxRow(p, cols) {
-  const c = p.ctx, line = (t, x, extra = '') => `<tr><td>${t}</td>${x.wars ? `<td class="text-end">${x.index ?? '–'}</td><td>${levelBadge(x.level)}</td><td class="text-end">${x.used}/${x.avail}</td><td class="text-end">${x.stars}</td><td class="text-end">${dec(x.values.estrellas, 2)} ★</td><td class="text-end">${x.values.triples == null ? '–' : Math.round(x.values.triples) + ' %'}</td>` : '<td colspan="6" class="text-secondary">Sin guerras</td>'}<td class="small text-secondary">${extra}</td></tr>`;
+  const c = p.ctx, line = (t, x, extra = '') => `<tr><td>${t}</td>${x.wars ? `<td class="text-end">${x.index ?? '–'}</td><td>${levelBadge(x.level)}</td><td class="text-end">${x.used}/${x.avail}</td><td class="text-end">${pctTxt(x.values.dano_efectivo)}</td><td class="text-end">${x.stars}</td><td class="text-end">${dec(x.values.estrellas, 2)} ★</td><td class="text-end">${x.values.triples == null ? '–' : Math.round(x.values.triples) + ' %'}</td>` : '<td colspan="7" class="text-secondary">Sin guerras</td>'}<td class="small text-secondary">${extra}</td></tr>`;
   return `<tr class="ctx-row"><td colspan="${cols}">${p.grouped ? `<div class="small text-secondary mb-1">Sus cuentas</div><div class="mb-3">${accountsTable(p.accounts)}</div>` : ''}<div class="row g-3"><div class="col-lg-7"><div class="small text-secondary mb-1">Rendimiento por tipo${p.grouped ? ' · media de sus cuentas' : ''}</div>
-    <table class="table table-sm mb-0"><thead><tr><th></th><th class="text-end">Índice</th><th>Nivel</th><th class="text-end">Ataques</th><th class="text-end">Estrellas</th><th class="text-end">Media</th><th class="text-end">Triples</th><th></th></tr></thead><tbody>
+    <table class="table table-sm mb-0"><thead><tr><th></th><th class="text-end">Índice</th><th>Nivel</th><th class="text-end">Ataques</th><th class="text-end">Daño efectivo</th><th class="text-end">Estrellas</th><th class="text-end">Media</th><th class="text-end">Triples</th><th></th></tr></thead><tbody>
     ${line('<span class="badge bg-purple-lt">Liga</span>', c.cwl)}${line('<span class="badge bg-blue-lt">Normales</span>', c.war)}${line('<span class="badge bg-secondary-lt">Normales, otros clanes</span>', c.other, c.other_clan ? 'Última: ' + esc(c.other_clan) : '')}</tbody></table></div>
     <div class="col-lg-5"><div class="small text-secondary mb-1">Últimas guerras en el clan</div>
     <table class="table table-sm mb-0"><tbody>${c.recent.map(w => `<tr><td class="text-secondary">${fecha(w.ts)}</td><td>${kindBadge(w.kind)}</td>${w.account ? `<td class="small">${esc(w.account)}</td>` : ''}<td>${esc(w.opponent)}</td><td>${hitsHtml(w)}</td></tr>`).join('') || '<tr><td class="text-secondary">Sin guerras en el clan</td></tr>'}</tbody></table>
@@ -215,15 +218,15 @@ function ctxRow(p, cols) {
 }
 // Tabla de cuentas de un jugador: lo que antes se veía por jugador sigue aquí, cuenta a cuenta.
 function accountsTable(list) {
-  return `<div class="table-responsive"><table class="table table-sm table-vcenter mb-0"><thead><tr><th>Cuenta</th><th>TH</th><th class="text-end">Índice</th><th>Nivel</th><th class="text-end">Ataques</th><th class="text-end">Estrellas</th><th class="text-end">Media</th><th class="text-end">Triples</th><th>Forma</th></tr></thead><tbody>
-    ${list.map(a => `<tr><td><a class="player-name" href="${hash(a.tag)}">${esc(a.name)}</a></td><td>${a.th ?? '–'}</td><td class="text-end"><b>${a.index ?? '–'}</b></td><td>${levelBadge(a.level)}</td><td class="text-end">${a.used}/${a.avail}</td><td class="text-end">${a.stars}</td><td class="text-end">${dec(a.values.estrellas, 2)} ★</td><td class="text-end">${a.values.triples == null ? '–' : Math.round(a.values.triples) + ' %'}</td><td class="small">${trendHtml(a.trend)}</td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-responsive"><table class="table table-sm table-vcenter mb-0"><thead><tr><th>Cuenta</th><th>TH</th><th class="text-end">Índice</th><th>Nivel</th><th class="text-end">Ataques</th><th class="text-end">% total liga</th><th class="text-end">% medio liga</th><th class="text-end">Estrellas</th><th class="text-end">Media</th><th class="text-end">Triples</th><th>Forma</th></tr></thead><tbody>
+    ${list.map(a => `<tr><td><a class="player-name" href="${hash(a.tag)}">${esc(a.name)}</a></td><td>${a.th ?? '–'}</td><td class="text-end"><b>${a.index ?? '–'}</b></td><td>${levelBadge(a.level)}</td><td class="text-end">${a.used}/${a.avail}</td><td class="text-end">${ligaTxt(a)}</td><td class="text-end">${pctTxt(a.values.dano_liga)}</td><td class="text-end">${a.stars}</td><td class="text-end">${dec(a.values.estrellas, 2)} ★</td><td class="text-end">${a.values.triples == null ? '–' : Math.round(a.values.triples) + ' %'}</td><td class="small">${trendHtml(a.trend)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 // Tabla de jugadores de Guerras y Ligas: fila con la media y, debajo, una fila por cuenta.
-function ownerTable(rows, none) {
-  const cells = p => `<td>${p.th ? thText(p) : '–'}</td><td class="scorecell"><div class="d-flex align-items-center gap-2"><div class="progress progress-sm flex-fill"><div class="progress-bar bg-gold" style="width:${p.index ?? 0}%"></div></div><b>${p.index ?? '–'}</b></div></td><td>${levelBadge(p.level)}</td><td class="text-end">${p.used}/${p.avail}</td><td class="text-end">${dec(p.values.estrellas, 2)} ★</td><td class="text-end">${p.values.triples == null ? '–' : Math.round(p.values.triples) + ' %'}</td><td class="text-end ${p.missed ? 'text-red fw-bold' : 'text-secondary'}">${p.missed}</td>`;
-  return `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Jugador</th><th>TH</th><th>Índice</th><th>Nivel</th><th class="text-end">Ataques</th><th class="text-end">Estrellas por ataque</th><th class="text-end">Triples</th><th class="text-end">Sin usar</th></tr></thead><tbody>
+function ownerTable(rows, none, liga) {
+  const cells = p => `<td>${p.th ? thText(p) : '–'}</td><td class="scorecell"><div class="d-flex align-items-center gap-2"><div class="progress progress-sm flex-fill"><div class="progress-bar bg-gold" style="width:${p.index ?? 0}%"></div></div><b>${p.index ?? '–'}</b></div></td><td>${levelBadge(p.level)}</td><td class="text-end">${p.used}/${p.avail}</td>${liga ? `<td class="text-end">${ligaTxt(p)}</td><td class="text-end">${pctTxt(p.values.dano_liga)}</td>` : `<td class="text-end">${pctTxt(p.values.dano_efectivo)}</td>`}<td class="text-end">${dec(p.values.estrellas, 2)} ★</td><td class="text-end">${p.values.triples == null ? '–' : Math.round(p.values.triples) + ' %'}</td><td class="text-end ${p.missed ? 'text-red fw-bold' : 'text-secondary'}">${p.missed}</td>`;
+  return `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Jugador</th><th>TH</th><th>Índice</th><th>Nivel</th><th class="text-end">Ataques</th>${liga ? `<th class="text-end">% total liga</th><th class="text-end">% medio liga</th>` : `<th class="text-end">Daño efectivo</th>`}<th class="text-end">Estrellas por ataque</th><th class="text-end">Triples</th><th class="text-end">Sin usar</th></tr></thead><tbody>
     ${rows.map(p => `<tr class="${p.mine ? 'mine' : ''}"><td><div class="d-flex align-items-center gap-2">${avatar(p)}<div><a class="player-name" href="${link(p)}">${esc(p.name)}</a>${p.grouped ? `<div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media</div>` : ''}</div></div></td>${cells(p)}</tr>
-      ${p.grouped ? p.accounts.map(a => `<tr class="sub-row"><td><a class="player-name fw-normal" href="${hash(a.tag)}">${esc(a.name)}</a></td>${cells(a)}</tr>`).join('') : ''}`).join('') || `<tr><td colspan="8">${empty(none)}</td></tr>`}</tbody></table></div>`;
+      ${p.grouped ? p.accounts.map(a => `<tr class="sub-row"><td><a class="player-name fw-normal" href="${hash(a.tag)}">${esc(a.name)}</a></td>${cells(a)}</tr>`).join('') : ''}`).join('') || `<tr><td colspan="${liga ? 10 : 9}">${empty(none)}</td></tr>`}</tbody></table></div>`;
 }
 // Tablero jugador → cuentas. Cada arrastre se guarda: cuentas entre jugadores, orden dentro de cada uno y orden de los jugadores.
 function chip(a, groups) {
@@ -261,7 +264,7 @@ function wireBoard() {
     $('clanView').querySelector(dest).append(s.closest('.own-chip')); saveGroups(); }; });
   $('clanView').querySelectorAll('[data-ungroup]').forEach(b => { b.onclick = () => saveGroups(b.dataset.ungroup); });
 }
-const SORTS = {index: p => p.index ?? -1, name: p => p.name.toLowerCase(), th: p => p.th ?? 0, used: p => p.used, stars: p => p.stars, missed: p => p.missed, trend: p => p.trend ?? -9};
+const SORTS = {index: p => p.index ?? -1, name: p => p.name.toLowerCase(), th: p => p.th ?? 0, used: p => p.used, liga_total: p => p.liga_total, dano_liga: p => p.values.dano_liga ?? -1, stars: p => p.stars, missed: p => p.missed, trend: p => p.trend ?? -9};
 function renderResumen(d) {
   const sum = d.summary, players = (S.by === 'player' ? d.owners : d.players).filter(p => p.wars), sp = d.split, se = d.clan.season;
   const [one, many, One, Many] = who(), accounts = d.players.filter(p => p.wars);    // el ayuntamiento es de la cuenta, no del jugador
@@ -281,7 +284,7 @@ function renderResumen(d) {
   $('clanView').innerHTML = `
     <div class="card hero mb-3"><div class="card-body d-flex flex-wrap align-items-center gap-4">
       ${ring(sum.index, sum.level, 112, 10)}
-      <div style="flex:1 1 260px"><div class="subheader mb-1">Índice del clan · ${esc(sum.level.name)}</div><div class="hero-line">${phrase}</div><div class="small text-secondary mt-1">El índice es una nota de 0 a 100 que combina 7 indicadores de guerra.</div></div>
+      <div style="flex:1 1 260px"><div class="subheader mb-1">Índice del clan · ${esc(sum.level.name)}</div><div class="hero-line">${phrase}</div><div class="small text-secondary mt-1">El índice es una nota de 0 a 100 que combina 9 indicadores de guerra.</div></div>
       ${se ? `<div class="hero-tracker"><div class="subheader mb-2">Liga · ${esc(se.league || '')}</div>${tracker(d.season_rounds, d.live.filter(w => w.type === 'cwl'))}</div>` : ''}
     </div></div>
     <div class="row row-cards mb-3">
@@ -294,12 +297,12 @@ function renderResumen(d) {
       ${splitCard('war', 'Guerras normales', 'ti-swords', sp.war, '#guerras', '', `Aún sin guerras normales del clan. Tus miembros suman ${plural(d.others, 'participación', 'participaciones')} con otros clanes.`)}
     </div>
     ${sec('ranking', S.by === 'player' ? 'Ranking de jugadores' : 'Ranking de cuentas', `${players.every(p => p.few) ? 'Aún pocos datos · ' : ''}${KIND_NAME[S.kind]} · pulsa uno para ver su contexto`, `<div class="d-md-none px-3 py-2 d-flex align-items-center gap-2"><label class="small text-secondary" for="sortPick">Ordenar por</label><select class="form-select form-select-sm" id="sortPick">${[['index', 'Índice'], ['name', 'Nombre'], ['th', 'Ayuntamiento'], ['used', 'Ataques usados'], ['stars', 'Estrellas'], ['missed', 'Sin usar']].map(([k, t]) => `<option value="${k}" ${S.sort.k === k ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
-      <div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th class="pos">#</th>${col('name', One)}${col('th', 'TH')}${col('index', 'Índice')}<th>Nivel</th>${col('used', 'Ataques usados', 'text-end')}${col('stars', 'Estrellas', 'text-end')}${col('missed', 'Sin usar', 'text-end')}<th>Últimos ataques</th></tr></thead>
+      <div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th class="pos">#</th>${col('name', One)}${col('th', 'TH')}${col('index', 'Índice')}<th>Nivel</th>${col('used', 'Ataques usados', 'text-end')}${col('liga_total', '% total liga', 'text-end')}${col('dano_liga', '% medio liga', 'text-end')}${col('stars', 'Estrellas', 'text-end')}${col('missed', 'Sin usar', 'text-end')}<th>Últimos ataques</th></tr></thead>
       <tbody>${sorted.map((p, i) => `<tr class="player ${p.mine ? 'mine' : ''}" data-row="${esc(p.tag)}" aria-expanded="${S.openRow === p.tag}"><td class="pos">${i + 1}</td>
         <td><div class="d-flex align-items-center gap-2"><i class="ti ti-chevron-right row-chev"></i>${avatar(p)}<div><a class="player-name" href="${link(p)}">${esc(p.name)}</a>${p.mine ? `<span class="badge bg-yellow-lt ms-1">${S.by === 'player' ? 'Tú' : 'Tuya'}</span>` : ''}${ownerBadge(p.owner?.name, p.owner?.id, p.name)}${p.grouped ? `<div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media</div>` : ''}</div></div></td>
-        <td>${S.by === 'player' && p.ths?.length > 1 ? p.ths.join(' · ') : p.th ?? '–'}</td><td class="scorecell"><div class="d-flex align-items-center gap-2"><div class="progress progress-sm flex-fill"><div class="progress-bar bg-gold" style="width:${p.index ?? 0}%"></div></div><b>${p.index ?? '–'}</b></div></td>
-        <td>${levelBadge(p.level)}</td><td class="text-end">${p.used}/${p.avail}</td><td class="text-end">${p.stars}</td><td class="text-end ${p.missed ? 'text-red fw-bold' : 'text-secondary'}">${p.missed}</td><td>${strip(p.ctx.recent.slice().reverse())}</td></tr>
-        ${S.openRow === p.tag ? ctxRow(p, 9) : ''}`).join('') || `<tr><td colspan="9">${empty('Sin guerras con estos filtros')}</td></tr>`}</tbody></table></div>`, true)}
+        <td class="text-nowrap">${S.by === 'player' && p.ths?.length > 1 ? p.ths.join(' · ') : p.th ?? '–'}</td><td class="scorecell"><div class="d-flex align-items-center gap-2"><div class="progress progress-sm flex-fill"><div class="progress-bar bg-gold" style="width:${p.index ?? 0}%"></div></div><b>${p.index ?? '–'}</b></div></td>
+        <td>${levelBadge(p.level)}</td><td class="text-end">${p.used}/${p.avail}</td><td class="text-end">${ligaTxt(p)}</td><td class="text-end">${pctTxt(p.values.dano_liga)}</td><td class="text-end">${p.stars}</td><td class="text-end ${p.missed ? 'text-red fw-bold' : 'text-secondary'}">${p.missed}</td><td>${strip(p.ctx.recent.slice().reverse())}</td></tr>
+        ${S.openRow === p.tag ? ctxRow(p, 11) : ''}`).join('') || `<tr><td colspan="11">${empty('Sin guerras con estos filtros')}</td></tr>`}</tbody></table></div>`, true)}
     ${sec('kpis', 'KPIs del clan', 'Barras frente a cada objetivo', `<div class="card-body"><div class="mb-4">${bullets(d.kpis, sum)}</div>
       <div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>KPI</th><th>Mejor</th><th>Por mejorar</th></tr></thead><tbody>
       ${leaders.map(l => `<tr><td>${esc(l.k.name)}</td><td>${l.top ? `<a class="player-name" href="${link(l.top)}">${esc(l.top.name)}</a> <span class="text-secondary">${fmtKpi(l.k, l.top.values[l.k.id])}</span>` : '–'}</td><td>${l.low ? `<a class="player-name" href="${link(l.low)}">${esc(l.low.name)}</a> <span class="text-secondary">${fmtKpi(l.k, l.low.values[l.k.id])}</span>` : '–'}</td></tr>`).join('')}</tbody></table></div></div>`, false)}
@@ -378,7 +381,7 @@ function renderMembers(d) {
       <div class="small text-secondary mt-2">${liveText(p)}</div></div></a></div>`).join('') || `<div class="col-12"><div class="card">${empty('Nadie con este filtro')}</div></div>`}</div>`;
   const table = `<div class="card"><div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>${One}</th><th>TH</th><th>Estado</th><th>Detalle</th><th>Índice</th><th>Últimos ataques</th><th class="text-end">Guerras</th><th class="text-end">Sin usar</th></tr></thead>
       <tbody>${list.map(p => `<tr class="player ${p.mine ? 'mine' : ''}" data-row="${esc(p.tag)}" aria-expanded="${S.openRow === p.tag}"><td><div class="d-flex align-items-center gap-2"><i class="ti ti-chevron-right row-chev"></i>${avatar(p)}<div><a class="player-name" href="${link(p)}">${esc(p.name)}</a>${ownerBadge(p.owner?.name, p.owner?.id, p.name)}${p.grouped ? `<div class="small text-secondary">${plural(p.accounts.length, 'cuenta', 'cuentas')} · media</div>` : ''}</div></div></td>
-        <td>${S.by === 'player' && p.ths?.length > 1 ? p.ths.join(' · ') : p.th ?? '–'}</td><td>${stateBadge(p)}</td><td class="small text-secondary">${liveText(p)}</td><td><b>${p.index ?? '–'}</b> ${p.index != null ? levelBadge(p.level) : ''}</td><td>${strip(p.ctx.recent.slice().reverse())}</td><td class="text-end">${p.wars}</td><td class="text-end ${p.missed ? 'text-red fw-bold' : 'text-secondary'}">${p.missed}</td></tr>
+        <td class="text-nowrap">${S.by === 'player' && p.ths?.length > 1 ? p.ths.join(' · ') : p.th ?? '–'}</td><td>${stateBadge(p)}</td><td class="small text-secondary">${liveText(p)}</td><td><b>${p.index ?? '–'}</b> ${p.index != null ? levelBadge(p.level) : ''}</td><td>${strip(p.ctx.recent.slice().reverse())}</td><td class="text-end">${p.wars}</td><td class="text-end ${p.missed ? 'text-red fw-bold' : 'text-secondary'}">${p.missed}</td></tr>
         ${S.openRow === p.tag ? ctxRow(p, 8) : ''}`).join('') || `<tr><td colspan="8">${empty('Nadie con este filtro')}</td></tr>`}</tbody></table></div></div>`;
   $('clanView').innerHTML = `
     <div class="d-flex flex-wrap align-items-center gap-2 mb-3"><div class="hscroll flex-fill"><ul class="nav nav-pills" id="stateTabs">${pill('all', 'Todos', all.length)}${pill('war', 'En guerra', n('war'))}${pill('idle', 'Sin guerra', n('idle'))}${pill('gone', 'En otro clan', n('gone'))}</ul></div>
@@ -437,8 +440,8 @@ function warBlock(id, rows, heat, opts) {           // rows: de la más reciente
 }
 function renderWars(d) {
   const has = d.wars.length > 0, r = d.summary;
-  const others = `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Cuenta</th><th>TH</th><th>Índice</th><th class="text-end">Guerras</th><th class="text-end">Ataques</th><th class="text-end">Media</th><th class="text-end">Clanes</th><th>Último clan</th><th class="text-end">Última</th></tr></thead>
-    <tbody>${d.others.map(o => `<tr><td><a class="player-name" href="${hash(o.tag)}">${esc(o.name)}</a>${ownerBadge(d.owner_names[o.tag], null, o.name)}</td><td>${o.th ?? '–'}</td><td><b>${o.index ?? '–'}</b> ${levelBadge(o.level)}</td><td class="text-end">${o.wars}</td><td class="text-end">${o.used}/${o.avail}</td><td class="text-end">${dec(o.values.estrellas, 2)} ★</td><td class="text-end">${o.clans}</td><td class="small">${esc(o.last_clan)}</td><td class="text-end text-secondary">${fechaLarga(o.last_ts)}</td></tr>`).join('') || `<tr><td colspan="9">${empty('Sin guerras con otros clanes')}</td></tr>`}</tbody></table></div>`;
+  const others = `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Cuenta</th><th>TH</th><th>Índice</th><th class="text-end">Guerras</th><th class="text-end">Ataques</th><th class="text-end">Daño efectivo</th><th class="text-end">Media</th><th class="text-end">Clanes</th><th>Último clan</th><th class="text-end">Última</th></tr></thead>
+    <tbody>${d.others.map(o => `<tr><td><a class="player-name" href="${hash(o.tag)}">${esc(o.name)}</a>${ownerBadge(d.owner_names[o.tag], null, o.name)}</td><td>${o.th ?? '–'}</td><td><b>${o.index ?? '–'}</b> ${levelBadge(o.level)}</td><td class="text-end">${o.wars}</td><td class="text-end">${o.used}/${o.avail}</td><td class="text-end">${pctTxt(o.values.dano_efectivo)}</td><td class="text-end">${dec(o.values.estrellas, 2)} ★</td><td class="text-end">${o.clans}</td><td class="small">${esc(o.last_clan)}</td><td class="text-end text-secondary">${fechaLarga(o.last_ts)}</td></tr>`).join('') || `<tr><td colspan="10">${empty('Sin guerras con otros clanes')}</td></tr>`}</tbody></table></div>`;
   $('clanView').innerHTML = `
     ${has ? `<div class="row row-cards mb-3">${splitCard('war', 'Guerras normales del clan', 'ti-swords', r, null, '', '')}</div>` : `<div class="card mb-3"><div class="empty-state"><i class="ti ti-swords"></i><div class="h3 mt-2 mb-1">Aún no hay guerras normales</div><div class="text-secondary">Este apartado se irá llenando con las próximas guerras del clan.</div><a class="btn btn-sm btn-ghost-primary mt-3" href="#ligas">Ver las rondas de liga <i class="ti ti-arrow-right ms-1"></i></a></div></div>`}
     ${has ? sec('wplay', 'Jugadores en guerras normales', '', ownerTable(d.owners, 'Sin guerras normales'), true) : ''}
@@ -461,14 +464,15 @@ function renderLeagues(d) {
       <div style="flex:1 1 220px"><div class="subheader">${live ? 'Liga en curso' : 'Liga'}</div><div class="h1 mb-0">${esc(cur.league || '–')}</div></div>
       <div class="text-center"><div class="subheader">Puesto</div><div class="h1 mb-0">${cur.rank ?? '–'}º</div></div>
       <div class="text-center"><div class="subheader">Estrellas</div><div class="h1 mb-0">${cur.stars ?? '–'}</div></div>
+      <div class="text-center"><div class="subheader" title="Si hay empate a estrellas, desempata la destrucción acumulada">Destrucción acumulada</div><div class="h1 mb-0">${cur.destruction == null ? '–' : dec(cur.destruction, 1) + ' %'}</div></div>
       <div class="text-center"><div class="subheader">Victorias-Empates-Derrotas</div><div class="h1 mb-0">${cur.won ?? 0}-${cur.tied ?? 0}-${cur.lost ?? 0}</div></div>
       <div class="hero-tracker">${tracker(rd, liveCwl)}</div></div></div>` : ''}
     ${rows.length ? warBlock('l', rows, d.heat, {title: 'Rondas', one: 'ronda', many: 'rondas', label, live: liveCwl, round: w => `Ronda ${num_[w.end_ts]}`, owners: d.owner_names}) : sec('lnone', 'Rondas', '', warCards([], {live: liveCwl}), true)}
-    ${d.owners[month] ? sec('lplay', 'Jugadores de la temporada', '', ownerTable(d.owners[month], 'Sin rondas'), true) : ''}
-    ${sec('ljug', 'Cuentas por temporada', 'Estrellas conseguidas · ataques usados', `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Cuenta</th>${months.map(m => `<th class="text-end">${m}</th>`).join('')}</tr></thead>
-      <tbody>${d.matrix.map(r => `<tr><td><a class="player-name" href="${hash(r.tag)}">${esc(r.name)}</a>${ownerBadge(d.owner_names[r.tag], null, r.name)}</td>${months.map(m => { const c = r.cells[m]; return `<td class="text-end">${c ? `${c.stars} ★ <span class="text-secondary small">${c.used}/${c.avail}</span>` : '<span class="text-secondary">–</span>'}</td>`; }).join('')}</tr>`).join('') || `<tr><td colspan="9">${empty('Sin datos')}</td></tr>`}</tbody></table></div>`)}
-    ${sec('lhist', 'Histórico de temporadas', `${plural(se.length, 'temporada', 'temporadas')} guardadas`, `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Temporada</th><th>Liga</th><th>Estado</th><th class="text-end">Puesto</th><th class="text-end">Estrellas</th><th class="text-end">Victorias-Empates-Derrotas</th></tr></thead>
-      <tbody>${se.slice().reverse().map(s => `<tr><td>${esc(s.season.slice(0, 7))}</td><td>${esc(s.league || '–')}</td><td>${s.state === 'ended' ? '<span class="badge bg-secondary-lt">Terminada</span>' : '<span class="badge bg-green-lt">En curso</span>'}</td><td class="text-end">${s.rank ?? '–'}º</td><td class="text-end">${s.stars ?? '–'}</td><td class="text-end">${s.won ?? 0}-${s.tied ?? 0}-${s.lost ?? 0}</td></tr>`).join('') || `<tr><td colspan="6">${empty('Sin temporadas')}</td></tr>`}</tbody></table></div>
+    ${d.owners[month] ? sec('lplay', 'Jugadores de la temporada', '', ownerTable(d.owners[month], 'Sin rondas', true), true) : ''}
+    ${sec('ljug', 'Cuentas por temporada', 'Estrellas · ataques usados · % total y % medio', `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Cuenta</th>${months.map(m => `<th class="text-end">${m}</th>`).join('')}</tr></thead>
+      <tbody>${d.matrix.map(r => `<tr><td><a class="player-name" href="${hash(r.tag)}">${esc(r.name)}</a>${ownerBadge(d.owner_names[r.tag], null, r.name)}</td>${months.map(m => { const c = r.cells[m]; return `<td class="text-end">${c ? `${c.stars} ★ <span class="text-secondary small">${c.used}/${c.avail}</span>${c.used ? `<div class="small text-secondary">${Math.round(c.pct)} % · media ${Math.round(c.pct / c.used)} %</div>` : ''}` : '<span class="text-secondary">–</span>'}</td>`; }).join('')}</tr>`).join('') || `<tr><td colspan="9">${empty('Sin datos')}</td></tr>`}</tbody></table></div>`)}
+    ${sec('lhist', 'Histórico de temporadas', `${plural(se.length, 'temporada', 'temporadas')} guardadas`, `<div class="table-responsive"><table class="table table-vcenter card-table rank-table mb-0"><thead><tr><th>Temporada</th><th>Liga</th><th>Estado</th><th class="text-end">Puesto</th><th class="text-end">Estrellas</th><th class="text-end">Destrucción acumulada</th><th class="text-end">Victorias-Empates-Derrotas</th></tr></thead>
+      <tbody>${se.slice().reverse().map(s => `<tr><td>${esc(s.season.slice(0, 7))}</td><td>${esc(s.league || '–')}</td><td>${s.state === 'ended' ? '<span class="badge bg-secondary-lt">Terminada</span>' : '<span class="badge bg-green-lt">En curso</span>'}</td><td class="text-end">${s.rank ?? '–'}º</td><td class="text-end">${s.stars ?? '–'}</td><td class="text-end">${s.destruction == null ? '–' : dec(s.destruction, 1) + ' %'}</td><td class="text-end">${s.won ?? 0}-${s.tied ?? 0}-${s.lost ?? 0}</td></tr>`).join('') || `<tr><td colspan="7">${empty('Sin temporadas')}</td></tr>`}</tbody></table></div>
       ${has ? chartRow(`${chart('chRank', 'Puesto por temporada', 'Puesto final en cada temporada: más arriba es mejor', {col: 'col-lg-4'})}${chart('chSeasonStars', 'Estrellas por temporada', 'Total del clan', {col: 'col-lg-4'})}${chart('chSeasonWL', 'Rondas ganadas y perdidas', 'Por temporada', {col: 'col-lg-4'})}`) : ''}`, false, () => {
       if (!has) return;
       draw('chRank', {type: 'line', data: {labels: lab, datasets: [lineSet('Puesto', se.map(s => s.rank))]}, options: base({scales: {x: {grid: {display: false}}, y: {reverse: true, min: 1, max: 8, ticks: {precision: 0}}}})});
@@ -481,7 +485,7 @@ function renderLeagues(d) {
 
 // ---------- ficha de jugador
 function historyTable(rows, none) {
-  return `<div class="table-responsive" style="max-height:420px"><table class="table table-vcenter card-table rank-table mb-0"><thead class="sticky-top"><tr><th>Fin</th><th>Clan</th><th>Rival</th><th>Resultado</th><th>Ataques</th><th class="text-end">Cedidas</th></tr></thead>
+  return `<div class="table-responsive" style="max-height:420px"><table class="table table-vcenter card-table rank-table mb-0"><thead class="sticky-top"><tr><th>Fin</th><th>Clan</th><th>Rival</th><th>Resultado</th><th>Ataques</th><th class="text-end">Estrellas otorgadas al rival</th></tr></thead>
     <tbody>${rows.slice().reverse().map(w => `<tr><td class="text-secondary">${fechaLarga(w.ts)}</td><td class="small">${esc(w.clan)}</td><td>${esc(w.opponent)}</td><td>${resultBadge(w.result)}</td><td>${hitsHtml(w)}</td><td class="text-end">${w.defenses ? w.conceded : '–'}</td></tr>`).join('') || `<tr><td colspan="6">${empty(none)}</td></tr>`}</tbody></table></div>`;
 }
 function renderPlayer(d) {
@@ -524,7 +528,7 @@ function renderPlayer(d) {
         options: base({plugins: {tooltip: {callbacks: {afterLabel: c_ => `${d.by_diff[c_.dataIndex].n} ataques · ${d.by_diff[c_.dataIndex].pct} % de daño`}}}, scales: {...starY, x: {grid: {display: false}, title: {display: true, text: 'TH rival menos el suyo'}}}})});
       draw('pTiming', {type: 'bar', data: {labels: ['Primer tercio', 'Segundo', 'Último'], datasets: [barSet('Ataques', d.timing)]}, options: base()});
     })}
-    ${sec('pdef', 'Defensa', '2 gráficas', chartRow(`${chart('pDef', 'Estrellas cedidas', 'Estrellas que le sacan en cada guerra: cuantas menos, mejor', {has: def})}${chart('pDefTh', 'Defensa por TH atacante', 'Estrellas medias que le sacan según quién le ataque', {has: d.def_by_th.length > 0})}`), false, () => {
+    ${sec('pdef', 'Defensa', '2 gráficas', chartRow(`${chart('pDef', 'Estrellas otorgadas al rival', 'Estrellas que le sacan en cada guerra: cuantas menos, mejor', {has: def})}${chart('pDefTh', 'Defensa por TH atacante', 'Estrellas medias que le sacan según quién le ataque', {has: d.def_by_th.length > 0})}`), false, () => {
       draw('pDef', {type: 'bar', data: {labels: lab, datasets: [byKind('Liga', w => w.conceded, 'cwl'), byKind('Normales', w => w.conceded, 'war')]}, options: base({plugins: tip, scales: stacked})});
       draw('pDefTh', {type: 'bar', data: {labels: d.def_by_th.map(x => 'TH' + x.th), datasets: [barSet('Estrellas', d.def_by_th.map(x => x.stars))]}, options: base({plugins: {tooltip: {callbacks: {afterLabel: c_ => `${d.def_by_th[c_.dataIndex].n} defensas`}}}, scales: starY})});
     })}

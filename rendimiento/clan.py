@@ -44,17 +44,21 @@ DAILY_HOUR, DAILY_MINUTE = 11, 1
 # Sistema de KPIs. Nota 0–100: lineal entre `floor` (0) y `target` (100). Si un KPI no se puede medir,
 # su peso se reparte entre los demás en vez de penalizar.
 KPIS = [
-    {"id": "participacion", "name": "Participación", "unit": "%", "weight": 25, "floor": 50, "target": 100,
-     "help": "Ataques usados de los disponibles"},
-    {"id": "estrellas", "name": "Estrellas por ataque", "unit": "★", "weight": 25, "floor": 1, "target": 2.6,
+    {"id": "dano_liga", "name": "% medio en liga", "unit": "%", "weight": 25, "floor": 60, "target": 100,
+     "help": "Destrucción media de sus ataques de liga: la destrucción acumulada desempata la clasificación"},
+    {"id": "estrellas", "name": "Estrellas por ataque", "unit": "★", "weight": 20, "floor": 1, "target": 2.6,
      "help": "Media por ataque disponible: un ataque sin usar cuenta 0"},
-    {"id": "triples", "name": "Triples", "unit": "%", "weight": 15, "floor": 10, "target": 70,
+    {"id": "dano_efectivo", "name": "Daño efectivo", "unit": "%", "weight": 15, "floor": 50, "target": 95,
+     "help": "Destrucción media por ataque disponible: un ataque sin usar cuenta 0 %"},
+    {"id": "participacion", "name": "Participación", "unit": "%", "weight": 15, "floor": 50, "target": 100,
+     "help": "Ataques usados de los disponibles"},
+    {"id": "dano", "name": "Daño medio", "unit": "%", "weight": 5, "floor": 50, "target": 95,
+     "help": "Destrucción media de los ataques que usó, en liga y normales"},
+    {"id": "triples", "name": "Triples", "unit": "%", "weight": 5, "floor": 10, "target": 70,
      "help": "Ataques de 3 estrellas sobre los usados"},
-    {"id": "dano", "name": "Daño medio", "unit": "%", "weight": 10, "floor": 50, "target": 95,
-     "help": "Destrucción media de sus ataques"},
-    {"id": "exigencia", "name": "Contra TH igual o mayor", "unit": "★", "weight": 10, "floor": 1, "target": 2.4,
+    {"id": "exigencia", "name": "Contra TH igual o mayor", "unit": "★", "weight": 5, "floor": 1, "target": 2.4,
      "help": "Estrellas medias contra rivales de su TH o superior"},
-    {"id": "defensa", "name": "Estrellas cedidas", "unit": "★", "weight": 10, "floor": 3, "target": 1.5,
+    {"id": "defensa", "name": "Estrellas otorgadas al rival", "unit": "★", "weight": 5, "floor": 3, "target": 1.5,
      "help": "Media que le sacan por defensa (menos es mejor)"},
     {"id": "constancia", "name": "Guerras completas", "unit": "%", "weight": 5, "floor": 40, "target": 100,
      "help": "Guerras en las que usó todos sus ataques"},
@@ -517,6 +521,10 @@ def mean(vals):
     return sum(vals) / len(vals) if vals else None
 
 
+def league_pcts(plays):
+    return [a["pct"] for p in plays if p["kind"] == "cwl" for a in p["attacks"]]
+
+
 def kpi_values(plays):
     avail = sum(p["per"] for p in plays)
     atk = [a for p in plays for a in p["attacks"]]
@@ -526,6 +534,8 @@ def kpi_values(plays):
     return {"participacion": 100 * len(atk) / avail if avail else None,
             "estrellas": stars / avail if avail else None,
             "triples": 100 * sum(a["stars"] == 3 for a in atk) / len(atk) if atk else None,
+            "dano_liga": mean(league_pcts(plays)),
+            "dano_efectivo": sum(a["pct"] for a in atk) / avail if avail else None,
             "dano": mean([a["pct"] for a in atk]),
             "exigencia": mean(harder),
             "defensa": mean([d["stars"] for d in dfs]),
@@ -566,9 +576,11 @@ def scorecard(plays):
     scores, index = kpi_scores(v)
     atk = [a for p in plays for a in p["attacks"]]
     avail = sum(p["per"] for p in plays)
+    liga = league_pcts(plays)
     return {"values": {k: (round(x, 2) if x is not None else None) for k, x in v.items()}, "scores": scores, "index": index,
             "level": level_of(index), "trend": trend(plays), "wars": len(plays), "avail": avail, "used": len(atk),
             "missed": avail - len(atk), "stars": sum(a["stars"] for a in atk), "few": avail < MIN_ATTACKS,
+            "liga_total": round(sum(liga), 1), "liga_attacks": len(liga),
             "wins": sum(p["result"] == "win" for p in plays), "loses": sum(p["result"] == "lose" for p in plays)}
 
 
@@ -669,7 +681,7 @@ def mean_card(cards):
     return {"values": {k["id"]: avg([c["values"][k["id"]] for c in played]) for k in KPIS},
             "scores": {k["id"]: avg([c["scores"][k["id"]] for c in played], 0) for k in KPIS}, "index": index, "level": level_of(index),
             "trend": avg([c["trend"] for c in played]), "few": all(c["few"] for c in cards),
-            **{k: sum(c[k] for c in cards) for k in ("wars", "avail", "used", "missed", "stars", "wins", "loses")}}
+            **{k: sum(c[k] for c in cards) for k in ("wars", "avail", "used", "missed", "stars", "wins", "loses", "liga_total", "liga_attacks")}}
 
 
 def mean_record(records):
@@ -905,10 +917,11 @@ def leagues_view():
         matrix = {}
         for p in plays:
             row = matrix.setdefault(p["player"], {"tag": p["player"], "name": names.get(p["player"]) or p["player"], "cells": {}})
-            cell = row["cells"].setdefault(month_of(p["end_ts"]), {"stars": 0, "avail": 0, "used": 0})
+            cell = row["cells"].setdefault(month_of(p["end_ts"]), {"stars": 0, "avail": 0, "used": 0, "pct": 0})
             cell["avail"] += p["per"]
             cell["used"] += len(p["attacks"])
             cell["stars"] += sum(a["stars"] for a in p["attacks"])
+            cell["pct"] = round(cell["pct"] + sum(a["pct"] for a in p["attacks"]), 1)
         table = sorted(matrix.values(), key=lambda r: -sum(x["stars"] for x in r["cells"].values()))
         detail = wars_view("cwl")
         groups = account_groups(c)
