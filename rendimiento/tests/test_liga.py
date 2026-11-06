@@ -5,6 +5,7 @@ resultados posibles de ligas pequeñas, y el resto del módulo se prueba en cada
 """
 import itertools
 import json
+import os
 import random
 import sys
 import time
@@ -674,6 +675,13 @@ def test_many_clans_are_kept_apart():
             c = clan.db()
             assert clan.meta_get(c, "stamp") is None, "un clan ve los datos de otro"
             c.close()
+            real = almacen.leer_ajustes                                      # otra instancia con copia vieja: no conoce el clan nuevo
+            almacen.leer_ajustes = lambda fresco=False: real() if fresco else {**real(), "clans": real()["clans"][:1]}
+            try:
+                clan.use_clan("#QQQ")
+                assert almacen.archivo() == "QQQ", "la recogida iría al clan equivocado"
+            finally:
+                almacen.leer_ajustes = real
             clan.use_clan("#RRR")                                           # uno que ya no se sigue: el primero
             assert clan.settings()["clan_tag"] == "#PPP"
             a, b = clan.running(), None
@@ -711,6 +719,120 @@ def test_progress_is_per_clan():
         finally:
             almacen.DB = old
             almacen.usar(None)
+
+
+def test_cron_gives_each_clan_its_own_run():
+    """Con varios clanes el cron no recoge: lanza una ejecución por clan, que sí recoge el suyo."""
+    import io
+    import importlib.util
+    import tempfile
+    import almacen, clan
+    spec = importlib.util.spec_from_file_location("api_index", Path(__file__).parent.parent / "api" / "index.py")
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)
+
+    def request(path, headers):
+        h = api.handler.__new__(api.handler)
+        h.path, h.headers, h.rfile, h.wfile = path, headers, io.BytesIO(), io.BytesIO()
+        h.requestline, h.request_version, h.command, h.client_address = "GET", "HTTP/1.1", "GET", ("x", 0)
+        h.do_GET()
+        return h.wfile.getvalue()
+
+    class Reply:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    with tempfile.TemporaryDirectory() as d:
+        js = Path(d) / "c.json"
+        js.write_text(json.dumps({"clans": [{"tag": "#PPP", "file": "clan"}, {"tag": "#QQQ", "file": "QQQ"}]}), encoding="utf8")
+        old = almacen.SETTINGS, almacen.DB, clan.daily, api.urllib.request.urlopen, os.environ.get("CRON_SECRET"), os.environ.get("VERCEL_PROJECT_PRODUCTION_URL")
+        almacen.SETTINGS, almacen.DB = js, Path(d) / "clan.db"
+        os.environ["CRON_SECRET"] = "s3"
+        os.environ.pop("VERCEL_PROJECT_PRODUCTION_URL", None)
+        calls, daily = [], []
+        clan.daily = lambda **k: daily.append(clan.settings()["clan_tag"]) or 0
+        api.urllib.request.urlopen = lambda r, timeout=0: calls.append((r.full_url, r.get_header("Authorization"))) or Reply()
+        H = {"Authorization": "Bearer s3", "Host": "web.test"}
+        try:
+            out = request("/api/index?ruta=cron", H)
+            assert sorted(calls) == [("https://web.test/api/cron?clan=PPP", "Bearer s3"), ("https://web.test/api/cron?clan=QQQ", "Bearer s3")], calls
+            assert not daily and b'"clans": 2' in out, (daily, out[-120:])
+            request("/api/index?ruta=cron&clan=QQQ", H)
+            assert daily == ["#QQQ"], daily                  # la ejecución de cada clan solo recoge ese clan
+            assert b"No autorizado" in request("/api/index?ruta=cron&clan=QQQ", {"Authorization": "Bearer mala"})
+            assert daily == ["#QQQ"]
+            api.urllib.request.urlopen = lambda r, timeout=0: (_ for _ in ()).throw(OSError("caída"))
+            out = request("/api/index?ruta=cron", H)
+            assert b" 500 " in out[:40] and b'"failed": 2' in out, out[:200]     # un fallo queda marcado en Vercel
+        finally:
+            almacen.SETTINGS, almacen.DB, clan.daily, api.urllib.request.urlopen = old[:4]
+            os.environ.pop("CRON_SECRET", None)
+            if old[4] is not None:
+                os.environ["CRON_SECRET"] = old[4]
+            if old[5] is not None:
+                os.environ["VERCEL_PROJECT_PRODUCTION_URL"] = old[5]
+            almacen.usar(None)
+
+
+def test_stale_store_never_ends_a_run():
+    """El almacén sirve versiones viejas durante un rato: una lectura vieja no puede dar la recogida por terminada."""
+    import datetime as dt
+    import sys as _sys
+    import types
+    import almacen
+
+    class Head:
+        def __init__(self, etag, ts):
+            self.etag, self.pathname, self.content_type, self.uploaded_at = etag, "clan/progreso-PRUEBA.json", st["type"], dt.datetime.fromtimestamp(ts, dt.timezone.utc)
+
+    class Got:
+        def __init__(self, etag, data):
+            self.metadata, self.body = types.SimpleNamespace(etag=etag), data
+    st = {"old": None, "new": None, "bust": True, "reads": 0, "type": "application/json"}
+    fake = types.ModuleType("vercel.blob.sync")
+    fake.BlobNotFoundError = KeyError
+    fake.head_blob = lambda p: Head(*st["new"][:2])
+    fake.get_blob = lambda u, access: (st.update(reads=st["reads"] + 1), Got(st["new"][0], st["new"][2]) if st["bust"] else Got(st["old"][0], st["old"][2]))[1]
+    now = time.time()
+    done = json.dumps({"active": False, "pct": 100, "updated": now - 3600}).encode()
+    run = json.dumps({"active": True, "pct": 40, "updated": now - 1, "label": "Simulando"}).encode()
+    keep = _sys.modules.get("vercel.blob.sync"), almacen.EN_NUBE
+    _sys.modules["vercel.blob.sync"] = fake
+    almacen.EN_NUBE = True
+    almacen.usar("PRUEBA")
+    almacen._progresos.clear()
+    try:
+        st.update(old=("a", now - 3600, done), new=("a", now - 3600, done))
+        assert almacen.leer_progreso()["active"] is False                    # lo que había: terminada
+        st.update(new=("b", now - 1, run))
+        assert almacen.leer_progreso()["pct"] == 40
+        st.update(old=("b", now - 1, run), new=("c", now - 1, json.dumps({"active": True, "pct": 60, "updated": now}).encode()), bust=False)
+        p = almacen.leer_progreso()                                          # la caché sigue vieja del todo: se mantiene lo último de esta recogida
+        assert p["active"] and p["pct"] == 40, p
+        almacen._progresos.clear()                                           # instancia nueva que solo conoce lo anterior
+        st.update(old=("a", now - 3600, done), new=("b", now - 1, run), bust=False)
+        p = almacen.leer_progreso()
+        assert p["active"] and p["pct"] == 0, p                              # nunca «terminada» si hay algo más nuevo que no se puede leer
+        st.update(new=("z", now - 600, run), bust=False)
+        almacen._progresos.clear()
+        assert not almacen.leer_progreso().get("active"), "una escritura vieja no prueba que siga viva"
+        # lo normal: el avance viaja en los metadatos, que no pasan por la caché, y ni se descarga el archivo
+        almacen._progresos.clear()
+        seen = {"active": True, "pct": 72, "label": "Simulando la liga", "detail": "guerra 5 de 12", "error": "ñandú · 100 %", "steps": ["a", "b"], "updated": now}
+        st.update(type=almacen._tipo_con(seen), new=("y", now, done), old=("a", now - 3600, done), bust=False, reads=0)
+        assert almacen.leer_progreso() == seen and st["reads"] == 0
+    finally:
+        if keep[0] is None:
+            _sys.modules.pop("vercel.blob.sync", None)
+        else:
+            _sys.modules["vercel.blob.sync"] = keep[0]
+        almacen.EN_NUBE = keep[1]
+        almacen.usar(None)
+        almacen._progresos.clear()
 
 
 def test_map_rank_not_roster_number():

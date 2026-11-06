@@ -9,7 +9,8 @@
 
 Vercel reparte las peticiones entre varias instancias y el Blob tiene caché: head_blob siempre dice cuál es
 la versión actual, pero get_blob puede devolver una anterior durante un rato tras escribir. Por eso aquí se
-pregunta primero con head y se pide con get hasta recibir justo esa versión.
+pregunta primero con head y se pide con get hasta recibir justo esa versión. El avance cambia cada pocos segundos
+y no puede esperar a la caché: viaja también en el tipo del archivo, que head siempre da al día.
 """
 import contextvars
 import json
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 ROOT = Path(__file__).parent
 EN_NUBE = bool(os.environ.get("VERCEL"))
@@ -27,6 +29,7 @@ PRIMERO = "clan"                 # archivo del clan que ya había antes de poder
 BLOB_AJUSTES = "clan/ajustes.json"
 TTL_DB, TTL_AJUSTES = 180, 20    # cada consulta al almacén gasta cuota: los datos cambian poco
 GET_INTENTOS, GET_ESPERA = 12, 0.5
+ESCRITO_HACE = 30                # si la última escritura es de hace menos, la recogida puede seguir viva
 _lock = threading.RLock()
 _clan = contextvars.ContextVar("clan", default=None)     # cada petición lleva el suyo, aunque compartan instancia
 _copias, _progresos = {}, {}
@@ -70,10 +73,11 @@ def _progreso(f):
     return _progresos.setdefault(f, {"datos": None, "etag": None})
 
 
-def _etag(pathname):
+def _meta(pathname):
+    """Lo que el almacén sabe ahora de un archivo: esto nunca viene de la caché. None si no existe."""
     from vercel.blob.sync import BlobNotFoundError, head_blob
     try:
-        return head_blob(pathname).etag
+        return head_blob(pathname)
     except BlobNotFoundError:
         return None
 
@@ -82,15 +86,36 @@ def _limpio(etag):
     return str(etag or "").removeprefix("W/").strip('"')
 
 
-def _bajar(pathname, etag):
+def _bajar(m):
     """Contenido de esa versión exacta; si la caché sigue dando otra, espera y reintenta."""
     from vercel.blob.sync import get_blob
     for intento in range(GET_INTENTOS):
-        r = get_blob(pathname, access="private")
-        if _limpio(r.metadata.etag) == _limpio(etag):
+        r = get_blob(m.pathname, access="private")
+        if _limpio(r.metadata.etag) == _limpio(m.etag):
             return bytes(r.body)
         time.sleep(GET_ESPERA)
     raise RuntimeError("El almacén aún no sirve la última versión; reinténtalo en unos segundos.")
+
+
+def _bajar_progreso(m):
+    """Por si el tipo del archivo no trae el avance: vale esa versión o una posterior, nunca una anterior."""
+    from vercel.blob.sync import get_blob
+    escrito = m.uploaded_at.timestamp()
+    for intento in range(3):
+        d = json.loads(get_blob(m.pathname, access="private").body)
+        if d.get("updated", 0) >= escrito - 15:
+            return d
+        time.sleep(.3)
+    raise RuntimeError("Versión vieja del avance.")
+
+
+def _tipo_con(p):
+    return "application/json; d=" + quote(json.dumps(p, separators=(",", ":")), safe="")
+
+
+def _tipo_datos(m):
+    _, _, d = (getattr(m, "content_type", None) or "").partition("; d=")
+    return json.loads(unquote(d)) if d else None
 
 
 def guardar_progreso(p, f=None):
@@ -100,7 +125,11 @@ def guardar_progreso(p, f=None):
     try:
         data = json.dumps(p, ensure_ascii=False).encode("utf-8")
         if EN_NUBE:
-            _progreso(f).update(datos=p, etag=subir(_blob_progreso(f), data, "application/json"))
+            try:
+                etag = subir(_blob_progreso(f), data, _tipo_con(p))
+            except Exception:   # noqa: BLE001 — sin metadatos se sigue leyendo del contenido
+                etag = subir(_blob_progreso(f), data, "application/json")
+            _progreso(f).update(datos=p, etag=etag)
         else:
             ruta = _ruta_progreso(f)
             tmp = ruta.with_suffix(".tmp")
@@ -113,18 +142,26 @@ def guardar_progreso(p, f=None):
 def leer_progreso():
     f = archivo()
     x = _progreso(f)
+    m = None
     try:
         if not EN_NUBE:
             ruta = _ruta_progreso(f)
             return json.loads(ruta.read_text(encoding="utf-8")) if ruta.exists() else {}
-        etag = _etag(_blob_progreso(f))
-        if not etag:
+        m = _meta(_blob_progreso(f))
+        if not m:
             return {}
-        if etag != x["etag"]:
-            x.update(datos=json.loads(_bajar(_blob_progreso(f), etag)), etag=etag)
+        d = _tipo_datos(m)
+        if d is not None:
+            x.update(datos=d, etag=m.etag)
+            return d
+        if m.etag != x["etag"]:
+            x.update(datos=_bajar_progreso(m), etag=m.etag)
         return x["datos"] or {}
     except Exception:           # noqa: BLE001 — un fallo al leer no significa que haya terminado
-        return x["datos"] or {"unknown": True}
+        d = x["datos"] or {}
+        if m and time.time() - m.uploaded_at.timestamp() < ESCRITO_HACE:     # hay una versión nueva que aún no se puede leer: lo que tenemos ya no vale
+            return {**d, "updated": m.uploaded_at.timestamp()} if d.get("active") else {"active": True, "pct": 0, "stage": "recoger", "label": "Calculando", "detail": None, "source": None, "step": 1, "steps": d.get("steps") or [], "updated": m.uploaded_at.timestamp()}
+        return d or {"unknown": True}
 
 
 def refrescar_db():
@@ -150,12 +187,12 @@ def ruta_db():
         x = _copia(f)
         if time.time() - x["visto"] > TTL_DB:
             try:
-                etag = _etag(_blob_db(f))
-                if etag and etag != x["etag"]:
+                m = _meta(_blob_db(f))
+                if m and m.etag != x["etag"]:
                     tmp = _tmp(f).with_suffix(".nuevo")
-                    tmp.write_bytes(_bajar(_blob_db(f), etag))
+                    tmp.write_bytes(_bajar(m))
                     tmp.replace(_tmp(f))
-                    x["etag"] = etag
+                    x["etag"] = m.etag
                 x["visto"] = time.time()
             except Exception:
                 if x["etag"] is None:
@@ -185,9 +222,10 @@ def leer_ajustes(fresco=False):
         forzar = fresco and ahora - _ajustes["forzado"] >= 1     # un intento por segundo: no se gasta cuota por ráfagas
         if _ajustes["datos"] is None or forzar or ahora - _ajustes["visto"] > TTL_AJUSTES:
             try:
-                etag = _etag(BLOB_AJUSTES)
+                m = _meta(BLOB_AJUSTES)
+                etag = m.etag if m else None
                 if _ajustes["datos"] is None or etag != _ajustes["etag"]:
-                    _ajustes.update(datos=json.loads(_bajar(BLOB_AJUSTES, etag)) if etag else {}, etag=etag)
+                    _ajustes.update(datos=json.loads(_bajar(m)) if m else {}, etag=etag)
                 _ajustes.update(visto=time.time(), forzado=time.time() if forzar else _ajustes["forzado"])
             except Exception:
                 if fresco or _ajustes["datos"] is None:

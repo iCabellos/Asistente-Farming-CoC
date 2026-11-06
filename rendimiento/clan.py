@@ -141,7 +141,11 @@ def use_clan(tag=None):
     """Elige el clan de esta petición. Sin tag, o con uno que ya no se sigue, el primero de la lista."""
     rows = clan_list()
     wanted = str(tag or "").strip().upper().lstrip("#")
-    e = next((r for r in rows if r["tag"][1:] == wanted), rows[0] if rows else None)
+    e = next((r for r in rows if r["tag"][1:] == wanted), None)
+    if wanted and not e:      # recién añadido: esta instancia puede tener una copia de hace unos segundos
+        rows = clan_list(_raw())
+        e = next((r for r in rows if r["tag"][1:] == wanted), None)
+    e = e or (rows[0] if rows else None)
     almacen.usar(e["file"] if e else None)
     return e
 
