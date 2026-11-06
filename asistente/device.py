@@ -1,11 +1,64 @@
 """Manos y ojos crudos: ADB (capturas, toques, deslizar, zoom) y colores de píxel."""
 import io
+import re
 import subprocess
 import time
 
 from PIL import Image
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# Valores de BlueStacks Pie 64-bit, por si no se puede detectar la pantalla táctil.
+FALLBACK_TOUCH = {"path": "/dev/input/event4", "name": "", "max_x": 32767, "max_y": 32767, "slots": False}
+
+
+def parse_touch(text):
+    """Saca de `getevent -lp` el dispositivo multitáctil. Prefiere el táctil virtual de BlueStacks."""
+    devices, cur = [], None
+    for line in text.splitlines():
+        if m := re.match(r"add device \d+: (\S+)", line):
+            cur = {"path": m[1], "name": "", "max_x": None, "max_y": None, "slots": False}
+            devices.append(cur)
+        elif cur is None:
+            continue
+        elif m := re.search(r'name:\s+"(.*)"', line):
+            cur["name"] = m[1]
+        elif m := re.search(r"ABS_MT_POSITION_X\s*:.*max (\d+)", line):
+            cur["max_x"] = int(m[1])
+        elif m := re.search(r"ABS_MT_POSITION_Y\s*:.*max (\d+)", line):
+            cur["max_y"] = int(m[1])
+        elif "ABS_MT_SLOT" in line:
+            cur["slots"] = True
+    found = [d for d in devices if d["max_x"] and d["max_y"]]
+    found.sort(key=lambda d: "touch" not in d["name"].lower())
+    return found[0] if found else None
+
+
+def pinch_commands(t):
+    """Dos dedos que se juntan en horizontal, en 7 pasos, en la escala del dispositivo.
+    Hay dos protocolos multitáctiles: sin ranuras (tipo A) y con ranuras (tipo B)."""
+    d, sx, cy = t["path"], t["max_x"] / 32767, t["max_y"] * 16383 // 32767
+    cmds = []
+    for i in range(7):
+        a = int((5898 + (13762 - 5898) * i // 6) * sx)
+        b = int((26869 - (26869 - 19005) * i // 6) * sx)
+        if t["slots"]:
+            for slot, x in ((0, a), (1, b)):
+                cmds.append(f"sendevent {d} 3 47 {slot}")
+                if i == 0:
+                    cmds.append(f"sendevent {d} 3 57 {slot + 1}")
+                cmds += [f"sendevent {d} 3 53 {x}", f"sendevent {d} 3 54 {cy}"]
+            cmds.append(f"sendevent {d} 0 0 0")
+        else:
+            cmds += [f"sendevent {d} 3 53 {a}", f"sendevent {d} 3 54 {cy}", f"sendevent {d} 0 2 0",
+                     f"sendevent {d} 3 53 {b}", f"sendevent {d} 3 54 {cy}", f"sendevent {d} 0 2 0",
+                     f"sendevent {d} 0 0 0"]
+    if t["slots"]:
+        for slot in (0, 1):
+            cmds += [f"sendevent {d} 3 47 {slot}", f"sendevent {d} 3 57 4294967295"]
+        return cmds + [f"sendevent {d} 0 0 0"]
+    return cmds + [f"sendevent {d} 0 2 0", f"sendevent {d} 0 0 0"]
 
 
 class Device:
@@ -50,16 +103,15 @@ class Device:
         self.shell("input keyevent 4")
         time.sleep(wait)
 
+    def touch(self):
+        """Pantalla táctil de este emulador. Se busca una vez: su número cambia entre instalaciones."""
+        if not hasattr(self, "_touch"):
+            self._touch = parse_touch(self.shell("getevent -lp")) or dict(FALLBACK_TOUCH)
+        return self._touch
+
     def zoom_out(self, times=2):
-        """Pellizco con dos dedos en 'BlueStacks Virtual Touch' (multitáctil tipo A)."""
-        d, cy, cmds = "/dev/input/event4", 16383, []
-        for i in range(7):
-            a = 5898 + (13762 - 5898) * i // 6
-            b = 26869 - (26869 - 19005) * i // 6
-            cmds += [f"sendevent {d} 3 53 {a}", f"sendevent {d} 3 54 {cy}", f"sendevent {d} 0 2 0",
-                     f"sendevent {d} 3 53 {b}", f"sendevent {d} 3 54 {cy}", f"sendevent {d} 0 2 0",
-                     f"sendevent {d} 0 0 0"]
-        cmds += [f"sendevent {d} 0 2 0", f"sendevent {d} 0 0 0"]
+        """Pellizco con dos dedos, escrito directamente en la pantalla táctil."""
+        cmds = pinch_commands(self.touch())
         for _ in range(times):
             self.shell(" ; ".join(cmds))
         time.sleep(0.8)
