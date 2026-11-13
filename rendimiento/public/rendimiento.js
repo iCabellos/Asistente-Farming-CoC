@@ -55,10 +55,13 @@ const PAGES = {
   persona: ['Ficha del jugador', 'Una persona con todas sus cuentas: sus KPIs son la media de las cuentas que han jugado guerras, y cada cuenta mantiene los suyos.'],
 };
 const DESC = {
-  eplan: ['Quién ataca a quién para sacar el mayor número de plenos, con el % de cada ataque. El plan principal nunca ataca por encima del puesto; si dejar subir a alguien sale más rentable, se propone como alternativa. Se recalcula con cada recogida.'],
+  eplan: ['Entran los dos ataques de cada cuenta y el cálculo decide quién ataca y a quién para tener el mayor % de victoria. Un ataque por aldea, y solo donde esa cuenta tiene opciones reales. Se recalcula con cada recogida.'],
+  etrain: ['Atacan todos: el primer ataque de cada cuenta va contra su mejor rival, y el segundo se reparte después para ganar la guerra. Nadie va a una aldea que le queda grande.'],
+  emap: ['Cada cuenta frente a su espejo: estrellas, ataques que le quedan y cómo fue cada uno. Se actualiza sola mientras se juega.'],
+  emapm: ['Cada cuenta frente a su espejo: estrellas, ataques que le quedan y cómo fue cada uno.'],
   ebat: ['La guerra que se está jugando: el marcador, lo que se esperaba antes de empezar y cómo va ahora. Se actualiza sola cada minuto.'],
   eprev: ['Lo que se previó antes de cada guerra frente a lo que pasó. Cada previsión se hizo solo con lo terminado antes de empezar, y no se retoca. La flecha dice si un ataque salió mejor o peor de lo esperado.'],
-  echat: ['Avisos listos para el chat del clan: copia un bloque, pégalo en el juego y ya. Van de 5 en 5, empezando por el jugador más bajo, y siguen el plan que tengas elegido en cada ronda. Las reservas no salen: esperan y rematan.'],
+  echat: ['Avisos listos para el chat del clan: copia un bloque, pégalo en el juego y ya. Van de 5 en 5, empezando por el jugador más bajo, y siguen el plan que elijas aquí, el 1 o el 2. Las reservas no salen.'],
   epos: ['Cada puesto, en verde si ya está asegurado, en ámbar si es posible y en rojo si está descartado. Pulsa uno para ver qué hace falta.'],
   etab: ['Cómo va el grupo ahora, con qué estrellas se espera que acabe cada clan y entre qué puestos puede moverse.'],
   elog: ['Lo que ha pasado cada ronda y si cada guerra nos ha ayudado o no a mejorar nuestro puesto.'],
@@ -449,7 +452,9 @@ function renderMembers(d) {
 function battleLink(b, kind) {
   if (!b || b.kind !== kind || b.ends < Date.now() / 1000) return '';
   const live = b.state === 'inWar', x = b.now || b.before;
-  return `<a class="card card-link lift mb-3 text-reset text-decoration-none" href="#predicciones"><div class="card-body d-flex flex-wrap align-items-center gap-2 py-2"><span class="badge ${live ? 'bg-green-lt' : 'bg-blue-lt'}">${live ? 'En juego' : 'En preparación'}</span><b>vs ${esc(b.them.name)}</b>${live ? `<span>${b.us.stars} – ${b.them.stars}</span>` : ''}${x ? `<span class="small text-secondary">Ganar: ${esPct(x.win)}</span>` : ''}<span class="ms-auto small">Ver predicción <i class="ti ti-arrow-right"></i></span></div></a>`;
+  const head = `<a class="card-link text-reset text-decoration-none d-block" href="#predicciones"><div class="card-body d-flex flex-wrap align-items-center gap-2 py-2"><span class="badge ${live ? 'bg-green-lt' : 'bg-blue-lt'}">${live ? 'En juego' : 'En preparación'}</span><b>vs ${esc(b.them.name)}</b>${live ? `<span>${b.us.stars} – ${b.them.stars}</span>` : ''}${x ? `<span class="small text-secondary">Ganar: ${esPct(x.win)}</span>` : ''}<span class="ms-auto small">Ver predicción <i class="ti ti-arrow-right"></i></span></div></a>`;
+  // la vista general de la guerra en juego: el mapa, cada cuenta frente a su espejo (lo pinta escenarios.js)
+  return `<div class="card mb-3 es-overview">${head}${b.map && typeof esMap === 'function' ? `<div class="border-top">${esMap(b).replace('id="esMap"', 'id="esMapW"')}</div>` : ''}</div>`;
 }
 // ---------- guerras normales: sólo normales; las de otros clanes van aparte y nunca suman al clan
 function warCards(rows, opts) {

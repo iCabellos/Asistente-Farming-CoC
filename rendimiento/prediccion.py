@@ -94,7 +94,7 @@ def forecast(war, us, data, seed=0, inactive=()):
     return {"sig": signature(war), "th": prob.th, "fresh": prob.beta[modelo.NAMES.index("fresh")], "pct": prob.pct, "sigma": model["sigma"], "calib": data.get("calib"), "aim": {s["tag"]: model["aim"][s["tag"]] for s in sides},
             "use": {m["tag"]: round(liga.use_prob(model, s["tag"], m["tag"], inactive if s["tag"] == us else ()), 3) for s in sides for m in s["members"]},
             "a": [m["tag"] for m in x], "b": [m["tag"] for m in y], "ab": [[round(prob.eta(m, d, True, cwl, size), 3) for d in y] for m in x], "ba": [[round(prob.eta(m, d, True, cwl, size), 3) for d in x] for m in y],
-            "ua": pick(prob.ua), "ud": pick(prob.ud), "form_a": pick(prob.form_a), "form_d": pick(prob.form_d), "recent_a": {t: prob.recent_a[t] for t in tags if t in prob.recent_a}, "recent_d": {t: prob.recent_d[t] for t in tags if t in prob.recent_d},
+            "ua": pick(prob.ua), "ud": pick(prob.ud), "form_a": pick(prob.form_a), "form_d": pick(prob.form_d), "recent_a": {t: prob.recent_a[t] for t in tags if t in prob.recent_a}, "recent_d": {t: prob.recent_d[t] for t in tags if t in prob.recent_d}, "hist_a": {t: prob.hist_a[t] for t in tags if t in prob.hist_a}, "hist_d": {t: prob.hist_d[t] for t in tags if t in prob.hist_d},
             "rows": len(known["rows"]), "made": start, "before": _play(a, b, rng)}
 
 
@@ -105,9 +105,13 @@ class Frozen:
         self.th, self.f, self.info = s["th"], s["fresh"], {"calib": s.get("calib")}
         self.pct = {int(k): v for k, v in s["pct"].items()}
         self.ua, self.ud, self.form_a, self.form_d, self.recent_a, self.recent_d = s["ua"], s["ud"], s["form_a"], s["form_d"], s["recent_a"], s["recent_d"]
+        self.hist_a, self.hist_d = s.get("hist_a") or {}, s.get("hist_d") or {}     # solo para explicar el %: ya va dentro de ab/ba
         self.eta_ = {(a, b): s["ab"][i][j] for i, a in enumerate(s["a"]) for j, b in enumerate(s["b"])}
         self.eta_.update({(b, a): s["ba"][j][i] for i, a in enumerate(s["a"]) for j, b in enumerate(s["b"])})
         self._c = {}
+
+    def evidence(self, a, b):
+        return modelo.evidence(a["th"], b["th"], self.hist_a.get(a["tag"], ()), self.hist_d.get(b["tag"], ()))
 
     def dist(self, a, b, fresh=True, cwl=True, size=15, shift=0.0):
         k = (a["tag"], b["tag"], fresh, shift)
@@ -152,21 +156,82 @@ def _result(war):
     return "win" if r > 0 else "lose" if r < 0 else "tie"
 
 
+_plan_memo = {}
+
+
+def plan_before_cached(war, snap):
+    """`plan_before` de la guerra en juego: no cambia mientras dure, así que se calcula una vez por guerra."""
+    if not snap:
+        return None
+    k = (snap.get("sig"), snap.get("made"), war["a"]["tag"])
+    if k not in _plan_memo:
+        try:
+            _plan_memo[k] = plan_before(war, snap)
+        except Exception:      # noqa: BLE001
+            _plan_memo[k] = None
+    return _plan_memo[k]
+
+
+def plan_before(war, snap):
+    """El plan que había antes del primer ataque, con el modelo congelado de la previsión: el mapa «previsto».
+    Es la propuesta de ganar la guerra, en liga y en guerra normal."""
+    if not snap or "ab" not in snap:
+        return None
+    w = {**war, "a": blank(war["a"]), "b": blank(war["b"]), "state": "preparation"}
+    start = _start(war)
+    L = mini(w, war["a"]["tag"], start)
+    games = liga.pending(L)
+    if not games:
+        return None
+    model = {"prob": Frozen(snap), "use": snap["use"], "aim": snap["aim"], "sigma": snap["sigma"]}
+    p = liga.war_plan(L, model, games[0], war["a"]["tag"], {t for t, u in snap["use"].items() if not u})
+    pick = p
+    by = {}
+    for r in pick["assign"]:
+        by.setdefault(r["a_tag"], []).append({"to": r["b_pos"], "p3": r["p3"], "e": r["stars"]})
+    on = {r["b_pos"]: {"by": r["a_pos"], "p3": r["p3"], "e": r["stars"]} for r in pick["assign"]}
+    return {"goal": pick.get("goal", "win"), "stars": pick["stars"], "triples": pick["triples"], "win": pick.get("win"),
+            "us": [{"pos": m["pos"], "name": m["name"], "th": m["th"], "plan": by.get(m["tag"], [])} for m in sorted(war["a"]["members"], key=lambda m: m["pos"])],
+            "them": [{"pos": m["pos"], "name": m["name"], "th": m["th"], **({"exp": on[m["pos"]]} if m["pos"] in on else {})} for m in sorted(war["b"]["members"], key=lambda m: m["pos"])]}
+
+
 def finished(war, snap):
-    """Comparación definitiva de una guerra terminada."""
+    """Comparación definitiva de una guerra terminada, con el mapa previsto antes de empezar y el mapa final."""
     rows = review(war, Frozen(snap))
-    return {"kind": war["kind"], "round": war.get("round"), "size": war["size"], "per": war["per"], "end": war.get("end"), "partial": war["partial"], "result": _result(war), "us": _side_info(war["a"], war), "them": _side_info(war["b"], war),
+    try:
+        before_map = plan_before(war, snap)
+    except Exception:      # noqa: BLE001 — sin mapa previsto la comparación sigue valiendo
+        before_map = None
+    return {"map_plan": before_map, "map_end": war_map(war), "kind": war["kind"], "round": war.get("round"), "size": war["size"], "per": war["per"], "end": war.get("end"), "partial": war["partial"], "result": _result(war), "us": _side_info(war["a"], war), "them": _side_info(war["b"], war),
             "before": snap["before"], "made": snap.get("made"), "rows": rows, "t": tally(rows)}
+
+
+def war_map(war):
+    """El mapa de la guerra, puesto a puesto: lo que ha hecho cada cuenta de los dos lados y lo que le queda."""
+    def side(me, ot):
+        pos = {m["tag"]: m["pos"] for m in ot["members"]}
+        got = {}                             # la mejor nota que el rival le ha sacado a cada aldea, como en el juego
+        for o in ot["members"]:
+            for a in o["atk"]:
+                got[a["def"]] = max(got.get(a["def"], 0), a["stars"])
+        rows = []
+        for m in sorted(me["members"], key=lambda m: m["pos"]):
+            atk = sorted(m["atk"], key=lambda a: a.get("order") or 0)
+            rows.append({"pos": m["pos"], "name": m["name"], "th": m["th"], "stars": sum(a["stars"] for a in atk), "left": max(0, war["per"] - len(atk)), "got": got.get(m["tag"]), 
+                         "atk": [{"stars": a["stars"], "pct": round(a["pct"]), "to": pos.get(a["def"])} for a in atk]})
+        return rows
+    return {"per": war["per"], "us": side(war["a"], war["b"]), "them": side(war["b"], war["a"])}
 
 
 def battle_view(war, us, snap, now, seed=0):
     """Una guerra en juego o en preparación: marcador, lo previsto antes de empezar, cómo va y el plan de lo que queda."""
     live = war["state"] == "inWar"
     out = {"kind": war["kind"], "cwl": war["cwl"], "round": war.get("round"), "state": war["state"], "size": war["size"], "per": war["per"], "start": modelo._ts(war.get("start")), "ends": modelo._ts(war.get("end")),
-           "us": _side_info(war["a"], war), "them": _side_info(war["b"], war), "before": None, "now": None, "hits": [], "t": None, "plan": None, "ts": int(now)}
+           "us": _side_info(war["a"], war), "them": _side_info(war["b"], war), "before": None, "now": None, "hits": [], "t": None, "plan": None, "ts": int(now), "map": war_map(war)}
     if not snap:
         return out                       # guerra recién empezada: la previsión llegará con la siguiente recogida
     prob = Frozen(snap)
+    out["map_plan"] = plan_before_cached(war, snap)      # lo previsto antes del primer ataque, para «Previsto y real»
     model = {"prob": prob, "use": snap["use"], "aim": snap["aim"], "sigma": snap["sigma"]}
     L = mini(war, us, now)
     games = liga.pending(L)

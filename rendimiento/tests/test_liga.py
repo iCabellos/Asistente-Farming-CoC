@@ -4,6 +4,7 @@ Lo más importante: «asegurado» y «descartado» no pueden ser falsos nunca. P
 resultados posibles de ligas pequeñas, y el resto del módulo se prueba en cada fase de la temporada.
 """
 import itertools
+import math
 import json
 import os
 import random
@@ -399,29 +400,30 @@ def test_plan_rules():
         p = plan.build(FakeProb(), at, ba, n, seed=rng.random())
         seen_a, seen_b = set(), set()
         for r in p["assign"]:
-            assert r["b_pos"] >= r["a_pos"], ("ataque por encima de su puesto", r)
-            assert r["a_tag"] not in seen_a and r["b_tag"] not in seen_b, "una cuenta o una aldea repetida"
+            assert r["a_tag"] not in seen_a and r["b_tag"] not in seen_b, "en liga, una cuenta o una aldea repetida"
             seen_a.add(r["a_tag"])
             seen_b.add(r["b_tag"])
-            assert r["p3"] >= p["tau"] - 1e-9
-        assert len(seen_a) + len(p["reserves"]) == n
         dist = plan.grid(FakeProb(), at, ba, n)
-        # nunca da menos plenos que el espejo, salvo lo poco que se cede por evitar ataques dudosos
-        got = sum(r["p3"] for r in p["assign"])
-        mir = sum(dist[i][j][3] for i, j in plan.mirror(at, ba).items())
-        assert got >= mir * (1 - plan.GIVE_UP) - .3, (got, mir)
+        ix = {a["tag"]: i for i, a in enumerate(at)}
+        jx = {b["pos"]: j for j, b in enumerate(ba)}
+        assert all(plan.viable(dist[ix[r["a_tag"]]][jx[r["b_pos"]]]) for r in p["assign"]), "ataque sin opciones"
+        assert p["covered"] + len(p["uncovered"]) == n
+        for u in p["uncovered"]:                         # sin rival solo si nadie libre tiene opciones con ella
+            assert not any(plan.viable(dist[ix[a["tag"]]][jx[u["pos"]]]) and a["tag"] not in seen_a for a in at), (u, p["assign"])     # con un ataque por cuenta, un ataque libre siempre suma
+        assert len(seen_a) + sum(r["n"] for r in p["reserves"]) == n
+        # el óptimo nunca da menos estrellas que el espejo (salvo el azar de las tiradas)
+        assert p["stars"] >= p["mirror"]["stars"] - .5, (p["stars"], p["mirror"])
 
 
 def test_plan_finds_the_slide():
-    """El caso pedido: los de abajo no llegan a nada y los de arriba bajan para asegurar el pleno."""
+    """Los de abajo no llegan a nada arriba: los fuertes bajan a asegurar plenos y los débiles cubren las de arriba."""
     at = _lineup([14, 14, 14, 13, 13, 13, 12, 12, 8, 8], "A")
     ba = _lineup([15, 15, 14, 14, 13, 13, 12, 12, 11, 11], "B")
     p = plan.build(FakeProb(), at, ba, 10, seed=1)
-    assert {r["pos"] for r in p["reserves"]} >= {9, 10}, p["reserves"]    # los TH8 no atacan
-    assert p["assign"] and p["triples"] > p["mirror"]["triples"], (p["triples"], p["mirror"])
-    assert all(r["b_pos"] > r["a_pos"] for r in p["assign"]), p["assign"]
-    assert {u["pos"] for u in p["uncovered"]} >= {1, 2}
-    assert p["shape"] in ("bajada", "mixto")
+    assert p["stars"] > p["mirror"]["stars"], (p["stars"], p["mirror"])
+    assert all(r["p3"] >= plan.MIN_P3 or r["p2"] + r["p3"] >= plan.MIN_P2 for r in p["assign"]), p["assign"]
+    assert p["covered"] + len(p["uncovered"]) == 10
+    assert p["shape"] == "mixto"
 
 
 def test_plan_pure_mirror():
@@ -436,6 +438,46 @@ def test_plan_live_state():
     ba = [{**b, "best": x, "touched": x > 0} for b, x in zip(_lineup([12, 12, 12], "B"), (3, 2, 0))]
     p = plan.build(FakeProb(), at[1:], ba, 3, seed=3, stars_now=5)
     assert all(r["b_pos"] != 1 for r in p["assign"]) and p["done"] == 1      # la aldea con 3★ ya no se ataca
+    assert {r["b_pos"] for r in p["assign"]} == {2, 3}
+
+
+def _worth(p, ba, dist, goal="stars"):
+    return sum(plan.value(dist[i][j], ba[j].get("best", 0), goal) for i, j in p.items())
+
+
+def _brute(at, ba, dist, up=True, goal="stars"):
+    """El mejor reparto probando todos: un ataque por aldea, el que más vale en total."""
+    free = [j for j, b in enumerate(ba) if b.get("best", 0) < 3]
+    top = None
+    for combo in itertools.product([None] + free, repeat=len(at)):
+        p = {i: j for i, j in enumerate(combo) if j is not None}
+        if len(set(p.values())) < len(p) or any(ba[j]["tag"] in (at[i].get("hit") or ()) or (not up and plan._up(at[i], ba[j])) or not plan.worth(dist[i][j], ba[j].get("best", 0)) for i, j in p.items()):
+            continue
+        k = _worth(p, ba, dist, goal)
+        top = k if top is None or k > top else top
+    return top
+
+
+def test_plan_is_optimal():
+    """Los dos repartos son los mejores posibles: se comparan con todos los repartos en guerras pequeñas, con 1 y 2 ataques."""
+    rng = random.Random(7)
+    for _ in range(200):
+        n, per, up, goal = rng.randint(2, 4), rng.choice((1, 2)), rng.random() < .5, rng.choice(("stars", "triples"))
+        at = [{"tag": f"A{p}", "name": "a", "th": rng.randint(12, 14), "pos": p} for p in range(1, n + 1)] * per
+        if rng.random() < .3:
+            at[0] = {**at[0], "hit": ["B2"]}
+        ba = [{"tag": f"B{p}", "name": "b", "th": rng.randint(12, 15), "pos": p, "best": rng.choice((0, 0, 0, 1, 2, 3))} for p in range(1, n + 1)]
+        rows = []
+        for _a in range(n):
+            w = [[rng.random() ** 2 for _ in range(4)] for _b in ba]
+            rows.append([tuple(x / sum(v) for x in v) for v in w])
+        at = [{**a, "th": at[k % n]["th"]} for k, a in enumerate(at)]       # misma cuenta, mismo TH
+        dist = [rows[i % n] for i in range(len(at))]
+        got = plan.optimize(at, ba, dist, up=up, goal=goal)
+        assert len(set(got.values())) == len(got), "una aldea con dos ataques"
+        assert all(plan.worth(dist[i][j], ba[j].get("best", 0)) for i, j in got.items())
+        val = _brute(at, ba, dist, up, goal)
+        assert _worth(got, ba, dist, goal) >= val - 1e-9, (got, val)
 
 
 class MatrixProb:
@@ -463,58 +505,197 @@ def _atk(positions):
 CAPTURA = {1: {1: 94, 2: 94, 3: 95, 4: 99, 5: 99}, 2: {1: 66, 2: 57, 3: 62, 4: 97, 5: 96}, 3: {1: 46, 2: 36, 3: 41, 4: 94, 5: 91}, 5: {1: 9, 2: 9, 3: 11, 4: 67, 5: 58}}
 
 
-def test_alternative_helps_the_weakest():
-    p = plan.build(MatrixProb(CAPTURA), _atk([1, 2, 3, 5]), _bases([15, 14, 14, 12, 12]), 5, seed=1)
-    main = {a["a_pos"]: a["b_pos"] for a in p["assign"]}
-    assert all(b >= a for a, b in main.items()), main           # el plan principal nunca sube
-    alt = p["alt"]
-    assert alt, "tenía que proponer alternativa"
-    chosen = {a["a_pos"]: a["b_pos"] for a in alt["assign"]}
-    assert chosen[5] == 4 and chosen[3] == 5, chosen            # el 3 cede el 4 al 5: pierde 3, gana 9
-    assert chosen[2] == 1, chosen                               # el 2 sube al 1, donde tiene más que en su sitio
-    assert alt["ups"] == sum(1 for a, b in chosen.items() if b < a) >= 2
-    total = lambda m: sum(CAPTURA[a][b] for a, b in m.items())
-    assert total(chosen) > total(main), (chosen, main)
-    assert alt["gain_t"] > 0 and alt["verdict"] == "mejor", alt["verdict"]
-    assert round(sum(s["net"] for s in alt["swaps"]), 2) == round((total(chosen) - total(main)) / 100, 2), alt["swaps"]
-    for s in alt["swaps"]:
-        assert s["net"] > 0, s                                  # ningún grupo de cambios resta
+def test_win_plan_follows_the_score():
+    """Ganar la guerra: el 1 asegura 2★ en la 1 o va a por el pleno dudoso de la 2, y el 2 al revés. Si con estrellas
+    seguras basta, se asegura; si solo vale hacer dos plenos, se arriesga; sin saber del rival, más estrellas."""
+    m = {1: {1: 40, 2: 60}, 2: {1: 30, 2: 10}}
+    full = {(1, 1): (0, .05, .55, .40), (1, 2): (.3, .05, .05, .60), (2, 1): (.6, .05, .05, .30), (2, 2): (0, .05, .85, .10)}
+
+    class P(MatrixProb):
+        def dist(self, a, b, fresh=True, cwl=True, size=15, shift=0.0):
+            return full[(a["pos"], b["pos"])]
+    where = lambda p: {a["a_pos"]: a["b_pos"] for a in p["assign"]}
+    p = plan.build(P(m), _atk([1, 2]), _bases([14, 14]), 2, seed=1)
+    assert where(p) == {1: 1, 2: 2} and p["goal"] == "win" and p["win"] is None and p["style"] == "stars", p     # 4,3★ esperadas
+    p = plan.build(P(m), _atk([1, 2]), _bases([14, 14]), 2, seed=1, rival=[3] * 50)
+    assert where(p) == {1: 1, 2: 2} and p["win"] > .85, (where(p), p["win"])          # con 4★ se gana: se asegura
+    p = plan.build(P(m), _atk([1, 2]), _bases([14, 14]), 2, seed=1, rival=[6] * 50)
+    assert where(p) == {1: 2, 2: 1} and p["style"] != "stars", (where(p), p["style"])   # solo vale empatar a 6★: 18 % de hacerlas frente a 4 %
+    assert .05 < p["win"] < .14 and len(p["tried"]) >= 2, p["win"]
+    assert not any(k.startswith("_") for k in p) and not any(k.startswith("_") for k in (p["alt"] or {}))
 
 
-def test_alternative_needs_a_real_gain():
+def test_alternative_same_plan():
+    # los dos planes salen siempre, cada uno en su apartado, aunque aquí propongan lo mismo
+    m = {1: {1: 95, 2: 90}, 2: {1: 20, 2: 70}}
+    p = plan.build(MatrixProb(m), _atk([1, 2]), _bases([14, 14]), 2, seed=1)
+    assert p["same"] and p["alt"]["goal"] == "train" and [(a["a_pos"], a["b_pos"]) for a in p["alt"]["assign"]] == [(a["a_pos"], a["b_pos"]) for a in p["assign"]]
     # subir ganaría 1 punto, menos que el error del modelo: no se mueve a nadie
     m = {1: {1: 90, 2: 90}, 2: {1: 61, 2: 60}}
-    assert plan.build(MatrixProb(m), _atk([1, 2]), _bases([14, 14]), 2, seed=1)["alt"] is None
-    # sin ninguna subida que compense tampoco hay alternativa
-    m = {1: {1: 95, 2: 90}, 2: {1: 20, 2: 70}}
-    assert plan.build(MatrixProb(m), _atk([1, 2]), _bases([14, 14]), 2, seed=1)["alt"] is None
+    p = plan.build(MatrixProb(m), _atk([1, 2]), _bases([14, 14]), 2, seed=1)
+    assert not any(a["up"] for a in p["assign"])
 
 
-def test_alternative_never_repeats():
+def test_training_everyone_attacks():
+    """Entrenamiento para liga: el primer ataque de cada cuenta va como en liga (todos atacan, uno por aldea) y el
+    segundo se guarda para rematar."""
+    m = {1: {1: 90, 2: 90, 3: 90, 4: 99}, 2: {1: 30, 2: 60, 3: 60, 4: 95}, 3: {1: 5, 2: 20, 3: 70, 4: 90}, 4: {1: 1, 2: 5, 3: 10, 4: 50}}
+    p = plan.build(MatrixProb(m), _atk([1, 2, 3, 4]) * 2, _bases([14] * 4), 4, cwl=False, seed=1, rival=[9] * 40)
+    assert not any(a["a_pos"] == 4 for a in p["assign"])           # para ganar, el 4 no ataca
+    t = p["alt"]
+    assert t and t["goal"] == "train" and sorted(a["a_pos"] for a in t["assign"]) == [1, 2, 3, 4], t and t["assign"]
+    assert len({a["b_pos"] for a in t["assign"]}) == 4 and all(a["phase"] == 1 for a in t["assign"])
+    assert t["later"] == 4 and t["first"] == 4 and t["second"] == 0 and t["accounts"] == 4
+    assert t["final"]["stars"] >= t["stars"] and t["verdict"] in ("mejor", "igual", "peor") and t["gain_w"] is not None
+    rng = random.Random(8)
+    for _ in range(30):
+        n = rng.randint(3, 10)
+        m = {i: {j: rng.randint(1, 99) for j in range(1, n + 1)} for i in range(1, n + 1)}
+        p = plan.build(MatrixProb(m), _atk(range(1, n + 1)) * 2, _bases([14] * n), n, cwl=False, seed=rng.random())
+        t = p["alt"]
+        assert sorted(a["a_pos"] for a in t["assign"]) == list(range(1, n + 1)), "en el plan 2 atacan todos, una vez"
+        assert all(a["ok"] or a["lone"] for a in t["assign"]), "nadie va sin opciones a una aldea que no sea la suya"
+
+
+def test_training_never_sends_the_weak_up():
+    """Plan 2: cada uno contra su mejor rival. Quien no tiene opciones arriba no va arriba «a rascar»: si no le queda
+    aldea propia a su alcance, va a la que mejor se le da aunque la comparta."""
+    class P(MatrixProb):
+        def dist(self, a, b, fresh=True, cwl=True, size=15, shift=0.0):
+            p = self.m[a["pos"]][b["pos"]] / 100
+            return (.5 * (1 - p), .4 * (1 - p), .1 * (1 - p), p)     # sin pleno, casi nunca 2★
+    # el 3 (un TH bajo) no tiene nada que hacer en la aldea 1, y la 2 ya es del 2: comparte la 2, no sube a la 1
+    m = {1: {1: 60, 2: 95}, 2: {1: 3, 2: 90}, 3: {1: 1, 2: 60}}
+    p = plan.build(P(m), _atk([1, 2, 3]) * 2, _bases([18, 14]), 3, cwl=False, seed=1, rival=[4] * 30)
+    t = p["alt"]
+    got = {(a["a_pos"], a["b_pos"]): a for a in t["assign"]}
+    assert set(got) == {(1, 1), (2, 2), (3, 2)}, set(got)
+    assert got[(3, 2)]["lone"] and not got[(2, 2)]["lone"] and t["lone"] == 1 and all(a["phase"] == 1 for a in t["assign"])
+    assert not any(a["b_pos"] == 1 and a["a_pos"] != 1 for x in (p, t) for a in x["assign"]), "solo el 1 tiene opciones en la aldea 1"
+    # ni siquiera el más flojo, sin opciones en ninguna, se manda arriba: va a la más asequible
+    m = {1: {1: 60, 2: 95}, 2: {1: 1, 2: 4}}
+    t = plan.build(P(m), _atk([1, 2]) * 2, _bases([18, 14]), 2, cwl=False, seed=1)["alt"]
+    assert {(a["a_pos"], a["b_pos"]) for a in t["assign"]} == {(1, 1), (2, 2)} or {(a["a_pos"], a["b_pos"]) for a in t["assign"]} == {(1, 2), (2, 2)}, t["assign"]
+    # sobre una aldea ya atacada solo va quien, él solo, puede mejorarla
+    assert plan.worth((.1, .2, .6, .1), 0) and plan.worth((.1, .2, .6, .1), 1) and not plan.worth((.1, .2, .6, .1), 2)
+    assert not plan.worth((.6, .3, .08, .02), 0) and not plan.worth((.6, .3, .08, .02), 1)
+
+
+def test_training_second_attack_cleans_up():
+    """Con la guerra empezada: quien ya atacó remata lo que no salió pleno y quien no, hace su primer ataque."""
+    m = {1: {1: 90, 2: 80, 3: 90}, 2: {1: 50, 2: 50, 3: 50}, 3: {1: 50, 2: 10, 3: 80}}
+    atk = [{**a, "hit": ["#B1"]} for a in _atk([1])] + [{**a, "hit": ["#B2"]} for a in _atk([2])] + _atk([3]) * 2
+    ba = _bases([14, 14, 14])
+    ba[0] = {**ba[0], "best": 3, "touched": True}       # el 1 hizo pleno en la 1
+    ba[1] = {**ba[1], "best": 1, "touched": True}       # el 2 sacó 1★ en la 2
+    p = plan.build(MatrixProb(m), atk, ba, 3, cwl=False, seed=1)
+    t = p["alt"]
+    assert {(a["a_pos"], a["b_pos"]) for a in t["assign"]} == {(3, 3), (1, 2)}, t["assign"]
+    at = sorted(atk, key=lambda a: a["pos"])
+    got, phase, later, lone = plan.train(at, ba, plan.grid(MatrixProb(m), at, ba, 3, cwl=False))
+    assert got == {2: 2, 0: 1} and phase == {2: 1, 0: 2} and later == [1, 3] and not lone, (got, phase, later)     # el 3 hace el suyo; el 1 remata la 2; el 2 no puede repetirla
+
+
+def test_play_counts_cleanups():
+    """Los ataques que sobran rematan: el final nunca baja, y contra un rival a cero se gana siempre."""
+    m = {1: {1: 50, 2: 50}, 2: {1: 50, 2: 50}}
+    at, ba = _atk([1, 2]) * 2, _bases([14, 14])
+    at = sorted(at, key=lambda a: a["pos"])
+    dist = plan.grid(MatrixProb(m), at, ba, 2)
+    one = plan.play(at, ba, dist, {0: 0, 2: 1}, later=[], n=400, seed=3, rival=[0] * 10)
+    two = plan.play(at, ba, dist, {0: 0, 2: 1}, later=[1, 3], used=dist, n=400, seed=3, rival=[0] * 10)
+    assert one["stars"] == two["stars"] == one["final"]["stars"] < two["final"]["stars"], (one["final"], two["final"])
+    assert two["win"] > .99 and all(x >= y for x, y in zip(two["_f"], one["_f"]))
+    assert plan.play(at, ba, dist, {0: 0, 2: 1}, n=50, seed=3, rival=[6] * 10)["win"] < .2
+
+
+def test_plan_never_repeats():
     rng = random.Random(4)
     for _ in range(40):
-        n = rng.randint(3, 12)
+        n, per = rng.randint(3, 12), rng.choice((1, 2))
         m = {i: {j: rng.randint(5, 99) for j in range(1, n + 1)} for i in range(1, n + 1)}
-        p = plan.build(MatrixProb(m), _atk(range(1, n + 1)), _bases([14] * n), n, seed=rng.random())
+        p = plan.build(MatrixProb(m), _atk(range(1, n + 1)) * per, _bases([14] * n), n, cwl=per == 1, seed=rng.random())
         for x in (p, p["alt"]) if p["alt"] else (p,):
-            assert len({a["b_pos"] for a in x["assign"]}) == len(x["assign"])
-            assert len({a["a_pos"] for a in x["assign"]}) == len(x["assign"])
-            assert len(x["assign"]) + sum(r["n"] for r in x["reserves"]) == n
-        if p["alt"]:
-            assert p["alt"]["ups"] >= 1 and p["alt"]["base"]["triples"] >= 0
+            assert len({a["b_pos"] for a in x["assign"]}) == len(x["assign"]) == n, "cada aldea, un ataque y solo uno"
+            assert len(x["assign"]) + sum(r["n"] for r in x["reserves"]) == n * per
+            for a in {a["a_pos"] for a in x["assign"]}:
+                assert sum(1 for r in x["assign"] if r["a_pos"] == a) <= per
 
 
 def test_two_attacks_per_war():
-    """Guerra normal: cada cuenta aparece una vez por ataque libre y nunca repite una aldea que ya atacó."""
+    """Guerra normal: un ataque por aldea; con dos ataques por cuenta sobran ataques y no se usan los que menos aportan."""
     m = {1: {1: 90, 2: 95, 3: 99}, 2: {1: 50, 2: 80, 3: 90}, 3: {1: 20, 2: 40, 3: 85}}
     atk = _atk([1, 2, 3]) + _atk([1, 2, 3])
     atk[0] = {**atk[0], "hit": ["#B1"]}          # el 1 ya atacó la aldea 1 con su primer ataque
     atk[3] = {**atk[3], "hit": ["#B1"]}
+    atk = atk[1:]                                # y ese ataque ya está gastado
     p = plan.build(MatrixProb(m), atk, _bases([14, 14, 14]), 3, cwl=False, seed=1)
-    assert not any(a["a_pos"] == 1 and a["b_pos"] == 1 for a in p["assign"]), p["assign"]
-    assert len({a["b_pos"] for a in p["assign"]}) == len(p["assign"])
+    got = {(a["a_pos"], a["b_pos"]) for a in p["assign"]}
+    assert (1, 1) not in got and len({b for _, b in got}) == 3 == len(got), got
+    assert got == {(1, 2), (2, 1), (2, 3)}, got       # al 1 le queda un ataque: a la 2 (95); el 2 usa los dos (50 + 90)
     assert len(p["matrix"]["a"]) == 3                 # la matriz enseña cada cuenta una vez
-    assert sum(r["n"] for r in p["reserves"]) + len(p["assign"]) == 6
+    assert sum(r["n"] for r in p["reserves"]) + len(p["assign"]) == 5
+
+
+def test_no_hopeless_attacks():
+    """Un ataque sin opciones (poco pleno y poco 2★) no se planea, aunque la aldea se quede sin rival."""
+    m = {1: {1: 40, 2: 95}, 2: {1: 2, 2: 90}}
+
+    class P(MatrixProb):
+        def dist(self, a, b, fresh=True, cwl=True, size=15, shift=0.0):
+            p = self.m[a["pos"]][b["pos"]] / 100
+            return (.5 * (1 - p), .4 * (1 - p), .1 * (1 - p), p)     # sin pleno, casi nunca 2★
+    p = plan.build(P(m), _atk([1, 2]) * 2, _bases([18, 18]), 2, cwl=False, seed=1)
+    got = {(a["a_pos"], a["b_pos"]) for a in p["assign"]}
+    assert (2, 1) not in got and (1, 1) in got, got                    # al 1 solo va el 1
+    p = plan.build(P(m), _atk([2]) * 2, _bases([18, 18]), 2, cwl=False, seed=1)
+    assert [u["pos"] for u in p["uncovered"]] == [1] and [a["b_pos"] for a in p["assign"]] == [2], p
+
+
+def test_history_evidence():
+    """Lo que dice el historial de esa aldea y de esa cuenta, comparando TH: no el TH a secas."""
+    rushed = [(12, 3), (13, 3), (18, 2)]               # TH18 rusheado: un TH12 y un TH13 le hicieron pleno
+    strong = [(18, 2), (18, 1), (17, 1)]               # TH18 de verdad: un TH18 fuerte solo le hizo 2★
+    e = modelo.evidence(12, 18, [], rushed)
+    assert e["d_s"] == 1 and e["d_best"] == 12 and e["d_f"] == 1, e     # el pleno del TH12 cuenta; el del TH13 no (más fuerte)
+    e = modelo.evidence(11, 18, [], strong)
+    assert e["d_s"] == 0 and e["d_f"] == 3 and e["d_fail"] == 18, e     # tres más fuertes no pudieron
+    e = modelo.evidence(14, 14, [(15, 3), (14, 3), (13, 2)], [])
+    assert e["a_s"] == 2 and e["a_f"] == 1, e                            # plenos a TH ≥ 14 y fallo contra un TH13
+    th = modelo.PRIOR["th"]
+    p3 = lambda e_: 1 / (1 + math.exp(-(e_ + th[2])))
+    e0 = -2.0
+    up = e0 + modelo.ev_shift(e0, th, modelo.evidence(12, 18, [], rushed))
+    down = e0 + modelo.ev_shift(e0, th, modelo.evidence(11, 18, [], strong))
+    assert p3(up) > p3(e0) > p3(down), (p3(up), p3(e0), p3(down))
+    assert modelo.ev_shift(e0, th, modelo.evidence(11, 18, [], [])) == 0.0     # sin historial, el modelo tal cual
+    prob = modelo.Prob(modelo.PRIOR["beta"], th, {}, {}, {}, {}, {}, {0: 30, 1: 60, 2: 80, 3: 100}, hist_d={"#R": rushed})
+    a, b = {"tag": "#A", "th": 12}, {"tag": "#R", "th": 18}
+    assert prob.dist(a, b)[3] > modelo.Prob(modelo.PRIOR["beta"], th, {}, {}, {}, {}, {}, {0: 30, 1: 60, 2: 80, 3: 100}).dist(a, b)[3]
+
+
+def test_no_cover_at_any_price():
+    """El caso de la captura: cubrir el TH18 con el 39 % del 1 obliga a dar la 3 a un 20 %; en plenos sale más dejar el TH18."""
+    m = {1: {1: 39, 2: 98, 3: 98}, 2: {1: 3, 2: 60, 3: 20}}
+
+    class P(MatrixProb):
+        def dist(self, a, b, fresh=True, cwl=True, size=15, shift=0.0):
+            p = self.m[a["pos"]][b["pos"]] / 100
+            return (.05 * (1 - p), .15 * (1 - p), .8 * (1 - p), p)
+    p = plan.build(P(m), _atk([1, 2]) * 2, _bases([18, 14, 14]), 3, cwl=False, seed=1)
+    tri = {(a["a_pos"], a["b_pos"]) for a in p["assign"]}
+    assert tri == {(1, 2), (1, 3)} or tri == {(1, 2), (1, 3), (2, 1)}, tri     # el 1 hace sus dos plenos casi seguros
+    drill = {(a["a_pos"], a["b_pos"]) for a in p["alt"]["assign"]}
+    assert drill == {(1, 3), (2, 2)} and p["alt"]["later"] == 2, drill         # entrenando atacan los dos, y el TH18 se deja para los remates
+
+
+def test_mid_beats_upper():
+    """Una cuenta de la parte media-baja ataca si a esa aldea le saca más que una de la parte media."""
+    m = {1: {1: 90, 2: 90, 3: 90, 4: 99}, 2: {1: 30, 2: 60, 3: 60, 4: 95}, 3: {1: 5, 2: 20, 3: 70, 4: 90}, 4: {1: 1, 2: 5, 3: 10, 4: 50}}
+    p = plan.build(MatrixProb(m), _atk([1, 2, 3, 4]) * 2, _bases([14] * 4), 4, cwl=False, seed=1)
+    got = {(a["a_pos"], a["b_pos"]) for a in p["assign"]}
+    assert (3, 3) in got, got                          # el 3 a la 3 (70 %) en vez de gastar ahí el 2 (60 %)
+    assert not any(a == 4 for a, _ in got), got        # el 4 no ataca: no mejora a nadie
 
 
 # ---------------- guerras normales y previsto frente a real ----------------
@@ -641,6 +822,11 @@ def test_finished_war_is_compared():
     assert x["result"] == "win" and x["t"]["n"] == 2 and x["t"]["triples"] == 2 and x["before"]["us"] >= 0
     s = prediccion.summary([{**x, "end_ts": 1}])
     assert s["wars"] == 1 and s["n"] == 2 and s["players"][0]["n"] == 1
+    # el mapa previsto es el plan de antes del primer ataque, y el final enseña lo que pasó en cada aldea
+    mp, me = x["map_plan"], x["map_end"]
+    assert mp and len(mp["us"]) == len(war["a"]["members"]) and all(not r.get("atk") for r in mp["us"])
+    assert sum(len(r["plan"]) for r in mp["us"]) == sum(1 for r in mp["them"] if r.get("exp")) >= 1
+    assert [r["stars"] for r in me["us"]][:2] == [3, 3] and me["them"][0]["got"] == 3 and me["us"][0]["got"] == 1
 
 
 def test_many_clans_are_kept_apart():

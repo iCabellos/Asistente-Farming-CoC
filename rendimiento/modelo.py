@@ -7,6 +7,11 @@ con el pasado y midiendo con ataques posteriores:
 - Lo que más explica un pleno es la diferencia de ayuntamiento y, después, quién ataca y a qué aldea.
 - Pesan más los ataques recientes, y cuentan la forma de los últimos ataques, la liga y si la aldea ya estaba tocada.
 - Una vez conocido el historial, héroes, mascotas, hechizos, experiencia y estrellas de guerra no mejoran la predicción.
+- Encima va la evidencia directa de cada pareja (ver `evidence`): en las últimas EV_N defensas de la aldea, ¿le hizo pleno
+  alguien de TH igual o menor que el atacante? ¿falló alguien de TH igual o mayor? Y en los últimos EV_N ataques de la
+  cuenta, ¿hizo pleno a aldeas de TH igual o mayor? ¿falló contra aldeas de TH igual o menor? Un TH18 rusheado al que le
+  hizo pleno un TH12 sube para un TH12; un TH18 al que un TH18 fuerte solo le hizo 2★ baja para un TH11. Medido con
+  1.580 ataques futuros: el error de pleno baja de 0,3701 a 0,3624 y el de estrellas de 0,402 a 0,390 (EV_K = 12).
   Sólo aporta algo el equipo de héroes y la posición entre aldeas del mismo ayuntamiento, y únicamente en ataques
   recientes: la foto de una aldea no dice nada de cómo era hace años.
 
@@ -24,6 +29,8 @@ D_LIMIT = 5
 FORM_N = 8                # ataques que forman la «forma» reciente
 RECENT_N = 20             # ataques que se enseñan como historial reciente
 RECENT_DAYS = 200         # la foto de la aldea sólo vale para ataques cercanos
+EV_N = 10                 # ataques y defensas que se miran como evidencia directa de cada pareja
+EV_K = 12                 # cuánto pesa el modelo frente a esa evidencia (ataques «equivalentes»); medido, ver arriba
 HOLDOUT_DAYS = 45
 MIN_ROWS_TUNE = 1500
 MIN_HOLDOUT = 120
@@ -153,11 +160,16 @@ def _features(d, dth, cwl, fresh, form_a, form_d, pos_same, eq_gap):
 class Prob:
     """Modelo ya entrenado. No necesita numpy: sólo sumas y logísticas, para que la simulación vaya rápida."""
 
-    def __init__(self, beta, th, ua, ud, form_a, form_d, eq, pct, info=None, recent_a=None, recent_d=None):
+    def __init__(self, beta, th, ua, ud, form_a, form_d, eq, pct, info=None, recent_a=None, recent_d=None, hist_a=None, hist_d=None, ev_k=EV_K):
         self.beta, self.th, self.ua, self.ud, self.form_a, self.form_d, self.eq, self.pct = beta, th, ua, ud, form_a, form_d, eq, pct
         self.info = info or {}
         self.recent_a, self.recent_d = recent_a or {}, recent_d or {}     # plenos en sus últimos ataques y defensas
+        self.hist_a, self.hist_d, self.ev_k = hist_a or {}, hist_d or {}, ev_k   # últimos EV_N: [(TH del otro, estrellas)]
         self._c = {}
+        self._ev = {}
+
+    def evidence(self, a, b):
+        return evidence(a["th"], b["th"], self.hist_a.get(a["tag"], ()), self.hist_d.get(b["tag"], ()))
 
     def _eq_gap(self, a, b):
         x, y = self.eq.get(a["tag"]), self.eq.get(b["tag"])
@@ -167,7 +179,14 @@ class Prob:
         d = a["th"] - b["th"]
         pos = max(-1.0, min(1.0, ((b.get("pos") or 0) - (a.get("pos") or 0)) / max(size, 1))) if d == 0 and a.get("pos") and b.get("pos") else 0.0
         x = _features(d, b["th"], float(cwl), 1.0 if fresh else -1.0, self.form_a.get(a["tag"], 0.0), self.form_d.get(b["tag"], 0.0), pos, self._eq_gap(a, b))
-        return sum(i * j for i, j in zip(self.beta, x)) + self.ua.get(a["tag"], 0.0) + self.ud.get(b["tag"], 0.0)
+        e = sum(i * j for i, j in zip(self.beta, x)) + self.ua.get(a["tag"], 0.0) + self.ud.get(b["tag"], 0.0)
+        # la evidencia se mide siempre sobre la aldea sin tocar, y se guarda: la simulación pregunta lo mismo cientos de veces
+        k = (a["tag"], b["tag"], a["th"], b["th"], cwl, size, a.get("pos"), b.get("pos"))
+        d = self._ev.get(k)
+        if d is None:
+            base = e if fresh else e + 2 * self.beta[NAMES.index("fresh")]
+            d = self._ev[k] = ev_shift(base, self.th, self.evidence(a, b), self.ev_k)
+        return e + d
 
     def dist(self, a, b, fresh=True, cwl=True, size=15, shift=0.0):
         """Probabilidad de 0, 1, 2 y 3 estrellas. `shift` mueve la guerra entera: un mal o buen día de todo el clan."""
@@ -179,6 +198,47 @@ class Prob:
             v = (1 - p[0], p[0] - p[1], p[1] - p[2], p[2])
             self._c[k] = v
         return v
+
+
+def histories(rows, n=EV_N):
+    """Los últimos `n` ataques de cada cuenta y las últimas `n` defensas de cada aldea: [(TH del otro, estrellas)]."""
+    A, D = defaultdict(list), defaultdict(list)
+    for r in sorted(rows, key=lambda r: (r["end"], r["ord"])):
+        A[r["a"]].append((r["d_th"], r["stars"]))
+        D[r["d"]].append((r["a_th"], r["stars"]))
+    return {k: v[-n:] for k, v in A.items()}, {k: v[-n:] for k, v in D.items()}
+
+
+def evidence(a_th, b_th, atk, dfn):
+    """Evidencia directa de pleno para un atacante de TH `a_th` contra una aldea de TH `b_th`.
+    A favor: a esa aldea le hizo pleno alguien de TH igual o menor; o esa cuenta hizo pleno a una aldea de TH igual o mayor.
+    En contra: a esa aldea no le hizo pleno alguien de TH igual o mayor; o esa cuenta falló contra una aldea de TH igual
+    o menor. Lo demás (que falle uno más débil o acierte uno más fuerte) no dice nada de esta pareja."""
+    out = {"d_s": 0, "d_f": 0, "a_s": 0, "a_f": 0, "d_best": None, "d_fail": None}
+    for th, st in dfn:
+        if st == 3 and th <= a_th:
+            out["d_s"] += 1
+            out["d_best"] = th if out["d_best"] is None else min(out["d_best"], th)     # el TH más bajo que le hizo pleno
+        elif st < 3 and th >= a_th:
+            out["d_f"] += 1
+            out["d_fail"] = th if out["d_fail"] is None else max(out["d_fail"], th)     # el TH más alto que no pudo
+    for th, st in atk:
+        if st == 3 and th >= b_th:
+            out["a_s"] += 1
+        elif st < 3 and th <= b_th:
+            out["a_f"] += 1
+    return out
+
+
+def ev_shift(e, th, ev, k=EV_K):
+    """Desplazamiento del modelo para que su % de pleno pase a la media entre lo que dice y la evidencia (k frente a n)."""
+    s, f = ev["d_s"] + ev["a_s"], ev["d_f"] + ev["a_f"]
+    if not k or not (s or f):
+        return 0.0
+    cl = lambda p: min(max(p, 1e-4), 1 - 1e-4)
+    p3 = cl(1 / (1 + math.exp(-max(min(e + th[2], 40), -40))))
+    post = cl((k * p3 + s) / (k + s + f))
+    return math.log(post / (1 - post)) - math.log(p3 / (1 - p3))
 
 
 def _prepare(rows, villages, np):
@@ -320,8 +380,9 @@ def train(rows, villages=None, hp=None, tune=True, report=True, steps=STEPS, on=
         on(.9, f"{len(rows):,} ataques".replace(",", "."))
     fit = _fit(D, np.ones(len(rows), dtype=bool), hp, np, steps=steps)
     b, ua, ud, th = fit
+    ha, hd = histories(rows)
     return Prob([float(x) for x in b], [float(x) for x in th], {k: float(ua[i]) for i, k in enumerate(D["keys_a"])}, {k: float(ud[i]) for i, k in enumerate(D["keys_d"])},
-                D["form_a"], D["form_d"], D["eq"], pct, info, _recent(rows, "a"), _recent(rows, "d"))
+                D["form_a"], D["form_d"], D["eq"], pct, info, _recent(rows, "a"), _recent(rows, "d"), ha, hd)
 
 
 def _pct_table(rows):

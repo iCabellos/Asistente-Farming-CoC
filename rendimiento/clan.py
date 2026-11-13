@@ -897,7 +897,8 @@ def refresh_forecasts(c, tag, on):
     """Predice las guerras que aún no lo están, de la más reciente a la más antigua, y cierra las que han terminado."""
     rows = c.execute("SELECT end_ts, kind, state, data, forecast, review FROM battles ORDER BY (state='warEnded'), end_ts DESC").fetchall()
     todo = [r for r in rows if not r["review"]]
-    if not todo:
+    old = [r for r in rows if r["review"] and r["state"] == "warEnded" and "map_plan" not in json.loads(r["review"])]
+    if not todo and not old:
         return
     data, L = forecast_rows(c, tag)
     cfg = liga_cfg(tag)
@@ -919,6 +920,24 @@ def refresh_forecasts(c, tag, on):
                 c.execute("UPDATE battles SET forecast=?, review=? WHERE end_ts=?", (json.dumps({"before": snap["before"]}), json.dumps(prediccion.finished(war, snap), ensure_ascii=False), r["end_ts"]))
             else:
                 c.execute("UPDATE battles SET forecast=? WHERE end_ts=?", (json.dumps(snap), r["end_ts"]))
+    # las cerradas antes de guardar el mapa previsto: se rehace la previsión con lo terminado antes de empezar (lo mismo
+    # que se hizo entonces) y de ahí el plan de antes del primer ataque. Poco a poco, dentro del tiempo de cada recogida
+    for i, r in enumerate(old):
+        if time.time() > stop:
+            break
+        on("batallas", .9 + .1 * i / len(old), f"mapa previsto {i + 1} de {len(old)}")
+        try:
+            war = prediccion.standard(json.loads(r["data"]), tag, r["kind"])
+            snap = prediccion.forecast(war, tag, data, seed=f"{tag}|{r['end_ts']}")
+            mp = prediccion.plan_before(war, snap)
+        except Exception:      # noqa: BLE001 — se marca como hecha para no repetirla en cada recogida
+            mp, war = None, None
+        x = json.loads(r["review"])
+        x["map_plan"] = mp
+        if war and "map_end" not in x:
+            x["map_end"] = prediccion.war_map(war)
+        with c:
+            c.execute("UPDATE battles SET review=? WHERE end_ts=?", (json.dumps(x, ensure_ascii=False), r["end_ts"]))
 
 
 def active_battle(c):
@@ -934,7 +953,17 @@ def battle_now(c, tag, r, raw=None):
 
 
 def past_reviews(c):
-    return [{**json.loads(r["review"]), "end_ts": r["end_ts"]} for r in c.execute("SELECT end_ts, review FROM battles WHERE review IS NOT NULL ORDER BY end_ts DESC")]
+    out = []
+    for r in c.execute("SELECT end_ts, kind, data, review FROM battles WHERE review IS NOT NULL ORDER BY end_ts DESC"):
+        x = {**json.loads(r["review"]), "end_ts": r["end_ts"]}
+        if "map_end" not in x and r["data"]:      # las cerradas antes de guardar mapas: el final sale de la guerra guardada
+            try:
+                t = json.loads(r["data"])
+                x["map_end"] = prediccion.war_map(prediccion.standard(t, x["us"]["tag"], r["kind"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+        out.append(x)
+    return out
 
 
 def refresh_battles(c, tag, progress=None):

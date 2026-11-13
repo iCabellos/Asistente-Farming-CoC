@@ -84,7 +84,7 @@ function esHero(v) {
     <div class="subheader">${esc(v.league || 'Liga')} · ${v.state === 'ended' ? 'Terminada' : `Ronda ${Math.min(v.rounds_done + 1, v.rounds_total)} de ${v.rounds_total}`}</div>
     <div class="hero-line mt-1">${phase}</div>
     <div class="es-chips">${chip('Ascender', up)}${chip('Evitar el descenso', safe)}${v.state !== 'ended' ? `<div class="es-chip"><small>Puesto final posible</small><b>${rng}</b></div>` : ''}</div>
-    ${v.state !== 'ended' && up && up.status === 'posible' ? `<div class="small text-secondary mt-2">Si atacan todos los que pueden, ascender sube al ${esPct(v.ranks_all.slice(0, v.zones.promote).reduce((a, b) => a + b, 0))}; si además siguen el plan de ataque, al ${esPct(v.ranks_plan.slice(0, v.zones.promote).reduce((a, b) => a + b, 0))}${v.ranks_alt ? `; y con la alternativa donde sale más rentable, al ${esPct(v.ranks_alt.slice(0, v.zones.promote).reduce((a, b) => a + b, 0))}` : ''}.</div>` : ''}
+    ${v.state !== 'ended' && up && up.status === 'posible' ? `<div class="small text-secondary mt-2">Si atacan todos los que pueden, ascender sube al ${esPct(v.ranks_all.slice(0, v.zones.promote).reduce((a, b) => a + b, 0))}; si además siguen el plan de ataque, al ${esPct(v.ranks_plan.slice(0, v.zones.promote).reduce((a, b) => a + b, 0))}.</div>` : ''}
     ${v.inactive.length ? `<div class="small text-secondary mt-2"><i class="ti ti-user-off me-1"></i>Se cuenta que no atacan: ${v.inactive.map(esc).join(', ')}. Se cambia en Admin.</div>` : ''}
     <div class="small text-secondary mt-1"><i class="ti ti-clock me-1"></i>Datos de la recogida del ${esWhen(v.ts)}.</div></div></div>`;
 }
@@ -106,62 +106,96 @@ function esGames(v) {
 }
 // ---------- plan de ataque
 const ES_TIER = {seguro: 'Casi seguro', razonable: 'Razonable', dudoso: 'Dudoso'};
+const ES_GOAL = {3: 'a por el pleno', 2: 'a por 2★', 1: 'a sumar lo que pueda'};
+const ES_STYLE = {
+  stars: 'El reparto que más estrellas suma es también el que más veces gana la guerra.',
+  bold: 'Para ganar hay que arriesgar: este reparto busca más plenos que el de más estrellas, y gana la guerra más veces.',
+  triples: 'Para ganar solo valen los plenos: cada ataque va donde más opciones tiene de hacer 3★.',
+  safe: 'Asegurando 2★ en cada aldea se gana la guerra más veces que arriesgando.',
+  train: 'Lo que más veces gana la guerra es que ataquen todos primero y guardar los segundos ataques para rematar.',
+};
 function esShape(p) {
-  const n = p.assign.length, bottom = p.reserves.filter(r => !p.assign.some(a => a.a_pos > r.pos)).length;
-  if (!n) return 'No queda nadie con un pleno razonable.';
-  const low = p.assign.reduce((a, b) => (b.a_pos > a.a_pos ? b : a)), head = {espejo: 'Lo mejor es puro espejo.', bajada: 'Lo mejor es que todos bajen los mismos puestos.', mixto: 'Reparto a medida: cada cuenta a la aldea donde más plenos suma.'}[p.shape];
-  return `${head} ${bottom ? `Empezando por abajo, el primero con pleno razonable es el nº ${low.a_pos}: por debajo de él ${plural(bottom, 'cuenta queda', 'cuentas quedan')} de reserva.` : ''}`;
+  if (!p.assign.length) return 'No quedan ataques que repartir.';
+  const idle = p.reserves.reduce((n, r) => n + r.n, 0);
+  if (p.goal === 'train') {
+    const one = p.assign.filter(a => a.phase !== 2).length, two = p.assign.length - one, lone = p.assign.filter(a => a.lone).length;
+    return `${one ? `${plural(one, 'cuenta hace', 'cuentas hacen')} su primer ataque contra su mejor rival: una aldea para cada una y solo donde tiene opciones reales.` : 'Los primeros ataques ya están hechos.'}${lone ? ` ${plural(lone, 'cuenta no tiene', 'cuentas no tienen')} ninguna aldea propia a su alcance: ${lone === 1 ? 'va' : 'van'} a la que mejor se le da, aunque la comparta. A nadie se le manda a una aldea de arriba para cubrirla.` : ''}${two ? ` ${plural(two, 'segundo ataque ya se puede usar y va', 'segundos ataques ya se pueden usar y van')} donde más ayuda a ganar la guerra.` : ''}${idle ? ` ${plural(idle, 'ataque queda', 'ataques quedan')} por repartir: se deciden cuando sus cuentas hayan hecho el primero, con el mismo criterio que el plan 1.` : ''}`;
+  }
+  const head = p.win == null ? 'Reparto de más estrellas esperadas: aún no se puede medir el % de ganar.' : ES_STYLE[p.style] || ES_STYLE.stars;
+  const cover = p.uncovered.length ? `${plural(p.uncovered.length, 'aldea se queda', 'aldeas se quedan')} sin rival: o nadie tiene opciones con ella o el ataque que haría falta rinde más en otra.` : `Las ${num(p.open)} aldeas que quedan tienen rival.`;
+  return `${head} ${cover} Un solo ataque por aldea: repetir aldea gastaría un ataque que rinde más en otra.${idle ? ` ${plural(idle, 'ataque queda', 'ataques quedan')} en reserva: solo se usan si su cuenta, por sí sola, puede mejorar una aldea que no salga pleno.` : ''}`;
 }
-function esPlanRow(a) {
-  return `<div class="es-atk es-k-${a.tier}"><div class="es-atk-m"><span class="es-atk-t"><b>${a.a_pos}.</b> ${esB(a.a)}<small>TH${a.a_th}</small></span><i class="ti ti-arrow-right text-secondary"></i><span class="es-atk-t"><b>${a.b_pos}.</b> ${esB(a.b)}<small>TH${a.b_th}${a.best ? ` · ya ${a.best}★` : ''}</small></span><span class="es-atk-p"><b>${Math.round(a.p3 * 100)} %</b><small>${ES_TIER[a.tier]}</small></span></div>
-    <div class="es-atk-w">${a.why.a_n ? `Sus últimos ${a.why.a_n}: ${a.why.a_3} plenos` : 'Sin historial'} · ${a.why.d_n ? `a esta aldea, ${a.why.d_3} plenos en ${a.why.d_n}` : 'aldea sin historial'}</div></div>`;
+function esPlanHit(a) {
+  return `<div class="es-tgt"><div class="es-tgt-m"><i class="ti ti-arrow-right text-secondary"></i><span class="es-atk-t"><b>${a.b_pos}.</b> ${esB(a.b)}<small>TH${a.b_th}${a.best ? ` · ya ${a.best}★` : ''}${a.phase === 2 ? ' · segundo ataque' : ''}${a.lone ? (a.ok ? ' · comparte aldea' : ' · sin aldea a su alcance: va a la más asequible') : ''}${a.up ? ' · <i class="ti ti-arrow-up" title="Ataca por encima de su puesto"></i> sube' : ''}</small></span><span class="es-atk-p"><b>${Math.round(a.p3 * 100)} %</b><small>${dec(a.stars, 1)}★ · ${ES_TIER[a.tier]}</small></span></div>
+    <div class="es-atk-w">${ES_GOAL[a.goal] ?? ''} · ${esEvidence(a)}</div></div>`;
+}
+function esEvidence(a) {     // por qué ese %: lo que dicen las últimas 10 defensas de la aldea y los últimos 10 ataques de la cuenta
+  const e = a.why.ev || {}, out = [];
+  if (e.d_s) out.push(`le ${e.d_s === 1 ? 'hizo pleno 1' : `hicieron pleno ${e.d_s}`} de TH${a.a_th} o menos${e.d_best != null && e.d_best < a.a_th ? ` (hasta un TH${e.d_best})` : ''}`);
+  if (e.d_f) out.push(`${e.d_f === 1 ? 'no pudo 1' : `no pudieron ${e.d_f}`} de TH${a.a_th} o más${e.d_fail != null && e.d_fail > a.a_th ? ` (hasta un TH${e.d_fail})` : ''}`);
+  if (e.a_s) out.push(`${a.a} hizo ${e.a_s} ${e.a_s === 1 ? 'pleno' : 'plenos'} a TH${a.b_th} o más`);
+  if (e.a_f) out.push(`${a.a} falló ${e.a_f} contra TH${a.b_th} o menos`);
+  return out.length ? `historial: ${out.join(' · ')}` : (a.why.d_n ? `a esta aldea, ${a.why.d_3} plenos en ${a.why.d_n}` : 'sin historial que compare');
+}
+function esPlanCards(rows) {     // una tarjeta por cuenta, con su ataque o sus dos ataques dentro
+  const by = new Map();
+  for (const a of rows) {
+    if (!by.has(a.a_tag)) by.set(a.a_tag, []);
+    by.get(a.a_tag).push(a);
+  }
+  const color = {seguro: 'var(--tblr-green)', razonable: 'var(--tblr-yellow)', dudoso: 'var(--tblr-red)'};
+  return [...by.values()].map(hits => { const a = hits[0], k1 = color[a.tier], k2 = color[hits[hits.length - 1].tier];     // el borde, partido si hay dos ataques
+    return `<div class="es-atk es-acc" style="--k1:${k1};--k2:${k2}"><div class="es-acc-h"><span class="es-atk-t"><b>${a.a_pos}.</b> ${esB(a.a)}<small>TH${a.a_th}</small></span><small class="text-secondary">${a.why.a_n ? `sus últimos ${a.why.a_n}: ${a.why.a_3} plenos` : 'sin historial'}${hits.length > 1 ? ` · ${hits.length} ataques` : ''}</small></div>${hits.map(esPlanHit).join('')}</div>`; }).join('');
 }
 function esMatrix(p, alt) {
   const m = p.matrix, rows = alt ? p.alt.assign : p.assign, on = new Set(rows.map(a => `${a.a_pos}|${a.b_pos}`));
-  const cell = (x, a, b) => { const high = b.pos < a.pos, used = on.has(`${a.pos}|${b.pos}`), up = high && !(alt && used), c = `background:rgba(45,160,90,${(x / 100 * .75).toFixed(2)})`;
-    return `<td class="${used ? 'es-on' : ''} ${up ? 'es-up' : ''} ${b.best >= 3 ? 'es-done' : ''}" style="${up || b.best >= 3 ? '' : c}" title="${esc(a.name)} a ${esc(b.name)}: ${x} %">${b.best >= 3 ? '★' : x}</td>`; };
+  const cell = (x, e, a, b) => { const up = false, used = on.has(`${a.pos}|${b.pos}`), c = `background:rgba(45,160,90,${(x / 100 * .75).toFixed(2)})`;
+    return `<td class="${used ? 'es-on' : ''} ${up ? 'es-up' : ''} ${b.best >= 3 ? 'es-done' : ''}" style="${up || b.best >= 3 ? '' : c}" title="${esc(a.name)} a ${esc(b.name)}: ${x} % de pleno${e == null ? '' : `, ${dec(e, 1)}★ de media`}">${b.best >= 3 ? '★' : x}</td>`; };
   return `<div class="table-responsive es-mx-w"><table class="es-mx"><thead><tr><th>Ataca</th>${m.b.map(b => `<th title="${esc(b.name)}">${b.pos}<small>TH${b.th}</small></th>`).join('')}</tr></thead><tbody>
-    ${m.a.map((a, i) => `<tr><th title="${esc(a.name)}">${a.pos}. <bdi>${esc(a.name)}</bdi></th>${m.p3[i].map((x, j) => cell(x, a, m.b[j])).join('')}</tr>`).join('')}</tbody></table></div>
-    <div class="small text-secondary mt-1">% de pleno de cada cuenta contra cada aldea. Más verde, más probable. Recuadro: lo que propone ${alt ? 'la alternativa' : 'el plan'}. Gris: por encima de su puesto${alt ? ', salvo las subidas elegidas' : ''}.</div>`;
+    ${m.a.map((a, i) => `<tr><th title="${esc(a.name)}">${a.pos}. <bdi>${esc(a.name)}</bdi></th>${m.p3[i].map((x, j) => cell(x, m.e?.[i]?.[j], a, m.b[j])).join('')}</tr>`).join('')}</tbody></table></div>
+    <div class="small text-secondary mt-1">% de pleno de cada cuenta contra cada aldea (al pasar por encima, las estrellas de media). Más verde, más probable. Recuadro: lo que propone el plan ${alt ? '2' : '1'}.</div>`;
 }
-// ---------- alternativa: qué se gana dejando subir a quien lo necesita
+// ---------- segunda propuesta: entrenamiento para liga (atacan todos y el segundo ataque remata)
 const esPlanKey = p => String(p.round ?? p.rival);
-const esPick = p => !!(p.alt && S.planAlt?.[esPlanKey(p)]);
+const esAlt = p => p.alt?.goal === 'train' && p.alt.final ? p.alt : null;      // un plan guardado con el formato anterior no tiene esta propuesta
+const esPick = p => !!(esAlt(p) && S.chatAlt);       // el chat avisa del plan que se elija en su apartado
 const esSigned = (n, d = 1) => `${n > 0 ? '+' : n < 0 ? '−' : ''}${dec(Math.abs(n), d)}`;
 const ES_VERDICT = {
-  mejor: ['es-b-asegurado', 'ti-trending-up', 'Sale más rentable'],
-  mezcla: ['es-b-posible', 'ti-arrows-exchange', 'Depende de lo que busques'],
-  igual: ['', 'ti-equal', 'Sale prácticamente igual'],
+  mejor: ['es-b-asegurado', 'ti-trending-up', 'Frente al plan 1: aquí además gana más'],
+  peor: ['es-b-posible', 'ti-arrows-exchange', 'Frente al plan 1: lo que cuesta que ataquen todos'],
+  igual: ['', 'ti-equal', 'Frente al plan 1: sale prácticamente igual'],
 };
 function esAltText(a) {
-  const riskier = a.lo < a.base.lo ? ` A cambio, el peor día habitual baja de ${num(a.base.lo)} a ${num(a.lo)}★.` : '';
-  if (a.verdict === 'mejor') return `Se esperan ${dec(a.triples, 1)} plenos y ${dec(a.stars, 0)}★ frente a ${dec(a.base.triples, 1)} y ${dec(a.base.stars, 0)}★ del plan principal.${riskier}`;
-  if (a.verdict === 'mezcla') return `${a.gain_t > 0 ? 'Da más plenos pero menos estrellas' : 'Da más estrellas pero menos plenos'}: ${dec(a.triples, 1)} plenos y ${dec(a.stars, 0)}★ frente a ${dec(a.base.triples, 1)} y ${dec(a.base.stars, 0)}★. Si la guerra se decide por estrellas, mira esa cifra.${riskier}`;
-  return `La diferencia (${dec(a.triples, 1)} frente a ${dec(a.base.triples, 1)} plenos) no se distingue del azar: mejor el plan principal, sin subir a nadie.`;
+  const b = a.base, w = a.win != null && b.win != null;
+  const vs = `${w ? `Ganar la guerra: ${esPct(a.win)}, frente al ${esPct(b.win)} del plan 1. ` : ''}Acabaría en ${dec(a.final.stars, 0)}★ y ${dec(a.final.triples, 1)} plenos, frente a ${dec(b.final.stars, 0)}★ y ${dec(b.final.triples, 1)}.`;
+  return `${vs}${a.verdict === 'igual' ? ' La diferencia no se distingue del azar.' : ''}`;
 }
 function esAltBox(p) {
-  const a = p.alt, [cls, icon, title] = ES_VERDICT[a.verdict], key = esPlanKey(p), on = esPick(p);
-  const move = r => { const change = r.was == null ? `entra al ${r.now}` : r.now == null ? `deja el ${r.was} y queda de reserva` : `al ${r.now} en vez del ${r.was}`, d = (r.p_now ?? 0) - (r.p_was ?? 0);
-    return `<div class="es-sw-r"><span><b>${r.pos}.</b> ${esB(r.name)} ${change}${r.up ? ' <i class="ti ti-arrow-up text-secondary" title="Ataca por encima de su puesto"></i>' : ''}</span><small>${r.p_was == null ? '–' : Math.round(r.p_was * 100) + ' %'} → ${r.p_now == null ? '–' : Math.round(r.p_now * 100) + ' %'}</small><b class="${d >= 0 ? 'text-green' : 'text-red'}">${esSigned(Math.round(d * 100), 0)}</b></div>`; };
-  return `<div class="es-alt ${cls}"><div class="es-alt-h"><i class="ti ${icon}"></i><b>Alternativa: ${title}</b><small>${esSigned(a.gain_t, 1)} plenos · ${esSigned(a.gain_s, 1)}★ · ${plural(a.ups, 'subida', 'subidas')}</small></div>
+  const a = esAlt(p), [cls, icon, title] = ES_VERDICT[a.verdict] || ES_VERDICT.igual;
+  const move = r => { const change = r.was == null ? `entra al ${r.now}` : r.now == null ? `deja el ${r.was} y queda en reserva` : `al ${r.now} en vez del ${r.was}`, d = (r.p_now ?? 0) - (r.p_was ?? 0);
+    return `<div class="es-sw-r"><span><b>${r.pos}.</b> ${esB(r.name)} ${change}</span><small>${r.e_was == null ? '–' : dec(r.e_was, 1) + '★'} → ${r.e_now == null ? '–' : dec(r.e_now, 1) + '★'}</small><b class="${d >= 0 ? 'text-green' : 'text-red'}">${esSigned(Math.round(d * 100), 0)} % pleno</b></div>`; };
+  return `<div class="es-alt ${cls}"><div class="es-alt-h"><i class="ti ${icon}"></i><b>${title}</b><small>${a.gain_w != null ? `${esSigned(Math.round(a.gain_w * 100), 0)} % de ganar · ` : ''}${esSigned(a.gain_s, 1)}★</small></div>
     <div class="small">${esAltText(a)}</div>
-    <details class="mt-1"><summary class="es-more">Ver qué cambia</summary><div class="mt-1">${a.swaps.map(s => `<div class="es-sw">${s.rows.map(move).join('')}<div class="es-sw-t">Saldo: ${esSigned(Math.round(s.net * 100), 0)} puntos de pleno</div></div>`).join('')}
-      <div class="small text-secondary">Cada subida tiene que ganar más de ${dec(a.margin * 100, 1)} puntos: es el error medio del modelo, y por debajo la diferencia podría no existir.</div></div></details>
-    <div class="btn-group mt-2" role="group" aria-label="Plan elegido"><button type="button" class="btn btn-sm ${on ? 'btn-ghost-secondary' : 'btn-primary'}" data-plan-pick="${esc(key)}" data-alt="0">Plan principal</button><button type="button" class="btn btn-sm ${on ? 'btn-primary' : 'btn-ghost-secondary'}" data-plan-pick="${esc(key)}" data-alt="1">Alternativa</button></div></div>`;
+    ${a.swaps.length ? `<details class="mt-1"><summary class="es-more">Ver qué cambia respecto al plan 1</summary><div class="mt-1">${a.swaps.map(s => `<div class="es-sw">${s.rows.map(move).join('')}</div>`).join('')}</div></details>` : ''}</div>`;
 }
-function esPlans(v) {
+// Dos apartados: plan 1 (mejores ataques para ganar) y plan 2 (todos atacan; el segundo ataque se reparte para ganar)
+function esPlans(v, alt = false) {
   if (!v.plans?.length) return `<div class="card-body">${empty('No quedan guerras por jugar')}</div>`;
   const st = {inWar: ['bg-green-lt', 'En juego'], preparation: ['bg-blue-lt', 'En preparación'], pending: ['bg-secondary-lt', 'Aún no empieza']};
   const open = S.planOpen ?? esPlanKey(v.plans[0]);
-  return `<div class="card-body">${v.plans.map(p => { const alt = esPick(p), x = alt ? p.alt : p, more = +(x.triples - p.mirror.triples).toFixed(1), extra = +(x.stars_free - x.stars).toFixed(1);
-    return `<details class="es-plan" ${esPlanKey(p) === open ? 'open' : ''}><summary><span class="es-day-h"><b>${esTitle(p)} · ${esB(p.rival_name)}</b><small><span class="badge ${st[p.state][0]}">${st[p.state][1]}</span>${p.deduced ? ' · cruce deducido' : ''}${p.known ? '' : ' · con su última alineación'} · ${dec(x.triples, 1)} plenos previstos${alt ? ' · alternativa' : ''}</small></span><i class="ti ti-chevron-down es-chev"></i></summary>
+  return `<div class="card-body">${v.plans.map(p => { const x = alt ? esAlt(p) : p;
+    const top = `<summary><span class="es-day-h"><b>${esTitle(p)} · ${esB(p.rival_name)}</b><small><span class="badge ${st[p.state][0]}">${st[p.state][1]}</span>${p.deduced ? ' · cruce deducido' : ''}${p.known ? '' : ' · con su última alineación'}${x ? ` · ${dec(x.stars, 0)}★ y ${dec(x.triples, 1)} plenos previstos${x.win != null ? ` · ganar: ${esPct(x.win)}` : ''}` : ''}</small></span><i class="ti ti-chevron-down es-chev"></i></summary>`;
+    if (!x) return `<details class="es-plan" ${esPlanKey(p) === open ? 'open' : ''}>${top}<div class="es-body"><div class="es-note mt-0"><i class="ti ti-clock"></i>${p.assign.length ? 'Este plan se calculará con la próxima recogida.' : 'No quedan ataques que repartir.'}</div></div></details>`;
+    const more = +(x.stars - p.mirror.stars).toFixed(1), nb = p.open ?? p.matrix.b.length, one = x.assign.filter(a => a.phase !== 2), two = x.assign.filter(a => a.phase === 2);
+    const win = x.win != null && x.final ? `<div><small>Ganar la guerra</small><b>${esPct(x.win)}</b><small>acabaría en ${dec(x.final.stars, 0)}★ con todos los ataques</small></div>` : x.final && x.final.stars > x.stars ? `<div><small>Con todos los ataques</small><b>${dec(x.final.stars, 0)}★</b><small>entre ${num(x.final.lo)} y ${num(x.final.hi)}</small></div>` : '';
+    return `<details class="es-plan" ${esPlanKey(p) === open ? 'open' : ''}>${top}
     <div class="es-body"><div class="small mb-2">${esShape({...p, ...x})}</div>
-    ${p.alt ? esAltBox(p) : ''}
-    ${x.assign.length ? `<div class="es-tiles"><div><small>Plenos previstos</small><b>${dec(x.triples, 1)}</b><small>${p.done ? `contando ${p.done} ya hechos` : `de ${p.matrix.b.length} aldeas`}</small></div><div><small>Frente al espejo</small><b>${more > 0 ? '+' : ''}${dec(more, 1)}</b><small>el espejo da ${dec(p.mirror.triples, 1)}</small></div><div><small>Estrellas</small><b>${dec(x.stars, 0)}★</b><small>entre ${num(x.lo)} y ${num(x.hi)}</small></div><div><small>Nota de corte</small><b>${Math.round(p.tau * 100)} %</b><small>la elige el cálculo</small></div></div>
-    <div class="es-h">Ataques</div><div class="es-atks">${x.assign.map(esPlanRow).join('')}</div>` : ''}
-    ${x.reserves.length ? `<div class="es-h">Reservas: atacan después y rematan</div>${x.reserves.map(r => `<div class="es-res"><span><b>${r.pos}.</b> ${esB(r.name)} <small>TH${r.th}${r.n > 1 ? ` · ${r.n} ataques` : ''}</small></span><small>${r.covers.length ? r.covers.map(c => `aldea ${c.pos}: ${Math.round(c.p3 * 100)} %`).join(' · ') : 'sin aldea a su alcance para rematar'}</small></div>`).join('')}` : ''}
-    ${x.uncovered.length ? `<div class="small text-secondary mt-2"><b>Sin pleno razonable:</b> ${x.uncovered.map(u => `aldea ${u.pos} (TH${u.th}${u.best ? `, ya ${u.best}★` : ''})`).join(', ')}.</div>` : ''}
-    ${extra >= 1 ? `<div class="es-note"><i class="ti ti-star"></i>Las reservas no tienen nada que perder: si van a por estrellas a las aldeas libres, aunque sea sin pleno, se suman unas ${dec(extra, 0)}★ y se llega a ${dec(x.stars_free, 0)}★.</div>` : ''}
+    ${alt ? esAltBox(p) : ''}
+    ${x.assign.length ? `<div class="es-tiles">${win}<div><small>Estrellas</small><b>${dec(x.stars, 0)}★</b><small>entre ${num(x.lo)} y ${num(x.hi)}${p.stars_now ? `, con ${num(p.stars_now)} ya hechas` : ''}</small></div><div><small>Frente al espejo</small><b>${more > 0 ? '+' : ''}${dec(more, 1)}★</b><small>el espejo da ${dec(p.mirror.stars, 0)}★</small></div><div><small>Plenos previstos</small><b>${dec(x.triples, 1)}</b><small>${p.done ? `contando ${p.done} ya hechos` : `de ${p.matrix.b.length} aldeas`}</small></div><div><small>Aldeas con rival</small><b>${num(x.covered ?? nb)} de ${num(nb)}</b><small>${plural(p.attacks ?? x.assign.length, 'ataque', 'ataques')} por usar</small></div></div>
+    ${alt ? `${one.length ? `<div class="es-h">Primer ataque: cada uno contra su mejor rival</div><div class="es-atks">${esPlanCards(one)}</div>` : ''}${two.length ? `<div class="es-h">Segundo ataque: donde más ayuda a ganar</div><div class="es-atks">${esPlanCards(two)}</div>` : ''}`
+      : `<div class="es-h">Ataques: uno por aldea</div><div class="es-atks">${esPlanCards(x.assign)}</div>`}` : ''}
+    ${x.reserves.length ? `<div class="es-h">${alt ? 'Segundos ataques por repartir: se deciden cuando hayan hecho el primero' : 'Ataques en reserva: otra cuenta rinde más en cada aldea'}</div>${x.reserves.map(r => `<div class="es-res"><span><b>${r.pos}.</b> ${esB(r.name)} <small>TH${r.th}</small></span><small>${alt ? (r.uses ? (r.n > 1 ? `le quedan ${r.n} ataques por repartir` : 'su segundo ataque, por repartir') : 'ahora no tiene ninguna aldea que pueda mejorar') : r.uses ? `ataca ${r.uses} vez · le sobra ${r.n}` : r.n > 1 ? `en reserva (${r.n} ataques)` : 'en reserva'}</small></div>`).join('')}` : ''}
+    ${x.uncovered.length ? `<div class="small text-secondary mt-2"><b>${alt ? 'Sin primer ataque (nadie libre tiene opciones; quedan para los segundos ataques)' : 'Sin rival (no compensa)'}:</b> ${x.uncovered.map(u => `aldea ${u.pos} (TH${u.th}${u.best ? `, ya ${u.best}★` : ''})`).join(', ')}.</div>` : ''}
     <details class="mt-3"><summary class="es-more">Ver el % de todos contra todos</summary><div class="mt-2">${esMatrix(p, alt)}</div></details></div></details>`; }).join('')}</div>`;
 }
 function esPlanWire() {
@@ -170,11 +204,17 @@ function esPlanWire() {
 // ---------- mensajes para el chat del clan
 const ES_CHAT_SIZE = 5;
 function esChatBlocks(p) {
-  const rows = (esPick(p) ? p.alt : p).assign.slice().sort((a, b) => b.a_pos - a.a_pos), out = [];      // del jugador más bajo al más alto
+  const by = new Map();
+  for (const a of (esPick(p) ? p.alt : p).assign) {     // con dos ataques, una línea por cuenta
+    if (!by.has(a.a_tag)) by.set(a.a_tag, {a: a.a, a_pos: a.a_pos, hits: []});
+    by.get(a.a_tag).hits.push(a);
+  }
+  const rows = [...by.values()].sort((a, b) => b.a_pos - a.a_pos), out = [];      // del jugador más bajo al más alto
   for (let i = 0; i < rows.length; i += ES_CHAT_SIZE) out.push(rows.slice(i, i + ES_CHAT_SIZE));
   return out;
 }
-const esChatText = (rows, lines) => rows.map(a => `@${a.a} -> al ${a.b_pos}`).join(lines ? '\n' : ' | ');
+const esChatHit = a => a.phase === 2 ? `2.º ataque al ${a.b_pos}` : `al ${a.b_pos}`;
+const esChatText = (rows, lines) => rows.map(r => `@${r.a} -> ${r.hits.map(esChatHit).join(' y ')}`).join(lines ? '\n' : ' | ');
 function esChat(v) {
   const plans = (v.plans || []).filter(p => (esPick(p) ? p.alt : p).assign.length);
   if (!plans.length) return `<div class="card-body">${empty('No hay ataques que avisar')}</div>`;
@@ -185,8 +225,9 @@ function esChat(v) {
     return `<div class="es-copy ${done ? 'es-copied' : ''}"><div class="es-copy-h"><b>Bloque ${i + 1}</b><small>del ${rows[0].a_pos} al ${rows[rows.length - 1].a_pos} · ${num([...text].length)} caracteres</small>
       <button class="btn btn-sm ${done ? 'btn-ghost-success' : 'btn-primary'} ms-auto" type="button" data-chat="${esc(key)}"><i class="ti ${done ? 'ti-check' : 'ti-copy'} me-1"></i>${done ? 'Copiado' : 'Copiar'}</button></div><pre class="es-pre" dir="ltr">${esc(text)}</pre></div>`; };
   return `<div class="card-body">
+    <div class="btn-group mb-2" role="group" aria-label="Plan que se avisa"><button type="button" class="btn btn-sm ${S.chatAlt ? 'btn-ghost-secondary' : 'btn-primary'}" data-chat-plan="0"><i class="ti ti-trophy me-1"></i>Plan 1: ganar</button><button type="button" class="btn btn-sm ${S.chatAlt ? 'btn-primary' : 'btn-ghost-secondary'}" data-chat-plan="1"><i class="ti ti-users me-1"></i>Plan 2: todos atacan</button></div>
     <div class="d-flex flex-wrap align-items-center gap-2 mb-2"><span class="small text-secondary">${lines ? 'Una línea por jugador.' : 'Todo en una línea, separado por barras.'}</span><button class="btn btn-sm btn-ghost-secondary ms-auto" type="button" data-chat-mode>${lines ? 'Pasar a una sola línea' : 'Poner un jugador por línea'}</button></div>
-    ${plans.map((p, i) => `<details class="es-plan" ${i === 0 ? 'open' : ''}><summary><span class="es-day-h"><b>${esTitle(p)} · ${esB(p.rival_name)}</b><small>${plural((esPick(p) ? p.alt : p).assign.length, 'aviso', 'avisos')}${esPick(p) ? ' · alternativa' : ''}${p.known ? '' : ' · alineación estimada'}</small></span><i class="ti ti-chevron-down es-chev"></i></summary>
+    ${plans.map((p, i) => `<details class="es-plan" ${i === 0 ? 'open' : ''}><summary><span class="es-day-h"><b>${esTitle(p)} · ${esB(p.rival_name)}</b><small>${plural(new Set((esPick(p) ? p.alt : p).assign.map(a => a.a_tag)).size, 'aviso', 'avisos')}${esPick(p) ? ' · plan 2' : ' · plan 1'}${p.known ? '' : ' · alineación estimada'}</small></span><i class="ti ti-chevron-down es-chev"></i></summary>
       <div class="es-body">${p.known ? '' : '<div class="es-note mb-2 mt-0"><i class="ti ti-alert-triangle"></i>Esta ronda aún no está publicada: los números pueden cambiar. Mejor enviarlos cuando empiece la preparación.</div>'}${esChatBlocks(p).map((rows, b) => block(p, rows, b)).join('')}</div></details>`).join('')}</div>`;
 }
 async function esCopy(text) {
@@ -210,6 +251,7 @@ function esChatWire(v) {
     (S.chatDone ??= new Set()).add(`${v.ts}|${key}`);
     b.className = 'btn btn-sm btn-ghost-success ms-auto'; b.innerHTML = '<i class="ti ti-check me-1"></i>Copiado'; b.closest('.es-copy').classList.add('es-copied');
     toast('<i class="ti ti-check me-1"></i>Copiado: pégalo en el chat del clan'); }; });
+  document.querySelectorAll('[data-chat-plan]').forEach(b => { b.onclick = () => { S.chatAlt = b.dataset.chatPlan === '1'; paint(); }; });
   document.querySelector('[data-chat-mode]')?.addEventListener('click', () => { localStorage.setItem('chatLineas', localStorage.getItem('chatLineas') === '1' ? '0' : '1'); paint(); });
 }
 function esBench(d, v) {
@@ -251,8 +293,10 @@ function esCalc(v) {
     <p><b>% de pleno.</b> Un modelo entrenado en cada recogida con ${num(k.rows || v.attacks)} ataques reales de ${num(k.players_a || 0)} jugadores. Tiene en cuenta la diferencia de ayuntamiento y su nivel, el historial del atacante, lo dura que es esa aldea concreta, la forma reciente de ambos, si es liga, si la aldea ya estaba tocada, el equipo de héroes y la posición entre aldeas del mismo ayuntamiento. Los ataques recientes pesan más: esa memoria y la fuerza de cada factor se eligen solas, probando cuál habría acertado más.</p>
     <p><b>Qué no cuenta.</b> Niveles de héroes, mascotas, hechizos, experiencia o estrellas de guerra se probaron y no mejoran la predicción una vez conocido el historial del jugador. De los edificios de la aldea la API no da nada: eso solo se ve a través de cómo le ha ido a quien la ha atacado.</p>
     ${bins.length ? `<p class="mb-1"><b>¿Acierta?</b> Sin ver las últimas semanas (${num(k.holdout)} ataques), esto dijo y esto pasó${k.auc ? `; ordena bien el ${Math.round(k.auc * 100)} % de las parejas pleno y no pleno` : ''}:</p><table class="xd-t mb-3"><thead><tr><th>Decía</th><th>Pasó</th><th>Ataques</th></tr></thead><tbody>${bins.map(b => `<tr><td>${Math.round(b.says * 100)} %</td><td><b>${Math.round(b.real * 100)} %</b></td><td>${num(b.n)}</td></tr>`).join('')}</tbody></table>` : ''}
-    <p><b>Plan de ataque.</b> Se calcula el % de cada cuenta contra cada aldea y se busca el reparto con más plenos esperados, sin atacar nunca por encima del propio puesto. La nota de corte no es fija: es la más exigente que apenas pierde plenos. Quien se queda sin aldea queda de reserva para rematar.</p>
-    <p><b>Alternativa.</b> Es el mismo cálculo dejando subir a quien lo necesita si el conjunto gana: si el 3 pierde 3 puntos por bajar y el 5 gana 9 por subir, salen 6 a favor. Cada subida debe ganar más que el error medio del modelo${k.calib != null ? ` (${dec(k.calib * 100, 1)} puntos)` : ''}. Después se juegan las dos versiones ${num(1500)} veces, y solo se dice que sale más rentable si la diferencia supera el azar.</p>
+    <p><b>Plan de ataque.</b> Se calcula la probabilidad de 0, 1, 2 y 3 estrellas de cada cuenta contra cada aldea y se busca el reparto que más suma. Cada aldea recibe un solo ataque: repetir aldea no suma, porque solo cuenta la mejor nota. El % de cada pareja sale del modelo y del historial directo: en las últimas 10 defensas de la aldea, quién de TH igual o menor le hizo pleno y quién de TH igual o mayor no pudo; y en los últimos 10 ataques de la cuenta, a qué TH hizo pleno y contra cuáles falló. Un ataque sin opciones (menos de un 10 % de pleno y sin 2★ probables) no se planea, y una aldea difícil no se cubre a cualquier precio: si el ataque que haría falta rinde mucho más en otra, gana el reparto que más suma entero. En guerra normal entran los dos ataques de cada cuenta y, como hay el doble de ataques que aldeas, el cálculo elige los que más rinden: a veces ataca dos veces una cuenta de abajo antes que una de la parte media. Solo se sube a alguien por encima de su puesto si gana más que el error del modelo.</p>
+    <p><b>Cada ataque cuenta por sí solo.</b> Un ataque empieza de cero: no hereda nada de lo que otro hiciera antes en esa aldea. Por eso solo se planea si esa cuenta, ella sola, puede mejorar lo que la aldea ya tiene: en una aldea sin atacar, al menos un 10 % de pleno o 2★ probables; en una ya atacada, al menos un 25 % de sacar más estrellas de las que hay. No se manda a nadie a una aldea que le queda grande para «rascar algo».</p>
+    <p><b>Plan 1, mejores ataques para ganar.</b> Entran los dos ataques de cada cuenta y el cálculo decide quién ataca y a quién. Se calculan cuatro repartos (el de más estrellas, uno más atrevido, el de más plenos y uno que asegura 2★) y cada uno se juega ${num(600)} veces contra las estrellas con las que se espera que acabe el rival. Se queda el que más veces gana: yendo por detrás conviene arriesgar, y yendo por delante, asegurar. Si ninguno gana más de lo que explica el azar, se queda el de más estrellas. El empate a estrellas cuenta como media victoria, porque lo decide la destrucción. Cada subida de puesto debe ganar más que el error medio del modelo${k.calib != null ? ` (${dec(k.calib * 100, 1)} puntos)` : ''}.</p>
+    <p><b>Plan 2, todos atacan.</b> El primer ataque de cada cuenta va contra su mejor rival: una aldea distinta para cada una, la combinación que más estrellas suma, y solo donde tiene opciones reales. Quien no tiene ninguna aldea propia a su alcance va a la que mejor se le da, aunque la comparta con otra cuenta. El segundo ataque se gestiona para ganar la guerra: el de quien ya hizo el primero se reparte con las mismas reglas del plan 1, y el de los demás, cuando hayan atacado. Arriba se compara con el plan 1 jugando los dos ${num(1500)} veces con la misma suerte.</p>
     <p><b>Previsto y real.</b> Cada guerra se predice con un modelo que solo ha visto lo terminado antes de que empezara, y la predicción se guarda sin retocarla: por eso se puede comparar con lo que pasó sin trampa. En el directo, el % de ganar parte del marcador real y simula los ataques que faltan.</p>
     <p><b>Probabilidades.</b> Cada guerra pendiente se juega ${num(300)} veces: ataca cada cuenta según su asistencia, cada una a la aldea más alta a la que suele apuntar su clan, y solo cuenta el mejor ataque por aldea. También hay días buenos y malos de todo el clan${k.war_sigma != null ? `, con la amplitud medida en guerras reales` : ''}. Después se combinan en 4.000 finales de liga.</p>
     <p><b>Techo realista.</b> Lo que da el plan de ataque en un día bueno: el mejor 10 % de sus resultados.</p>
@@ -284,16 +328,41 @@ function esBattle(b) {
 }
 const esPastTitle = x => x.kind === 'cwl' && x.round ? esRound(x.round) : fechaApi(x.end);
 const fechaApi = e => e ? `${String(e).slice(6, 8)}/${String(e).slice(4, 6)}` : '–';
+// mapa previsto: el plan que había antes del primer ataque, cada cuenta con sus ataques y cada aldea con lo que se esperaba de ella
+function esPlanMap(mp) {
+  const them = new Map(mp.them.map(x => [x.pos, x])), n = Math.max(mp.us.length, mp.them.length);
+  const left = m => !m ? '<div class="es-map-c es-map-empty">–</div>' : `<div class="es-map-c"><div class="es-map-n"><b>${m.pos}.</b> <bdi>${esc(m.name)}</bdi><small>TH${m.th}</small></div>
+    <div class="es-map-s">${m.plan.length ? plural(m.plan.length, 'ataque previsto', 'ataques previstos') : 'sin ataque previsto'}</div><div class="es-map-a">${m.plan.map(a => `<span class="es-chip es-chip-${a.p3 >= .85 ? 3 : a.p3 >= .5 ? 2 : 1}">→${a.to} · ${Math.round(a.p3 * 100)} %<small>${dec(a.e, 1)}★</small></span>`).join('')}</div></div>`;
+  const right = m => !m ? '<div class="es-map-c es-map-empty">–</div>' : `<div class="es-map-c"><div class="es-map-n"><b>${m.pos}.</b> <bdi>${esc(m.name)}</bdi><small>TH${m.th}</small></div>
+    <div class="es-map-s">${m.exp ? `se esperaban ${dec(m.exp.e, 1)}★ · ${Math.round(m.exp.p3 * 100)} % de pleno` : 'sin rival previsto'}</div>${m.exp ? `<div class="es-map-a"><span class="es-chip">la ataca el ${m.exp.by}</span></div>` : ''}</div>`;
+  const rows = Array.from({length: n}, (_, i) => { const a = mp.us[i]; return `<div class="es-map-r">${left(a)}<i class="ti ti-arrow-right text-secondary"></i>${right(them.get(a?.pos ?? i + 1))}</div>`; }).join('');
+  return `<div class="es-map"><div class="small text-secondary mb-1">Plan de ${mp.goal === 'triples' ? 'más plenos' : mp.goal === 'stars' ? 'más estrellas' : 'ganar la guerra'}: ${dec(mp.stars, 0)}★ y ${dec(mp.triples, 1)} plenos previstos.</div>${rows}</div>`;
+}
+function esPastMaps(x) {
+  if (!x.map_plan && !x.map_end) return '';
+  return `<details class="es-past-map mt-2"><summary class="es-more">Mapa de la guerra: previsto y final</summary>
+    ${x.map_plan ? `<div class="es-h mt-2">Previsto antes del primer ataque</div>${esPlanMap(x.map_plan)}` : '<div class="small text-secondary mt-2">El mapa previsto empezó a guardarse después de esta guerra.</div>'}
+    ${x.map_end ? `<div class="es-h mt-3">Mapa final</div>${esMap({map: x.map_end, us: x.us, them: x.them}).replace(' id="esMap"', '')}` : ''}</details>`;
+}
 function esPastRow(x, open) {
   const r = {win: 'Ganada', lose: 'Perdida', tie: 'Empatada'}[x.result], b = x.before, c = {win: 'bg-green-lt', lose: 'bg-red-lt', tie: 'bg-secondary-lt'}[x.result];
   return `<details class="es-plan" ${open ? 'open' : ''}><summary><span class="es-day-h"><b>${esPastTitle(x)} · ${esB(x.them.name)}</b><small><span class="badge ${c}">${r} ${x.us.stars}-${x.them.stars}</span> · se preveía ${esPct(b.win)} de ganar y ${dec(b.us, 0)}★${x.partial ? ' · datos parciales' : ''}</small></span><i class="ti ti-chevron-down es-chev"></i></summary>
     <div class="es-body"><div class="es-tiles"><div><small>Estrellas</small><b>${x.us.stars}</b><small>previstas ${dec(b.us, 1)} (${num(b.us_lo)}-${num(b.us_hi)})</small></div><div><small>Del rival</small><b>${x.them.stars}</b><small>previstas ${dec(b.them, 1)}</small></div><div><small>Plenos</small><b>${x.t.triples}</b><small>se esperaban ${dec(x.t.p3, 1)}</small></div><div><small>Ataques usados</small><b>${x.us.attacks}</b><small>de ${x.us.max}</small></div></div>
-    ${x.rows.length ? `<div class="es-h">Cada ataque</div>${ES_HIT_HEAD}${x.rows.map(esHit).join('')}` : ''}${x.partial ? '<div class="small text-secondary mt-1">La guerra terminó entre dos recogidas: el marcador es el final, pero pueden faltar sus últimos ataques.</div>' : ''}</div></details>`;
+    ${x.rows.length ? `<div class="es-h">Cada ataque</div>${ES_HIT_HEAD}${x.rows.map(esHit).join('')}` : ''}${x.partial ? '<div class="small text-secondary mt-1">La guerra terminó entre dos recogidas: el marcador es el final, pero pueden faltar sus últimos ataques.</div>' : ''}${esPastMaps(x)}</div></details>`;
+}
+// la guerra que se está jugando, arriba del histórico: su mapa previsto ya existe; el final llega al terminar
+function esPastLive(b) {
+  if (!b?.map_plan) return '';
+  const live = b.state === 'inWar', x = b.before;
+  return `<details class="es-plan"><summary><span class="es-day-h"><b>${b.cwl ? esRound(b.round) : 'Guerra normal'} · ${esB(b.them.name)}</b><small><span class="badge ${live ? 'bg-green-lt' : 'bg-blue-lt'}">${live ? `En juego ${b.us.stars}-${b.them.stars}` : 'En preparación'}</span>${x ? ` · se prevé ${esPct(x.win)} de ganar y ${dec(x.us, 0)}★` : ''}</small></span><i class="ti ti-chevron-down es-chev"></i></summary>
+    <div class="es-body"><details class="es-past-map"><summary class="es-more">Mapa de la guerra: previsto${live ? ' (el final, al terminar)' : ''}</summary>
+      <div class="es-h mt-2">Previsto antes del primer ataque</div>${esPlanMap(b.map_plan)}
+      <div class="small text-secondary mt-2">El mapa final saldrá aquí cuando acabe la guerra; mientras, el de ahora está en «Mapa de la guerra».</div></details></div></details>`;
 }
 function esPast(d) {
-  const s = d.summary, list = d.past || [], name = d.past_kind === 'war' ? ['guerra', 'guerras'] : ['ronda', 'rondas'];
-  if (!list.length) return `<div class="card-body">${empty(`Aún no ha terminado ninguna ${name[0]} desde que se guardan las previsiones`)}</div>`;
-  return `<div class="card-body">
+  const s = d.summary, list = d.past || [], name = d.past_kind === 'war' ? ['guerra', 'guerras'] : ['ronda', 'rondas'], now = esPastLive(d.battle);
+  if (!list.length) return `<div class="card-body">${now ? `<div class="es-h">En curso</div>${now}` : ''}${empty(`Aún no ha terminado ninguna ${name[0]} desde que se guardan las previsiones`)}</div>`;
+  return `<div class="card-body">${now ? `<div class="es-h">En curso</div>${now}` : ''}
     ${s ? `<div class="es-tiles"><div><small>Plenos</small><b>${num(s.triples)}</b><small>previstos ${dec(s.p3, 1)}</small></div><div><small>Estrellas en ataques</small><b>${num(s.stars)}</b><small>previstas ${dec(s.e, 1)}</small></div><div><small>Ganador acertado</small><b>${s.right} de ${s.called}</b><small>${name[1]} con favorito</small></div><div><small>Error por guerra</small><b>${dec(s.stars_err, 1)}★</b><small>total del clan</small></div></div>
     <details class="mt-1"><summary class="es-more">¿Se cumple lo que dice el %?</summary><table class="xd-t mt-1"><thead><tr><th>Decía</th><th>Pasó</th><th>Ataques</th></tr></thead><tbody>${s.bins.map(b => `<tr><td>${Math.round(b.says * 100)} %</td><td><b>${Math.round(b.real * 100)} %</b></td><td>${num(b.n)}</td></tr>`).join('')}</tbody></table>${s.n < 300 ? `<div class="small text-secondary mt-1">Con ${num(s.n)} ataques los tramos aún bailan mucho: será más fiable al ir sumando guerras.</div>` : ''}</details>
     <details class="mt-1"><summary class="es-more">Quién rinde por encima o por debajo de lo previsto</summary><table class="xd-t mt-1"><thead><tr><th>Cuenta</th><th>Plenos</th><th>Previstos</th><th>Estrellas</th></tr></thead><tbody>${s.players.map(p => `<tr><td>${esc(p.name)}<small>${plural(p.n, 'ataque', 'ataques')}</small></td><td>${p.triples}</td><td>${dec(p.p3, 1)}</td><td><b class="${p.gap > 0 ? 'text-green' : p.gap < 0 ? 'text-red' : ''}">${esSigned(p.gap, 1)}</b></td></tr>`).join('')}</tbody></table></details>` : ''}
@@ -303,7 +372,7 @@ function esPast(d) {
 // Mientras se juega, el marcador y el % se piden al minuto. Lo demás no se repinta: no hay que perder lo que se está leyendo.
 function esLiveStart(d) {
   if (S.liveFor === d) return;          // repintar los mismos datos no vuelve a preguntar
-  S.liveFor = d; clearTimeout(S.liveTimer);
+  S.liveFor = d; clearTimeout(S.liveTimer); S.livePlanShown = !!d.battle?.map_plan;
   const gen = S.liveGen = (S.liveGen || 0) + 1, on = () => gen === S.liveGen && S.sub === 'escenarios' && S.data === d;
   if (!d.battle) return;
   let attacks = d.battle.us.attacks + d.battle.them.attacks;
@@ -312,6 +381,8 @@ function esLiveStart(d) {
     api('api/vivo').then(j => { if (!on() || !j.battle) return;
       const b = {...j.battle, fresh: true}, now = b.us.attacks + b.them.attacks, moved = now !== attacks; attacks = now; d.battle = b;
       const box = document.getElementById('esBattle'); if (box) { const t = document.createElement('div'); t.innerHTML = esBattle(b); box.replaceWith(t.querySelector('#esBattle')); esHitsWire(); }
+      if (b.map_plan && !S.livePlanShown) { S.livePlanShown = true; const sb = document.querySelector('[data-sec=eprev] .sec-body'); if (sb) sb.innerHTML = esPast(d); }     // el previsto de la guerra en juego, aunque la última recogida aún no lo traiga
+      for (const id of ['esMap', 'esMapM']) { const el = document.getElementById(id); if (el && b.map) { const t = document.createElement('div'); t.innerHTML = esMap(b).replace('id="esMap"', `id="${id}"`); el.replaceWith(t.firstElementChild); } }
       if (b.plan) { const v = d.mode === 'liga' ? d.liga : null, list = v ? v.plans : d.plans, at = list?.findIndex(p => p.round === b.plan.round && p.rival === b.plan.rival);
         if (at >= 0) { list[at] = {...list[at], ...b.plan, title: list[at].title}; if (moved) esPlanRefresh(d); } }
     }).catch(() => {}).finally(() => { if (on() && d.battle.state === 'inWar') S.liveTimer = setTimeout(tick, 60000); }); };
@@ -321,7 +392,7 @@ function esHitsWire() { document.querySelector('[data-hits]')?.addEventListener(
 function esPlanRefresh(d) {
   const v = d.mode === 'liga' ? d.liga : {plans: d.plans, ts: d.battle?.ts};
   const set = (id, html) => { const b = document.querySelector(`[data-sec=${id}] .sec-body`); if (b) b.innerHTML = html; };
-  set('eplan', esPlans(v)); set('echat', esChat(v)); esChatWire(v); esPlanWire();
+  set('eplan', esPlans(v)); set('etrain', esPlans(v, true)); set('echat', esChat(v)); esChatWire(v); esPlanWire();
 }
 // ---------- simulador
 function esWhatKey(g) { return `${g.a}|${g.b}`; }
@@ -375,18 +446,46 @@ const esSkeleton = p => `<div class="card mb-3"><div class="card-body"><div clas
   <div class="sk mb-3" style="height:120px"></div><div class="sk mb-3" style="height:220px"></div><div class="sk mb-3" style="height:320px"></div>`;
 function esCalcWar(d) {
   return `<div class="card-body es-calc"><p><b>% de pleno.</b> Es el mismo modelo que en liga: diferencia de ayuntamiento y su nivel, historial del atacante, lo dura que es esa aldea, la forma reciente de ambos y si la aldea ya estaba tocada. Aquí no se aplica el efecto de liga.</p>
-    <p><b>Dos ataques.</b> Cada cuenta cuenta una vez por ataque que le quede y nunca repite aldea. Como hay el doble de ataques que aldeas, lo que no entra en el plan queda de reserva para rematar.</p>
+    <p><b>Dos ataques.</b> Cada cuenta cuenta una vez por ataque que le quede y nunca repite aldea. Como hay el doble de ataques que aldeas, los que no entran en el plan no se usan: cada aldea recibe un solo ataque.</p>
     <p><b>Previsto y real.</b> La previsión se hace solo con lo terminado antes de empezar la guerra y se guarda sin retocarla. El % de ganar en directo parte del marcador real y simula los ataques que faltan, según la asistencia de cada cuenta en guerras normales.</p>
     <p class="mb-0"><b>Con pocos datos.</b> Si ClashKing no tiene historial de un jugador, el modelo parte de lo que suele pasar con esa diferencia de ayuntamiento, y afina según se juegan guerras.</p></div>`;
 }
+// ---------- mapa de la guerra: cada cuenta frente a su espejo
+function esMapSide(m, per, got) {
+  if (!m) return '<div class="es-map-c es-map-empty">–</div>';
+  const chips = m.atk.map(a => `<span class="es-chip es-chip-${a.stars}" title="${a.to ? `A la aldea ${a.to}` : ''}">${a.stars}★ ${a.pct} %${a.to ? `<small>→${a.to}</small>` : ''}</span>`).join('') + '<span class="es-chip es-chip-x" title="Ataque por hacer">–</span>'.repeat(m.left);
+  const n = got ?? m.got ?? 0, stars = `<div class="es-map-d" title="${m.got == null ? 'Aún no la han atacado' : `El rival le ha hecho ${n}★`}">${'<i class="on">★</i>'.repeat(n)}${'<i>☆</i>'.repeat(3 - n)}</div>`;
+  return `<div class="es-map-c"><div class="es-map-n"><b>${m.pos}.</b> <bdi>${esc(m.name)}</bdi><small>TH${m.th}</small></div>${stars}
+    <div class="es-map-s">ha hecho ${m.stars}★ · ${m.left ? `${plural(m.left, 'ataque restante', 'ataques restantes')}` : 'sin ataques'}</div><div class="es-map-a">${chips}</div></div>`;
+}
+function esMap(b) {
+  const m = b.map;
+  if (!m) return '';
+  const them = new Map(m.them.map(x => [x.pos, x])), n = Math.max(m.us.length, m.them.length);
+  // las estrellas que tiene cada aldea salen de los ataques del otro lado: la mejor nota que le han hecho (como en el juego)
+  const best = side => { const o = {}; for (const x of side) for (const a of x.atk) if (a.to != null) o[a.to] = Math.max(o[a.to] ?? 0, a.stars); return o; };
+  const gotUs = best(m.them), gotThem = best(m.us);
+  const rows = Array.from({length: n}, (_, i) => { const a = m.us[i], b = them.get(a?.pos ?? i + 1);
+    return `<div class="es-map-r">${esMapSide(a, m.per, a && gotUs[a.pos])}<i class="ti ti-arrows-horizontal text-secondary"></i>${esMapSide(b, m.per, b && gotThem[b.pos])}</div>`; }).join('');
+  const side = (s, right) => `<div class="es-bat-s ${right ? 'r' : ''}"><b><bdi>${esc(s.name)}</bdi></b><small>${s.attacks} de ${s.max} ataques · ${dec(s.pct, 1)} %</small></div>`;
+  return `<div id="esMap" class="card-body es-map"><div class="es-bat-score es-map-score">${side(b.us)}<div class="es-bat-n">${b.us.stars}<span>–</span>${b.them.stars}</div>${side(b.them, true)}</div>${rows}</div>`;
+}
+// en escritorio, el mapa va a la derecha y se queda a la vista; en el móvil, como una sección más tras la batalla
+function esWithMap(b, main) {
+  if (!b?.map) return main;
+  return `<div class="row g-3"><div class="col-12 col-xl-8">${main}</div><div class="col-xl-4 d-none d-xl-block"><div class="es-map-side">${sec('emap', 'Mapa de la guerra', '', esMap(b), true)}</div></div></div>`;
+}
+const esMapMobile = b => b?.map ? `<div class="d-xl-none">${sec('emapm', 'Mapa de la guerra', '', esMap(b).replace('id="esMap"', 'id="esMapM"'), false)}</div>` : '';
 function renderGuerra(d, notice) {
   const b = d.battle, v = {plans: d.plans = b.plan ? [b.plan] : [], ts: b.ts}, open = !!b.plan;
-  $('clanView').innerHTML = `${notice}
+  $('clanView').innerHTML = `${notice}${esWithMap(b, `
     ${sec('ebat', 'Batalla en juego', '', esBattle(b), true)}
-    ${open ? sec('eplan', 'Plan de ataque', '', esPlans(v), true) : ''}
+    ${esMapMobile(b)}
+    ${open ? sec('eplan', 'Plan 1 · Mejores ataques para ganar', '', esPlans(v), true) : ''}
+    ${open ? sec('etrain', 'Plan 2 · Todos atacan', '', esPlans(v, true), true) : ''}
     ${open ? sec('echat', 'Mensajes para el chat', '', esChat(v), true) : ''}
     ${sec('eprev', 'Previsto y real', '', esPast(d), true)}
-    ${sec('ecalc', 'Cómo se calcula', '', esCalcWar(d), false)}`;
+    ${sec('ecalc', 'Cómo se calcula', '', esCalcWar(d), false)}`)}`;
   esChatWire(v); esPlanWire(); esHitsWire();
 }
 function renderEscenarios(d) {
@@ -405,10 +504,12 @@ function renderEscenarios(d) {
     return;
   }
   S.whatIf ??= {}; S.whatFor = S.whatFor === v.ts ? S.whatFor : (S.whatIf = {}, v.ts);
-  $('clanView').innerHTML = `${notice}${notice_}${esHero(v)}
+  $('clanView').innerHTML = `${notice}${notice_}${esHero(v)}${esWithMap(d.battle, `
     ${d.battle ? sec('ebat', 'Batalla en juego', '', esBattle(d.battle), true) : ''}
+    ${esMapMobile(d.battle)}
     ${sec('epos', 'Dónde podemos acabar', '', `<div class="card-body">${esPositions(v)}</div>`, true)}
-    ${v.state !== 'ended' ? sec('eplan', 'Plan de ataque', '', esPlans(v), true) : ''}
+    ${v.state !== 'ended' ? sec('eplan', 'Plan 1 · Mejores ataques para ganar', '', esPlans(v), true) : ''}
+    ${v.state !== 'ended' ? sec('etrain', 'Plan 2 · Todos atacan', '', esPlans(v, true), true) : ''}
     ${v.state !== 'ended' ? sec('echat', 'Mensajes para el chat', '', esChat(v), true) : ''}
     ${sec('eprev', 'Previsto y real', '', esPast(d), true)}
     ${sec('etab', 'Clasificación y previsión', '', esTable(v), true)}
@@ -417,7 +518,7 @@ function renderEscenarios(d) {
     ${v.state !== 'ended' ? sec('eban', 'Alineación y banquillo', '', esBench(d, v), true) : ''}
     ${v.state !== 'ended' ? sec('ewhat', 'Simulador: ¿y si…?', '', esWhat(v), true) : ''}
     ${sec('eniv', 'Nivel de cada clan', '', esLevels(v), true)}
-    ${sec('ecalc', 'Cómo se calcula', '', esCalc(v), false)}`;
+    ${sec('ecalc', 'Cómo se calcula', '', esCalc(v), false)}`)}`;
   if (v.state !== 'ended') { esWire(v); esChatWire(v); esPlanWire(); }
   esHitsWire(); esLiveStart(d);
 }

@@ -13,7 +13,7 @@ Tres preguntas, tres métodos:
 - ¿Qué es seguro? Límites matemáticos (rank_bounds): el mejor y el peor caso posibles, sin suponer nada de cómo juega
   cada clan. Si dudan, se inclinan por «posible»: nunca marcan asegurado o descartado algo que no lo está.
 - ¿Qué es probable? Simulación (simulate) con modelo.py, que da el % de cada resultado entre dos jugadores concretos.
-- ¿Qué hacer? plan.py: el reparto de ataques con más plenos esperados.
+- ¿Qué hacer? plan.py: el reparto de ataques que más veces gana la guerra, y el de entrenamiento para liga.
 
 Nada se ajusta a mano por liga o por clan: nivel, memoria, puntería, asistencia y dispersión salen de los datos.
 """
@@ -29,6 +29,7 @@ WIN_BONUS = 10
 BONUS_LIMIT = 10          # hasta estas guerras pendientes se prueban todos los ganadores; con más se asume el peor caso
 GAME_SIMS = 300
 SEASON_SIMS = 4000
+RIVAL_SIMS = 300          # tiradas del rival para medir el % de ganar de cada reparto
 HIST_SIMS = 120
 PRACTICAL = .005          # por debajo de este margen en miles de simulaciones se da por resuelto en la práctica
 MIN_INACTIVE_WARS = 3     # sin atacar en tantas guerras seguidas se da por hecho que no atacará
@@ -443,17 +444,18 @@ def _roll(P, rng):
     ths, aim, pct_of, route = P["ths"], P["aim"], P["pct"], P["route"]
     fresh_t, used_t = table[(day, True)], table[(day, False)]
     order = range(len(P["probs"]))
-    if route is not None:                    # con plan, primero el plan y al final las reservas, que rematan lo fallado
-        order = sorted(order, key=lambda i: i not in route)
+
     for i in order:
         if rng.random() >= P["probs"][i]:
             continue
         pick = route.get(i) if route is not None else None
+        if route is not None and pick is None:
+            continue                         # con plan, quien no tiene aldea no ataca: cada aldea recibe un solo ataque
         if pick is None or best[pick] >= 3:
             top, pick, safe, safe_th = 0.0, None, None, -1
             for j, bth in enumerate(ths):
                 b = best[j]
-                if b >= 3 or (route is not None and P["positions"][j] < P["own"][i]):
+                if b >= 3:
                     continue
                 cell = (used_t if touched[j] else fresh_t)[i][j]
                 g = cell[1][b]
@@ -638,7 +640,19 @@ def war_plan(L, model, game, tag, inactive=()):
     bases = _base_state(me, ot, live)
     size = (game.get("war") or {}).get("size") or L["size"]
     seed = f"{tag}|{_key(game)}|{sum(b['best'] for b in bases)}|{len(attackers)}"
-    return planner.build(model["prob"], attackers, bases, size, cwl=L.get("cwl", True), seed=seed, stars_now=me["stars"] if live else 0)
+    return planner.build(model["prob"], attackers, bases, size, cwl=L.get("cwl", True), seed=seed, stars_now=me["stars"] if live else 0,
+                         rival=rival_stars(L, model, game, me, ot, size, live, seed))
+
+
+def rival_stars(L, model, game, me, ot, size, live, seed):
+    """Con cuántas estrellas acaba el rival, tirada a tirada y según sus hábitos: contra eso se mide qué reparto gana más.
+    Si falta algo para simularlo, el plan sale igual, solo que sin % de ganar."""
+    try:
+        side = _prep_side(model, ot, me, size, live, left=_left(L, game) if live else 0, per=L.get("per", 1), cwl=L.get("cwl", True))
+        rng = random.Random(f"{seed}|rival")
+        return [_roll(side, rng)[0] for _ in range(RIVAL_SIMS)]
+    except Exception:      # noqa: BLE001
+        return None
 
 
 # ---------------- qué hace falta ----------------
