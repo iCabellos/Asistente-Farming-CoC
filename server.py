@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,18 +14,22 @@ from urllib.parse import parse_qs, urlparse
 import av
 
 ROOT = Path(__file__).parent
-RENDIMIENTO_URL = os.environ.get("COC_RENDIMIENTO_URL", "https://coc-rendimiento-clan.vercel.app")   # la web del clan
+sys.path.insert(0, str(ROOT / "asistente"))
+import settings                                   # noqa: E402  (config.json con sus valores por defecto)
+
 LOG = ROOT / "log.jsonl"
 LOOT = ROOT / "loot.jsonl"   # botín conseguido por ataque
+
+
 def _cfg():
-    try:
-        return json.loads((ROOT / "asistente" / "config.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    """(config.json completo: lo que falte, con su valor por defecto; lo que esté mal escrito)."""
+    return settings.load(CONFIG)
 
 
-ADB = _cfg().get("adb") or shutil.which("adb") or "adb"
-SERIAL = _cfg().get("serial", "127.0.0.1:5555")
+_START = settings.load()[0]
+RENDIMIENTO_URL = os.environ.get("COC_RENDIMIENTO_URL") or _START["clan_site_url"] or ""     # la web del clan
+ADB = (_START["adb"] if Path(str(_START["adb"])).exists() else None) or shutil.which("adb") or "adb"
+SERIAL = _START["serial"]
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 frame_jpeg, frame_seq = None, 0
@@ -35,7 +40,8 @@ def video():
     global frame_jpeg, frame_seq
     while True:
         p = subprocess.Popen([ADB, "-s", SERIAL, "exec-out", "screenrecord", "--output-format=h264",
-                              "--size", "1600x900", "--bit-rate", "8000000", "-"],
+                              "--size", str(_START["panel_video_size"]),
+                              "--bit-rate", str(_START["panel_video_bitrate"]), "-"],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
         codec = av.CodecContext.create("h264", "r")
         try:
@@ -68,14 +74,13 @@ def read_log(after):
 ASISTENTE_DIR = ROOT / "asistente"
 
 
-CONFIG = ASISTENTE_DIR / "config.json"
-TASKS = {"fill_storages": "Llenar almacenes", "farm": "Farmear", "builder_base": "Llenar aldea nocturna",
-         "build": "Mejorar lo recomendado", "walls": "Mejorar muros"}
+CONFIG = settings.CONFIG
+TASKS = settings.TASKS
 ATTACKS = {"farm": (6, 20)}   # sólo «farmear» lleva número; las demás siguen hasta cumplir su objetivo
 
 
 def routine_info():
-    cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+    cfg, problems = _cfg()
     try:
         st = json.loads((ASISTENTE_DIR / "estado.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -88,6 +93,7 @@ def routine_info():
     return {"routine": cfg.get("routine", []), "accounts": list(cfg.get("accounts", {})), "tasks": TASKS,
             "storage": storage,
             "labels": {n: a.get("label", n) for n, a in cfg.get("accounts", {}).items()},
+            "problems": problems,
             "state": st, "running": (ASISTENTE_DIR / "ENABLED").exists(), "now": time.time(),
             "paused_owner": _pause_until() > time.time(), "goto": _pending_goto()}
 
@@ -103,7 +109,7 @@ def _pending_goto():
 def goto_step(order):
     """Deja la orden de saltar al paso `index` de la rutina; el asistente la atiende en su siguiente punto
     seguro (nunca con tropas desplegadas). Si estaba detenido, lo arranca empezando por ese paso."""
-    routine = json.loads(CONFIG.read_text(encoding="utf-8")).get("routine", [])
+    routine = _cfg()[0]["routine"]
     i = order.get("index")
     if not isinstance(i, int) or not 0 <= i < len(routine):
         raise ValueError("paso no válido")
@@ -129,21 +135,19 @@ def _pause_until():
 
 def save_targets(targets):
     """{cuenta: {full_ratio, dark_full_ratio, builder_full_ratio}} en tanto por uno (0.3–1)."""
-    cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+    cfg = settings.read_raw(CONFIG)
     for acc, t in targets.items():
         if acc not in cfg["accounts"]:
             raise ValueError(f"cuenta desconocida: {acc}")
         for k in ("full_ratio", "dark_full_ratio", "builder_full_ratio"):
             if k in t:
                 cfg["accounts"][acc][k] = round(max(0.3, min(1.0, float(t[k]))), 2)
-    tmp = CONFIG.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(CONFIG)
+    settings.write_raw(cfg, CONFIG)
 
 
 def save_routine(routine):
     """Valida y guarda la rutina en config.json (el asistente la relee en cada paso)."""
-    cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+    cfg = settings.read_raw(CONFIG)
     clean = []
     for s in routine:
         acc, task = s.get("account"), s.get("task")
@@ -161,9 +165,7 @@ def save_routine(routine):
     if not clean:
         raise ValueError("la rutina no puede quedar vacía")
     cfg["routine"] = clean
-    tmp = CONFIG.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(CONFIG)
+    settings.write_raw(cfg, CONFIG)
     return clean
 
 
@@ -290,6 +292,6 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     threading.Thread(target=video, daemon=True).start()
-    print(f"Panel: http://localhost:{os.environ.get('COC_PORT', '8000')}/")
-    port = int(os.environ.get("COC_PORT", "8000"))
-    ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+    port = int(os.environ.get("COC_PORT") or _START["panel_port"])
+    print(f"Panel: http://localhost:{port}/")
+    ThreadingHTTPServer((str(_START["panel_host"]), port), H).serve_forever()

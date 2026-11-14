@@ -63,28 +63,63 @@ Nunca gasta gemas ni martillos, nunca hace guerra ni batallas competitivas.
 **Comprueba la conexión**: con BlueStacks abierto, doble clic en **`probar_conexion.bat`**.
 Debe salir `127.0.0.1:5555   device`. Si sale otra cosa → [Problemas frecuentes](#-problemas-frecuentes).
 
-### Paso 4 · Tus cuentas (3 min)
+### Paso 4 · Tus cuentas (1 min)
 
-Abre **`asistente\config.json`** con el Bloc de notas. Por cada cuenta, en `"accounts"`, cambia:
+Abre **`asistente\config.json`** con el Bloc de notas. **Sólo hace falta el nombre de tus aldeas**; con esto ya funciona:
 
-| Campo | Qué poner | Ejemplo |
+```json
+{ "accounts": ["MiAldea", "MiSegundaAldea"] }
+```
+
+El asistente llena los almacenes de cada cuenta, en bucle. Todo lo demás lo averigua solo o tiene un valor por defecto:
+la capacidad de los almacenes la lee del juego, el botín mínimo sale de esa capacidad, y la tarjeta de cada cuenta en
+Supercell ID la encuentra leyendo la lista (la primera vez; después guarda una plantilla y va al instante).
+
+Si quieres afinar, cada cuenta admite estos campos (todos opcionales):
+
+| Campo | Qué hace | Por defecto |
 |---|---|---|
-| nombre de la cuenta (la clave) | un nombre corto tuyo | `"Principal"` |
-| `village_name` | el nombre de la aldea **tal cual sale arriba a la izquierda** en el juego | `"MiAldea"` |
-| `switch_label` | el nombre de la tarjeta en **Supercell ID → Cambiar de cuenta** | `"MiAldea"` |
-| `label` | cómo quieres verla en el visor | `"Principal · TH18"` |
-| `capacity` | no hace falta: el asistente lee el **Máx.** de cada recurso del juego y lo actualiza solo (descarta lecturas imposibles o con una cifra de más, y si la barra del recurso está al tope lo da por lleno aunque la cifra no cuadre) | `28000000` |
-| `builder_capacity` | *(opcional)* igual, para la aldea nocturna | `4700000` |
-| `min_loot` | botín mínimo para atacar una base | `1000000` |
-| `auto_build` | `true` si quieres que **mejore solo** esa cuenta | `true` |
-| `auto_build_until_th` | nivel de ayuntamiento en el que deja de mejorar | `10` |
-| `request_message` | *(opcional)* mensaje al pedir tropas | `"Dragones porfa"` |
+| `village_name` | nombre de la aldea **tal cual sale arriba a la izquierda** en el juego | el nombre de la cuenta |
+| `switch_label` | nombre de la tarjeta en **Supercell ID**, sólo si quieres buscarla por ese nombre | `village_name` |
+| `label` | cómo se ve en el visor | el nombre de la cuenta |
+| `tasks` | qué hace esa cuenta si no escribes `"routine"`: `fill_storages`, `farm`, `builder_base`, `build`, `walls` | `["fill_storages"]` |
+| `min_loot` | botín mínimo para atacar: `"auto"` o `{"gold": N, "elixir": N, "dark": N, "mode": "gold_or_elixir"}` (lo que falte, automático) | `"auto"` |
+| `max_searches` | bases que mira antes de atacar la que haya | `25` |
+| `full_ratio`, `dark_full_ratio`, `builder_full_ratio` | hasta qué parte llenar (también desde el visor) | `0.9`, `0.5`, `0.9` |
+| `farm_focus` | sólo cuenta estos recursos: `["gold"]`, `["dark"]`… | todos |
+| `auto_build`, `auto_build_until_th` | mejora sola lo recomendado hasta ese ayuntamiento | `false`, `10` |
+| `donor` | la cuenta en la que se queda mientras descansa, para donar | ninguna |
 
-Y en `"home_account"` pon la cuenta que más dona (el asistente se queda en ella mientras descansa).
+Para no repetir un campo en todas las cuentas, ponlo una vez en `"account_defaults": { ... }`.
 
-Si una cuenta te sobra, bórrala (y sus pasos en `"routine"`). Guarda el archivo.
+**Opciones generales** (también opcionales; cualquiera se puede poner dentro de una cuenta para cambiarla sólo en ella):
 
-> 💡 Los **porcentajes** de llenado y el **orden de la rutina** no hace falta tocarlos aquí: se cambian desde el visor.
+| Opción | Qué hace | Por defecto |
+|---|---|---|
+| `routine` | lista de pasos `{"account", "task"}` en el orden que quieras (se edita desde el visor) | las `tasks` de cada cuenta |
+| `home_account` | cuenta en la que descansa | la primera con `donor` |
+| `donate`, `request_troops` | donar en el clan / pedir tropas cuando es gratis | `true`, `true` |
+| `rest_minutes_between_cycles`, `rest_minutes_when_full` | descanso entre vueltas | `2`, `30` |
+| `owner_pause_minutes` | cuánto se aparta si entras tú a jugar | `45` |
+| `min_loot_ratio` | botín mínimo automático, como parte de la capacidad | `0.035` |
+| `walls_spend_ratio`, `walls_one_by_one`, `walls_recheck_hours` | muros: cuándo gastar, cuándo ir de uno en uno, cada cuánto volver a mirar | `0.8`, `10`, `72` |
+| `hero_ability_seconds`, `stall_seconds` | habilidad de los héroes y cuándo dar la batalla por parada | `7`, `15` |
+| `troop_roles`, `spell_roles` | qué tropas son tanque/apoyo… y qué hechizos van a defensas o a tropas | los del juego |
+| `mass_event`, `mass_cards`, `mass_count` | evento de tropa en masa | `false` |
+| `serial`, `adb`, `game_package` | dispositivo ADB, ruta de adb y paquete del juego | `127.0.0.1:5555` |
+| `ollama`, `model`, `model_keep_alive`, `model_max_ram_gb` | modelo de visión | `qwen2.5vl:7b` |
+| `bluestacks_player`, `bluestacks_instance`, `emulator_args`, `emulator_process` | cómo arrancar el emulador | BlueStacks 5 |
+| `panel_port`, `panel_host`, `clan_site_url` | visor | `8000` |
+| `advanced` | cambia constantes internas (coordenadas, tablas) sin tocar el código: `{"SPEED_BTN": [1840, 615]}` | — |
+
+La lista completa, con sus valores, está en [`asistente/settings.py`](asistente/settings.py).
+
+Si escribes algo mal (una cuenta que no existe en la rutina, una tarea inventada, un número imposible), el asistente
+**no se cae**: lo dice en el diario y en el visor, usa el valor por defecto y sigue. Los cambios se aplican solos, sin reiniciar
+(salvo la conexión, el emulador y el visor, que se leen al arrancar).
+
+> 💡 El asistente está medido para el juego **en español** y a **1920x1080**. Con otra resolución 16:9 adapta capturas y
+> toques solo (y avisa); con otra proporción no funciona.
 
 ### Paso 5 · ¡A farmear!
 
@@ -165,6 +200,7 @@ coc-asistente/
 ├─ requirements.txt
 └─ asistente/
    ├─ asistente.py           ← el asistente
+   ├─ settings.py          ← valores por defecto y validación de config.json
    ├─ vision.py · eyes.py · device.py
    ├─ tpl/ · cards/        ← plantillas de imagen (defensas, barco, cartas de tropas)
    ├─ config.example.json  ← plantilla de configuración

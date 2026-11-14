@@ -124,6 +124,7 @@
                 <div class="card-actions"><span class="badge bg-secondary-lt" id="phaseBadge">–</span></div></div>
               <div class="card-body p-0">
                 <div class="px-3 pt-2 pb-1 small text-secondary" id="phaseText">Arrastra las tareas para cambiar la prioridad.</div>
+                <div class="alert alert-warning m-2 py-2 small d-none" id="cfgProblems"></div>
                 <div class="list-group list-group-flush routine" id="routine"></div>
               </div>
               <div class="card-footer d-flex flex-wrap gap-2 align-items-center">
@@ -266,6 +267,9 @@ const editList = () => (draft = draft || R.routine.map(s => ({...s})));
 const ATTACKS = {farm: [6, 20, 'Ataques por vuelta']};   // el resto no tiene tope: sigue hasta cumplir su objetivo
 function renderRoutine() {
   const list = draft || R.routine, box = $('routine');
+  const pb = $('cfgProblems'), probs = R.problems || [];        // lo que esté mal escrito en config.json
+  pb.classList.toggle('d-none', !probs.length);
+  pb.replaceChildren(...probs.map(t => Object.assign(document.createElement('div'), {textContent: 'config.json: ' + t})));
   box.innerHTML = list.map((s, i) => {
     const [ico, tip] = stepIcon(i, s);
     const cur = !dirty && R.running && !R.goto && R.state.current === i && ['run', 'pause'].includes(R.state.phase);

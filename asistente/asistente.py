@@ -33,15 +33,22 @@ import vision
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 HERE = Path(__file__).parent
 LIVE = HERE.parent                      # coc-live: diario y botín que muestra el visor
-CFG = json.loads((HERE / "config.json").read_text(encoding="utf-8"))
+import settings
+CFG, CFG_PROBLEMS = settings.load()     # config.json completado con los valores por defecto (settings.py)
 STOP = HERE / "STOP"
 
 import shutil
 _adb = CFG.get("adb") if CFG.get("adb") and Path(CFG["adb"]).exists() else (shutil.which("adb") or "adb")
-dev = Device(_adb, CFG["serial"])
+dev = Device(_adb, CFG["serial"], CFG["game_package"])
 eyes = Eyes(CFG["ollama"], CFG["model"], CFG.get("model_keep_alive", "5m"))
 blocked_until = {}                      # cuenta -> timestamp (el dueño está jugando)
 current = None                          # cuenta abierta
+
+
+def opt(key, default=None, acc=None):
+    """Una opción de config.json: la de la cuenta (`acc` o la que está abierta) si la tiene; si no, la general;
+    si no, `default`. Así cualquier ajuste general se puede cambiar sólo para una cuenta."""
+    return settings.option(CFG, key, default, acc or current)
 
 
 
@@ -311,7 +318,7 @@ def go_home(max_tries=10):
     for _ in range(max_tries + 4):
         if paused():
             return False
-        if "clashofclans" not in dev.foreground():
+        if not dev.game_in_front():
             dev.launch_game()
             time.sleep(15)
         kind, img = screen()
@@ -432,7 +439,7 @@ def handle_not_home():
         owner_detected()
     else:
         log("warn", "No consigo volver a la aldea; reinicio el juego.")
-        dev.shell("am force-stop com.supercell.clashofclans")
+        dev.stop_game()
         time.sleep(2)
         dev.launch_game()
         time.sleep(20)
@@ -448,12 +455,12 @@ except (OSError, ValueError):
 def owner_detected():
     """El dueño juega en otro dispositivo. Al reabrir, el juego entra SIEMPRE en la última aldea (la suya)
     y le echaría: así que el asistente entero se para con el juego cerrado un buen rato."""
-    mins = CFG.get("owner_pause_minutes", 45)
+    mins = opt("owner_pause_minutes", 45)
     PAUSE["until"] = time.time() + mins * 60
     blocked_until[current] = PAUSE["until"]          # igual que la pausa: si no, tras ella venía un descanso
     PAUSE_FILE.write_text(str(PAUSE["until"]))
     log("warn", f"El dueño está jugando en {current}: cierro el juego y paro el asistente {mins} min para no echarle.")
-    dev.shell("am force-stop com.supercell.clashofclans")
+    dev.stop_game()
 
 
 def clear_pause():
@@ -504,6 +511,12 @@ def which_account(img=None):
 
 
 SID_LIST = (1440, 370, 1800, 1080)        # columna de los nombres en la lista de Supercell ID (panel derecho)
+SID_NAME_X = (1460, 1800)                 # donde está el texto de cada tarjeta (a la derecha del avatar)
+SID_TAP_X = 1620
+SID_MIN_MATCH = 0.8                       # parecido mínimo entre el nombre leído y el de la cuenta
+SID_BAD = {}                              # cuenta -> nombres de tarjeta que resultaron ser de otra cuenta
+SID_LAST = {}                             # cuenta -> nombre de la última tarjeta elegida leyendo
+SID_READ = {}                             # recorte de tarjeta ya leído -> sus textos (no se pregunta dos veces)
 
 
 def _dark(img):
@@ -517,11 +530,15 @@ def sid_list_open(img):
     return strip.min() > 225 and strip.max() - strip.min() < 30
 
 
+def sid_tpl(acc):
+    """Plantilla del nombre de la cuenta en la lista. La crea el asistente la primera vez que la encuentra."""
+    return HERE / "tpl" / ("sid_" + re.sub(r"[^\w-]", "_", acc) + ".png")
+
+
 def sid_card_y(img, acc):
     """y donde tocar la tarjeta de la cuenta en la lista de Supercell ID, por la plantilla de su nombre
-    (tpl/sid_<cuenta>.png), o None. El modelo no la encontraba (10-nov): la lista pone «TheRlvan11», con ele,
-    y se le pedía «TheRIvan11». Plantillas: 1,0 en su tarjeta y ≤0,51 en las demás."""
-    p = HERE / "tpl" / f"sid_{acc}.png"
+    (tpl/sid_<cuenta>.png), o None. Plantillas: 1,0 en su tarjeta y ≤0,51 en las demás."""
+    p = sid_tpl(acc)
     if not p.exists():
         return None
     t = _dark(Image.open(p))
@@ -529,6 +546,71 @@ def sid_card_y(img, acc):
     _, v, _, (_, y) = cv2.minMaxLoc(r)
     y += SID_LIST[1] + t.shape[0] // 2
     return y + 15 if v >= 0.85 and y + 15 < 1060 else None
+
+
+def sid_cards(img):
+    """Renglón del nombre (letras negras) de cada tarjeta de la lista, de arriba abajo: [(x0, y0, x1, y1)].
+    Por píxeles: el nombre empieza pegado a la izquierda de la columna; quedan fuera la cabecera «Cambiar de
+    ID» (centrada) y el icono del juego del segundo renglón (cuadrado; su texto es gris, no negro)."""
+    x0, x1 = SID_NAME_X
+    top = SID_LIST[1]
+    m = _dark(img.crop((x0, top, x1, img.height))) > 0
+    out, start = [], None
+    for y, on in enumerate(list(m.sum(axis=1) >= 2) + [False]):
+        if on and start is None:
+            start = y
+        elif not on and start is not None:
+            cols = np.where(m[start:y].any(axis=0))[0]
+            h, w = y - start, int(cols[-1] - cols[0])
+            if cols[0] <= 20 and 10 <= h <= 30 and w >= 8 and not (w <= 34 and h >= 21):
+                out.append((x0 + int(cols[0]), top + start, x0 + int(cols[-1]) + 1, top + y))
+            start = None
+    return out
+
+
+def sid_read(img, box):
+    """Textos de una tarjeta (nombre de Supercell ID y, debajo, nombre de la aldea), leídos por el modelo."""
+    crop = img.crop((SID_NAME_X[0] - 8, box[1] - 12, SID_NAME_X[1], min(img.height, box[1] + 88)))
+    key = hash(crop.tobytes())
+    if key not in SID_READ:
+        d = eyes.ask(crop.resize((crop.width * 2, crop.height * 2)),
+                     'Tarjeta de una cuenta de un juego. Lee literalmente cada renglón de texto, de arriba abajo. '
+                     'Responde {"lineas": ["...", "..."]}.', max_tokens=80)
+        lines = d.get("lineas") if isinstance(d.get("lineas"), list) else []
+        if len(SID_READ) > 200:
+            SID_READ.clear()
+        SID_READ[key] = [str(t) for t in lines if isinstance(t, (str, int))]
+    return SID_READ[key]
+
+
+def sid_score(acc, texts):
+    """Parecido (0-1) entre los textos de una tarjeta y los nombres de la cuenta (aldea, Supercell ID o clave)."""
+    import difflib
+    a = CFG["accounts"][acc]
+    want = {_norm(a.get("village_name") or ""), _norm(a.get("switch_label") or ""), _norm(acc)} - {""}
+    got = [g for g in map(_norm, texts) if g]
+    return max((difflib.SequenceMatcher(None, w, g).ratio() for w in want for g in got), default=0.0)
+
+
+def sid_find(img, acc):
+    """Busca la tarjeta de `acc` leyendo las que hay en pantalla: (y donde tocar, recuadro del nombre) o
+    (None, None). No hace falta plantilla ni «switch_label»: vale el nombre de la aldea, que sale en la tarjeta."""
+    best = (0.0, None, "")
+    for box in sid_cards(img):
+        texts = sid_read(img, box)
+        name = " / ".join(texts[:2])
+        mine = sid_score(acc, texts)
+        other = max((sid_score(o, texts) for o in CFG["accounts"] if o != acc), default=0.0)
+        if mine < SID_MIN_MATCH or other > mine or name in SID_BAD.get(acc, ()):
+            continue
+        if mine > best[0]:
+            best = (mine, box, name)
+    if best[1] is None:
+        return None, None
+    box = best[1]
+    log("think", f"Tarjeta de {acc} en la lista de Supercell ID: «{best[2]}».")
+    SID_LAST[acc] = best[2]
+    return (box[1] + box[3]) // 2 + 15, box
 
 
 def switch_to(acc):
@@ -539,9 +621,7 @@ def switch_to(acc):
     if which_account() == acc:
         current = acc
         return True
-    label = CFG["accounts"][acc]["switch_label"]
     log("think", f"Cambio a la cuenta {acc}.")
-    pos = None
     for attempt in range(2):
         tap(100, 110, "abrir perfil", 2.5)
         # el perfil se abre en la última pestaña usada: sin pasar por «Ajustes», (1264,206) es otra cosa
@@ -553,31 +633,58 @@ def switch_to(acc):
         go_home()
     else:
         return False
-    for scroll in range(4):
-        img = dev.shot()
-        y = sid_card_y(img, acc)
-        if y:
-            pos = (1620, y)
-            break
-        if not (HERE / "tpl" / f"sid_{acc}.png").exists():      # cuenta sin plantilla: que la busque el modelo
-            pos = eyes.find(img, f'la tarjeta de la cuenta "{label}" en la lista de Supercell ID (panel derecho)')
-            if pos and pos[0] > 1330 and pos[1] < 1000:
+    # primero por la plantilla del nombre (instantáneo); sin plantilla, o si ya no aparece, leyendo las tarjetas
+    y = box = img = None
+    for by_template in (True, False):
+        if by_template and not sid_tpl(acc).exists():
+            continue
+        for scroll in range(4):
+            img = dev.shot()
+            y, box = (sid_card_y(img, acc), None) if by_template else sid_find(img, acc)
+            if y:
                 break
-            pos = None
-        dev.swipe(1620, 900, 1620, 560, 600, wait=1.5)
-    if not pos:
+            dev.swipe(SID_TAP_X, 900, SID_TAP_X, 560, 600, wait=1.5)
+        if y:
+            break
+        for _ in range(4):                               # de vuelta al principio de la lista
+            dev.swipe(SID_TAP_X, 560, SID_TAP_X, 900, 300, wait=0.6)
+    if not y:
         dev.shot().save(HERE / "sin_cuenta.png")
-        log("warn", f"No encuentro la cuenta {label} en la lista (captura en sin_cuenta.png).")
+        a = CFG["accounts"][acc]
+        log("warn", f"No encuentro la cuenta {acc} en la lista de Supercell ID (captura en sin_cuenta.png). "
+                    f"Busco una tarjeta que ponga «{a['village_name']}»"
+                    + (f" o «{a['switch_label']}»" if a["switch_label"] != a["village_name"] else "")
+                    + ": revisa «village_name» en config.json.")
         dev.back(1)
         go_home()
         return False
-    tap(*pos, f"elegir cuenta {label}", 15)
+    tap(SID_TAP_X, y, f"elegir cuenta {acc}", 15)
+    landed = None
     for _ in range(5):
-        if go_home() and which_account() == acc:
-            current = acc
-            log("done", f"Ahora en {acc}.")
-            return True
+        if go_home():
+            landed = which_account()
+            if landed == acc:
+                current = acc
+                if box is not None:                      # encontrada leyendo: la próxima vez, por plantilla
+                    try:
+                        img.crop((box[0] - 5, box[1] - 4, box[2] + 5, box[3] + 4)).save(sid_tpl(acc))
+                        log("think", f"Guardo el nombre de {acc} como plantilla ({sid_tpl(acc).name}) "
+                                     f"para encontrarla al instante la próxima vez.")
+                    except Exception as e:
+                        log("warn", f"No he podido guardar la plantilla de {acc}: {e}")
+                log("done", f"Ahora en {acc}.")
+                return True
+            if landed:
+                break
         time.sleep(4)
+    if landed and landed != acc:                         # la tarjeta era de otra cuenta: no repetir el error
+        current = landed
+        if box is None:
+            sid_tpl(acc).unlink(missing_ok=True)
+            log("warn", f"La plantilla de {acc} llevaba a {landed}: la borro y la próxima vez leo las tarjetas.")
+        else:
+            SID_BAD.setdefault(acc, set()).add(SID_LAST.get(acc, ""))
+            log("warn", f"Esa tarjeta era de {landed}, no de {acc}: no la vuelvo a elegir para {acc}.")
     return False
 
 
@@ -692,6 +799,9 @@ def clan_duties():
     """Abre el chat del clan, dona TODO lo que pidan y pide tropas si es gratis."""
     if mass_on() and time.time() - MASS["clan"] < 600:
         return                                     # evento en masa: el clan, como mucho cada 10 min
+    do_donate, do_request = opt("donate", True), opt("request_troops", True)
+    if not do_donate and not do_request:
+        return
     MASS["clan"] = time.time()
     if not go_home():
         return
@@ -716,7 +826,7 @@ def clan_duties():
         tap(62, 920, "ir al final del chat", 1.5)
     donated = 0
     tried = {}
-    for page in range(3):                          # final del chat y dos pantallas más arriba
+    for page in range(3 if do_donate else 0):      # final del chat y dos pantallas más arriba
         for _ in range(4):
             img = dev.shot()
             if not chat_open(img):
@@ -745,7 +855,7 @@ def clan_duties():
     # pedir es gratis si la burbuja del castillo no lleva el icono verde de gema (cuenta atrás de pago)
     bubble = img.crop((640, 978, 705, 1015))
     gem_px = sum(1 for p in bubble.getdata() if p[1] > 140 and p[0] < 130 and p[2] < 130 and p[1] - p[0] > 40)
-    if gem_px < 15:
+    if gem_px < 15 and do_request:
         tap(640, 1020, "pedir tropas al castillo", 2)
         dlg = dev.shot()
         dlg.save(HERE / "ultima_peticion.png")
@@ -760,6 +870,22 @@ def clan_duties():
 
 
 # ---------------- batalla normal ----------------
+def loot_rule(acc):
+    """Botín mínimo para atacar. Lo que no esté escrito en «min_loot» (o todo, si es "auto") sale de la
+    capacidad de la cuenta: «min_loot_ratio» de cada almacén. Sin capacidad leída aún vale cualquier base."""
+    a = CFG["accounts"][acc]
+    raw = a.get("min_loot") if isinstance(a.get("min_loot"), dict) else {}
+    cap = a.get("capacity") or {}
+    ratio = opt("min_loot_ratio", 0.035, acc)
+
+    def auto(k):
+        return int(cap[k] * ratio) if cap_ok(k, cap.get(k)) else 0
+    rule = {k: int(raw[k]) if isinstance(raw.get(k), (int, float)) and not isinstance(raw.get(k), bool) else auto(k)
+            for k in ("gold", "elixir", "dark")}
+    rule["mode"] = raw.get("mode") or ("gold_and_elixir_or_dark" if rule["dark"] else "gold_or_elixir")
+    return rule
+
+
 def good_target(loot, rule, full=()):
     g, e, d = (loot.get(k) or 0 for k in ("gold", "elixir", "dark"))
     if full:
@@ -1122,7 +1248,7 @@ def find_storages(shot, geo):
     ng = sum(1 for o in out if o["kind"] == "gold")
     log("think", f"Almacenes por las imágenes de la wiki en {t_sift:.1f} s: " + ", ".join(
         f"{o['kind']} {int(o['x'])},{int(o['y'])}" for o in out) + ".")
-    if ng or not CFG.get("storages_model", True):
+    if ng or not opt("storages_model", True):
         return out
     cands = [c for c in vision.storage_candidates(shot, mask)
              if c["hint"] == "oro" and all(math.hypot(c["x"] - s["x"], c["y"] - s["y"]) > 45 for s in out)][:6]
@@ -1199,7 +1325,7 @@ SPELL_ES = {"lightning": "rayo", "cc_lightning": "rayo", "earthquake": "terremot
 
 def spell_roles():
     """{"defensas": set, "tropas": set}; editable en config.json → "spell_roles"."""
-    r = CFG.get("spell_roles") or {}
+    r = opt("spell_roles") or {}
     return {k: set(r.get(k) or v) for k, v in SPELL_ROLES_DEFAULT.items()}
 
 
@@ -1425,7 +1551,7 @@ TROOP_ROLES = {"tank": ["giant", "golem", "pekka", "superyeti", "super_yeti", "y
 
 
 def troop_role(name):
-    roles = CFG.get("troop_roles") or TROOP_ROLES
+    roles = opt("troop_roles") or TROOP_ROLES
     for r, names in roles.items():
         if name in names:
             return r
@@ -1559,7 +1685,7 @@ class Battle:
         troops.sort(key=lambda c: order[troop_role(c["name"])])   # estable: dentro de cada grupo, la barra
         # tanteo desactivado por defecto (13-nov: 9 ataques con tanteo 1,1★ de media frente a 1,58★ sin él; las
         # tropas de tanteo salen sueltas y antes que el resto)
-        legal = self.probe(troops) if CFG.get("probe") else []
+        legal = self.probe(troops) if opt("probe") else []
         if len(legal) >= 2:
             self.variants.insert(0, ("probado", legal))
             self.good = legal
@@ -1592,7 +1718,7 @@ class Battle:
             if ok:
                 self.unit_ok = ok
                 key = c["name"] or f"héroe@{c['left']}"
-                self.heroes[key] = time.time() + CFG.get("hero_ability_seconds", 7)
+                self.heroes[key] = time.time() + opt("hero_ability_seconds", 7)
                 self.hero_cards[key] = c
         # 4) asedio: como un héroe (sólo vale con su barra de vida; sin desplegar, tocar la carta sólo la
         #    selecciona; desplegado, ya no se vuelve a tocar: nunca su habilidad). Castillo: un toque.
@@ -1620,7 +1746,7 @@ class Battle:
         t0, legal, taps = time.time(), [], 0
         # se tantea con lo más barato (13-nov: tanteando con la 1.ª carta, los globos salían sueltos antes que el
         # resto y morían solos; con el tanteo bajaron las estrellas): baratas primero, luego de atrás adelante
-        cheap = CFG.get("probe_troops") or PROBE_TROOPS
+        cheap = opt("probe_troops") or PROBE_TROOPS
         cards = sorted(troops, key=lambda c: (c["name"] not in cheap, -troops.index(c)))
         depths = [0.0, -0.03, -0.06, -0.10, -0.14]
         depths.sort(key=lambda k: k != PROBE.get("k", 0.0))
@@ -1731,7 +1857,7 @@ class Battle:
                 if c["role"] == "hero" and key not in self.heroes and not c.get("retried") and pick(c):
                     c["retried"] = True
                     if place_unit(c, self.unit_points(), f"{key} (no había salido)", 0.3):
-                        self.heroes[key] = time.time() + CFG.get("hero_ability_seconds", 7)
+                        self.heroes[key] = time.time() + opt("hero_ability_seconds", 7)
                         self.hero_cards[key] = c
             for c in self.cards:
                 if c["role"] == "troop" and pick(c):
@@ -1892,7 +2018,7 @@ def dynamic_attack(acc, shot, loot):
     b.outer = outer
     b.acc = acc
     b.deploy()
-    fight(b, stall_seconds=CFG.get("stall_seconds", 15))
+    fight(b, stall_seconds=opt("stall_seconds", 15))
 
 
 # ---------------- evento de tropa en masa (p. ej. «M.O.M.M.A en masa») ----------------
@@ -1904,7 +2030,7 @@ MASS_ORDER = (3, 1, 5, 0, 6, 2, 4)            # dentro de cada lado, primero el 
 
 
 def mass_on():
-    return bool(CFG.get("mass_event")) and MASS["until"] > time.time()
+    return bool(opt("mass_event")) and MASS["until"] > time.time()
 
 
 def mass_event_card(img):
@@ -1912,14 +2038,14 @@ def mass_event_card(img):
     9-nov-2026 salió en la 4.ª casilla, fondo azul, «x25», en cualquier sitio de la barra) o, si no, la primera
     carta con el fondo gris."""
     bar = read_bar(img)
-    names = set(CFG.get("mass_cards", ["momma"]))
+    names = set(opt("mass_cards", ["momma"]))
     for c in bar:
         if c["kind"] != "used" and vision.card_identity(img, c["left"])[0] in names:
             return c
     if not bar or bar[0]["left"] > 400:
         return None
     c = bar[0]
-    cols = [color(img, c["left"] + dx, y, 3) for dx, y in CFG.get("mass_card_points", ((10, 905), (10, 1010), (122, 905)))]
+    cols = [color(img, c["left"] + dx, y, 3) for dx, y in opt("mass_card_points", ((10, 905), (10, 1010), (122, 905)))]
     grey = all(max(k) - min(k) < 30 and 70 < sum(k) / 3 < 235 for k in cols)
     return c if grey else None
 
@@ -1974,7 +2100,7 @@ def mass_tip_taps(total=25):
     extremo; los toques que sobran no hacen nada («Selecciona una unidad diferente»)."""
     per = -(-total // len(MASS_TIPS))
     out = []
-    for ins in CFG.get("mass_tip_insets", MASS_TIP_INSETS):
+    for ins in opt("mass_tip_insets", MASS_TIP_INSETS):
         for pts in MASS_TIPS.values():
             ring = [(x + (960 - x) * ins, y + (470 - y) * ins) for x, y in pts]
             ring = [q for q in ring if _safe(*q)]
@@ -1990,7 +2116,7 @@ def mass_rings(n_angles=32, offset=0.0):
     raw = _border_samples(MAP_BORDER) + _border_samples(MAP_BORDER_LOW)
     base = [raw[int((i + offset) * len(raw) / n_angles) % len(raw)] for i in range(n_angles)]
     rings = []
-    for ins in CFG.get("mass_insets", MASS_INSETS):
+    for ins in opt("mass_insets", MASS_INSETS):
         ring = [(x + (960 - x) * ins, y + (470 - y) * ins) for x, y in base]
         rings.append([q for q in ring if _safe(*q)])
     return rings
@@ -2016,7 +2142,7 @@ def mass_points(img, n, inset=None):
     (esquinas izquierda y derecha incluidas): ahí siempre se puede desplegar. Lo pidió el usuario: el contorno
     de la aldea por colores fallaba en aldeas grandes y los toques caían en la zona roja (seleccionaban
     edificios). Sin modelo."""
-    inset = CFG.get("mass_inset", 0.08) if inset is None else inset
+    inset = opt("mass_inset", 0.08) if inset is None else inset
     raw = _border_samples(MAP_BORDER) + _border_samples(MAP_BORDER_LOW)
     pts = [(x + (960 - x) * inset, y + (470 - y) * inset) for x, y in raw]
     pts = [q for q in pts if _safe(*q)]
@@ -2037,7 +2163,7 @@ def mass_attack(acc, c):
     lum0 = _card_lum(img, c)
     used, why = 0, "quedan tropas"
     # sin pensar: todas las puntas de golpe y una sola comprobación al final
-    pts = mass_tip_taps(int(CFG.get("mass_count", 25)))
+    pts = mass_tip_taps(int(opt("mass_count", 25)))
     # en tandas de 30 toques (cada toque de Android tarda ~0,14 s: 195 de golpe pasaban de los 30 s de adb y
     # rompían la batalla). La 1.ª tanda = la punta más extrema de las 6; casi siempre basta con ella.
     done = False
@@ -2074,7 +2200,7 @@ def mass_attack(acc, c):
     log("think", f"Evento: puntas + {used} anillo(s) de reserva ({why}).")
     snap("despliegue")
     # desde el borde tardan en llegar y hay ratos sin daño mientras andan: 30 s quietos antes de rendirse
-    wait_battle_end(stall_seconds=CFG.get("mass_stall_seconds", 30), max_seconds=200, poll=1)
+    wait_battle_end(stall_seconds=opt("mass_stall_seconds", 30), max_seconds=200, poll=1)
     res_img = dev.shot()
     res_img.save(REVIEW / "resultado.png")
     if screen(res_img)[0] == "result":
@@ -2116,7 +2242,8 @@ def log_reads():
 def attack(acc):
     """Busca un rival que cumpla el criterio, ataca, espera y apunta el botín. True si atacó."""
     log_reads()
-    rule = CFG["accounts"][acc]["min_loot"]
+    rule = loot_rule(acc)
+    searches = max(1, int(opt("max_searches", 25, acc)))
     if not main_village():
         return False
     mass = mass_on()                     # evento en masa: nada de leer almacenes ni elegir botín
@@ -2127,7 +2254,7 @@ def attack(acc):
             log("warn", f"No he podido recoger recursos: {e}")
         MASS["collected"] = time.time()
     full = ()
-    cap = CFG["accounts"][acc]["capacity"]
+    cap = CFG["accounts"][acc].get("capacity")
     if cap and not mass:
         shot = dev.shot()
         res = eyes.my_resources(shot)
@@ -2165,7 +2292,7 @@ def attack(acc):
         if screen()[0] != "search" and is_green(color(dev.shot(), 1820, 990, 4)):
             tap(1695, 962, "Atacar (confirmar ejército)", 8)
     loot = None
-    for n in range(CFG["accounts"][acc]["max_searches"]):
+    for n in range(searches):
         check_stop()
         kind, img = screen()
         waited = 0                    # las nubes entre bases a veces tardan; y «Buscando rivales…», más
@@ -2180,7 +2307,7 @@ def attack(acc):
                 log("warn", "No estoy en la búsqueda; vuelvo a casa (captura en no_busqueda.png).")
                 go_home()
                 return False
-        if n == 0 and CFG.get("mass_event"):
+        if n == 0 and opt("mass_event"):
             c = mass_event_card(img)
             for _ in range(3 if not c else 0):  # la barra a veces aún está apareciendo: se mira otra vez
                 time.sleep(0.8)
@@ -2203,7 +2330,7 @@ def attack(acc):
                 else:
                     log("think", f"No veo la carta del evento ({MASS['miss']}/3): ataque normal esta vez.")
         loot = eyes.loot_available(img)
-        ok = good_target(loot, rule, full) or n == CFG["accounts"][acc]["max_searches"] - 1
+        ok = good_target(loot, rule, full) or n == searches - 1
         log("think", f"Rival: {loot['gold']} oro / {loot['elixir']} elixir / {loot['dark']} oscuro → "
                      f"{'ATACO' if ok else 'siguiente'}")
         if ok:
@@ -3226,7 +3353,7 @@ def upgrade_walls(acc, res=None):
             log("think", f"{acc}: muros de nivel {lvl} a {prices.get('gold')} (oro) / {prices.get('elixir')} "
                          f"(elixir); con {res.get('gold')} oro y {res.get('elixir')} elixir no llega para ninguno.")
             break
-        if (cheap["count"] or 1) <= CFG.get("walls_one_by_one", 10):
+        if (cheap["count"] or 1) <= opt("walls_one_by_one", 10, acc):
             # quedan pocos de este nivel y van sueltos por la aldea: «Mejorar más» no los junta y los «+1»
             # caían en la aldea (2026-11-09). De uno en uno, con la ventana normal de un muro.
             n = 1
@@ -3320,13 +3447,14 @@ def walls_rich(acc):
 
 def queue_next_walls(acc):
     """Los muros de `acc` ya están al máximo: activa el siguiente paso de muros que esté en cola (queue)."""
-    p = HERE / "config.json"
-    c = json.loads(p.read_text(encoding="utf-8"))
-    for st in c["routine"]:
-        if st.get("task") == "walls" and st.get("queue") and st.get("enabled") is False and st["account"] != acc:
+    c = settings.read_raw()
+    for st in c.get("routine") or []:
+        if not isinstance(st, dict):
+            continue
+        if st.get("task") == "walls" and st.get("queue") and st.get("enabled") is False and st.get("account") != acc:
             st["enabled"] = True
             st.pop("queue", None)
-            p.write_text(json.dumps(c, indent=2, ensure_ascii=False), encoding="utf-8")
+            settings.write_raw(c)
             reload_config()
             log("done", f"Muros de {acc} al máximo: activo los muros de {st['account']} (estaba en cola).")
             return st["account"]
@@ -3342,7 +3470,7 @@ def walls_task(acc):
     constructor libre). Acaba cuando ya no queda ningún muro por mejorar en este ayuntamiento ("max"); antes
     sólo si los almacenes están llenos y no hay constructor ("full": se vuelve tras el descanso)."""
     a = CFG["accounts"][acc]
-    if a.get("walls_done") and time.time() - a.get("walls_checked", 0) < CFG.get("walls_recheck_hours", 72) * 3600:
+    if a.get("walls_done") and time.time() - a.get("walls_checked", 0) < opt("walls_recheck_hours", 72, acc) * 3600:
         return "max"                           # se vuelve a mirar cada 12 h (por si sube el ayuntamiento)
     for n in itertools.count():               # sin tope: hasta que no quede ningún muro (o no se pueda seguir)
         check_stop()
@@ -3356,7 +3484,7 @@ def walls_task(acc):
             # entonces se gasta todo lo que dé; entre medias, sólo la barra por píxeles (gratis): si una
             # está al tope se gasta ya, para no perder botín.
             shot = dev.shot()
-            if any(bar_full(shot, k) for k in ("gold", "elixir")) or n % CFG.get("mass_walls_every", 20) == 0:
+            if any(bar_full(shot, k) for k in ("gold", "elixir")) or n % opt("mass_walls_every", 20, acc) == 0:
                 rich, res = walls_rich(acc)
                 cap = a.get("capacity") or {}
                 rich = rich or any((res.get(k) or 0) >= (cap.get(k) or 1e18) * 0.3 for k in ("gold", "elixir"))
@@ -3364,7 +3492,7 @@ def walls_task(acc):
                 rich, res = False, {}
         else:
             rich, res = walls_rich(acc)
-        busy = time.time() - WALLS_BUSY.get(acc, 0) < 900   # sin constructor hace <15 min: ni se mira
+        busy = time.time() - WALLS_BUSY.get(acc, 0) < opt("walls_busy_minutes", 15, acc) * 60   # sin constructor hace poco: ni se mira
         if (rich or n == 0 and a.get("walls_done") or WALLS_MAX.get(acc)) and not busy:
             r = upgrade_walls(acc, res)
             if r == "busy":
@@ -3400,19 +3528,44 @@ def walls_task(acc):
 
 def save_account_field(acc, key, value):
     """Guarda un dato de la cuenta en config.json (sobrevive a reinicios)."""
-    p = HERE / "config.json"
-    c = json.loads(p.read_text(encoding="utf-8"))
-    c["accounts"][acc][key] = value
-    p.write_text(json.dumps(c, indent=2, ensure_ascii=False), encoding="utf-8")
+    c = settings.read_raw()
+    c["accounts"].setdefault(acc, {})[key] = value
+    settings.write_raw(c)
 
 
 # ---------------- rutina ----------------
 def reload_config():
     """Relee config.json: los cambios de umbrales se aplican sin reiniciar el asistente."""
     try:
-        CFG.update(json.loads((HERE / "config.json").read_text(encoding="utf-8")))
+        raw = json.loads(settings.CONFIG.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        log("warn", f"config.json no válido, sigo con el anterior: {e}")
+        report_config([f"config.json no válido, sigo con el anterior: {e}"])
+        return
+    cfg, problems = settings.normalize(raw)
+    CFG.update(cfg)
+    for k in set(CFG) - set(cfg):
+        del CFG[k]
+    report_config(problems + apply_advanced())
+
+
+CONFIG_SAID = set()
+
+
+def report_config(problems):
+    """Avisa en el diario de lo que esté mal en config.json: cada cosa una vez, y de nuevo si reaparece."""
+    for msg in problems:
+        if msg not in CONFIG_SAID:
+            log("warn", "Configuración: " + msg)
+    CONFIG_SAID.clear()
+    CONFIG_SAID.update(problems)
+
+
+def apply_advanced():
+    """Constantes internas cambiadas desde «advanced» en config.json (sin tocar el código)."""
+    mods = {"asistente": sys.modules[__name__], "vision": vision, "device": sys.modules["device"]}
+    if ocr_mod is not None:
+        mods["ocr"] = ocr_mod
+    return settings.apply_overrides(CFG.get("advanced"), mods)
 
 
 def run_step(step):
@@ -3423,7 +3576,7 @@ def run_step(step):
         log("think", f"Me salto {acc}: la está usando el dueño.")
         return "skip"
     a = CFG["accounts"].get(acc, {})
-    if task == "walls" and a.get("walls_done") and time.time() - a.get("walls_checked", 0) < CFG.get("walls_recheck_hours", 72) * 3600:
+    if task == "walls" and a.get("walls_done") and time.time() - a.get("walls_checked", 0) < opt("walls_recheck_hours", 72, acc) * 3600:
         return "max"                              # muros ya al máximo: ni se cambia de cuenta
     if not switch_to(acc):
         if not paused():
@@ -3459,8 +3612,8 @@ def run_step(step):
         check_stop()                              # recién acabada la batalla: buen momento para obedecer
         clan_duties()
         dry = 0 if LAST_GAIN.get("mass") else (
-            dry + 1 if sum(LAST_GAIN.get(k) or 0 for k in ("gold", "elixir", "dark")) < 3000 else 0)
-        if dry >= 2:                              # uno malo suelto no para nada; dos seguidos = ya no cabe
+            dry + 1 if sum(LAST_GAIN.get(k) or 0 for k in ("gold", "elixir", "dark")) < opt("dry_attack_loot", 3000, acc) else 0)
+        if dry >= opt("dry_attacks_stop", 2, acc):                              # uno malo suelto no para nada; dos seguidos = ya no cabe
             log("done", f"{acc}: dos ataques seguidos sin sumar nada (almacenes llenos). Paso a lo siguiente.")
             return "full"
 
@@ -3517,7 +3670,7 @@ def cycle(start=0, forced=None):
         log("warn", "No hay ningún paso activo en la rutina: no hago nada (actívalo en el visor).")
         rest = max(rest, 10)
     if real and all(r in ("full", "skip", "max") for r in real):
-        rest = CFG.get("rest_minutes_when_full", 30)
+        rest = opt("rest_minutes_when_full", 30)
         log("think", "Todas las cuentas llenas (o en uso por el dueño): descanso largo.")
     log("think", f"Rutina completa. Descanso {rest} min y vuelvo a empezar.")
     t_end = time.time() + rest * 60
@@ -3526,7 +3679,7 @@ def cycle(start=0, forced=None):
     home = CFG.get("home_account")
     if home and blocked_until.get(home, 0) > time.time():
         home = None                      # su cuenta la usa el dueño: no se vuelve a ella
-    every = CFG.get("donation_check_minutes", 4) * 60
+    every = opt("donation_check_minutes", 4) * 60
     if home:
         try:
             switch_to(home)
@@ -3554,8 +3707,37 @@ def cycle(start=0, forced=None):
         time.sleep(2)
 
 
+def wait_for_config():
+    """Sin cuentas o sin ningún paso válido no hay nada que hacer: lo dice y espera a que se arregle
+    config.json (lo relee solo), en vez de caerse y que el vigilante lo relance sin parar."""
+    report_config(CFG_PROBLEMS + apply_advanced())
+    beat = 0
+    while not CFG["accounts"] or not CFG["routine"]:
+        check_stop(redirect=False)
+        if time.time() - beat >= 300:
+            beat = time.time()
+            log("warn", "No puedo empezar: en config.json no hay "
+                        + ("ninguna cuenta" if not CFG["accounts"] else "ningún paso válido en la rutina")
+                        + ". Corrígelo y sigo solo (no hace falta reiniciar).")
+        time.sleep(5)
+        reload_config()
+
+
+def check_screen():
+    """Mira la resolución del emulador con una captura y avisa si hay que adaptarla o no sirve."""
+    try:
+        dev.shot()
+    except Exception:
+        return                                   # el emulador aún no responde: ya se verá al usarlo
+    msg = dev.screen_problem()
+    if msg:
+        log("warn", msg)
+
+
 def main():
+    wait_for_config()
     dev.connect()
+    check_screen()
     log("think", "Asistente en marcha: rutina " + " → ".join(f"{s['account']} ({s['task']})" for s in CFG["routine"]) + ".")
     start = 0                                    # EMPEZAR_EN (un número): la 1ª vuelta empieza en ese paso
     try:
@@ -3579,16 +3761,15 @@ def main():
             # mientras aún quedaban muros (13-nov)
             if r.step.get("enabled") is False:
                 try:
-                    p = HERE / "config.json"
-                    c = json.loads(p.read_text(encoding="utf-8"))
+                    c = settings.read_raw()
                     st = c["routine"][r.index]
                     if st["account"] == r.step["account"] and st["task"] == r.step["task"]:
                         st.pop("enabled", None)
                         st.pop("queue", None)
-                        p.write_text(json.dumps(c, indent=2, ensure_ascii=False), encoding="utf-8")
+                        settings.write_raw(c)
                         reload_config()
                         log("think", "Ese paso estaba desactivado: lo dejo activado para que siga tras un reinicio.")
-                except (OSError, ValueError, KeyError, IndexError) as e:
+                except (OSError, ValueError, KeyError, IndexError, TypeError) as e:
                     log("warn", f"No he podido activar el paso: {e}")
 
 
