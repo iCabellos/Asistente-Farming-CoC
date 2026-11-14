@@ -10,6 +10,7 @@ Se arranca con  arrancar.bat.
 import json
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -19,18 +20,22 @@ import psutil
 ROOT = Path(__file__).parent
 ASIS = ROOT / "asistente"
 PYW = str(ROOT / ".venv" / "Scripts" / "pythonw.exe")
-try:
-    _CFG = json.loads((ASIS / "config.json").read_text(encoding="utf-8"))
-except (OSError, ValueError):
-    _CFG = {}
+sys.path.insert(0, str(ASIS))
+import settings                                   # noqa: E402  (config.json con sus valores por defecto)
+
+_CFG = settings.load()[0]
 OLLAMA = (_CFG.get("ollama_exe") or shutil.which("ollama")
           or str(Path.home() / "AppData" / "Local" / "Programs" / "Ollama" / "ollama.exe"))
-PLAYER = _CFG.get("bluestacks_player") or str(Path("C:/Program Files/BlueStacks_nxt/HD-Player.exe"))
-INSTANCE = _CFG.get("bluestacks_instance", "Pie64")
-MODEL = _CFG.get("model", "qwen2.5vl:7b")
+OLLAMA_URL = str(_CFG["ollama"]).rstrip("/")
+PLAYER = str(_CFG["bluestacks_player"])
+PLAYER_ARGS = [str(a) for a in _CFG["emulator_args"]]
+PLAYER_PROCESS = str(_CFG["emulator_process"])
+BOOT_SECONDS = _CFG["emulator_boot_seconds"]
+MODEL = _CFG["model"]
+MAX_RAM_GB = _CFG["model_max_ram_gb"]
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-STALL_SECONDS = 600
+STALL_SECONDS = int(_CFG["stall_minutes"] * 60)
 
 
 def log(kind, text):
@@ -81,15 +86,15 @@ def by_name(name):
 
 
 def ensure_emulator():
-    if not by_name("HD-Player.exe") and Path(PLAYER).exists():
-        subprocess.Popen([PLAYER, "--instance", INSTANCE], creationflags=DETACHED)
-        log("warn", "Vigilante: BlueStacks no estaba abierto; lo arranco.")
-        time.sleep(60)
+    if not by_name(PLAYER_PROCESS) and Path(PLAYER).exists():
+        subprocess.Popen([PLAYER, *PLAYER_ARGS], creationflags=DETACHED)
+        log("warn", "Vigilante: el emulador no estaba abierto; lo arranco.")
+        time.sleep(BOOT_SECONDS)
 
 
 def ensure_ollama():
     try:
-        httpx.get("http://127.0.0.1:11434/api/tags", timeout=5)
+        httpx.get(f"{OLLAMA_URL}/api/tags", timeout=5)
     except httpx.HTTPError:
         subprocess.Popen([OLLAMA, "serve"], creationflags=DETACHED | NO_WINDOW,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -116,7 +121,7 @@ def main():
                 stalled = procesos and out.exists() and time.time() - out.stat().st_mtime > STALL_SECONDS
                 if stalled:
                     kill(procesos)
-                    log("warn", "Vigilante: el asistente llevaba 10 min sin hacer nada; lo reinicio.")
+                    log("warn", f"Vigilante: el asistente llevaba {STALL_SECONDS // 60} min sin hacer nada; lo reinicio.")
                     procesos = []
                 if len(procesos) > 1:
                     kill(procesos[1:])
@@ -126,10 +131,10 @@ def main():
                     log("warn", "Vigilante: asistente lanzado.")
             else:
                 kill(procs("asistente.py")) if (ASIS / "STOP").exists() and time.time() - (ASIS / "STOP").stat().st_mtime > 120 else None
-            if llama_gb() > 9:
-                httpx.post("http://127.0.0.1:11434/api/generate",
+            if llama_gb() > MAX_RAM_GB:
+                httpx.post(f"{OLLAMA_URL}/api/generate",
                            json={"model": MODEL, "keep_alive": 0}, timeout=30)
-                log("warn", "Vigilante: el LLM ocupaba más de 9 GB; descargado para liberar memoria.")
+                log("warn", f"Vigilante: el LLM ocupaba más de {MAX_RAM_GB} GB; descargado para liberar memoria.")
         except Exception as e:
             log("warn", f"Vigilante: {e}")
         time.sleep(20)

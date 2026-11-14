@@ -61,9 +61,36 @@ def pinch_commands(t):
     return cmds + [f"sendevent {d} 0 2 0", f"sendevent {d} 0 0 0"]
 
 
+BASE = (1920, 1080)        # tamaño de pantalla para el que están medidas todas las coordenadas del asistente
+
+
 class Device:
-    def __init__(self, adb, serial):
-        self.adb, self.serial = adb, serial
+    """El resto del asistente trabaja SIEMPRE en 1920x1080: si el emulador tiene otra resolución (misma
+    proporción 16:9), las capturas se pasan a ese tamaño y los toques se devuelven a la escala real."""
+
+    def __init__(self, adb, serial, package="com.supercell.clashofclans"):
+        self.adb, self.serial, self.package = adb, serial, package
+        self.real, self.sx, self.sy = None, 1.0, 1.0
+
+    def _fit(self, img):
+        if img.size != self.real:
+            self.real = img.size
+            self.sx, self.sy = img.width / BASE[0], img.height / BASE[1]
+        return img if img.size == BASE else img.resize(BASE, Image.LANCZOS)
+
+    def screen_problem(self):
+        """Aviso sobre la resolución del emulador (tras la primera captura), o None si es 1920x1080."""
+        if not self.real or self.real == BASE:
+            return None
+        w, h = self.real
+        if abs(w / h - BASE[0] / BASE[1]) > 0.02:
+            return (f"El emulador está a {w}x{h}, que no es 16:9: el asistente no puede trabajar así. "
+                    f"Ponlo a 1920x1080 (apaisado) en los ajustes del emulador.")
+        return (f"El emulador está a {w}x{h}: adapto capturas y toques a 1920x1080. Funciona, pero las "
+                f"lecturas son más fiables si lo pones a 1920x1080.")
+
+    def _xy(self, x, y):
+        return int(x * self.sx), int(y * self.sy)
 
     def _run(self, *args, binary=False, timeout=30):
         r = subprocess.run([self.adb, "-s", self.serial, *map(str, args)], capture_output=True,
@@ -81,13 +108,13 @@ class Device:
                 w, h = int.from_bytes(d[0:4], "little"), int.from_bytes(d[4:8], "little")
                 off = len(d) - w * h * 4
                 if 0 < w <= 4096 and 0 < h <= 4096 and 12 <= off <= 16 and int.from_bytes(d[8:12], "little") == 1:
-                    return Image.frombuffer("RGBA", (w, h), d[off:], "raw", "RGBA", 0, 1).convert("RGB")
+                    return self._fit(Image.frombuffer("RGBA", (w, h), d[off:], "raw", "RGBA", 0, 1).convert("RGB"))
         except Exception:
             pass
         for _ in range(3):
             data = self._run("exec-out", "screencap", "-p", binary=True)
             if data:
-                return Image.open(io.BytesIO(data)).convert("RGB")
+                return self._fit(Image.open(io.BytesIO(data)).convert("RGB"))
             self.connect()
             time.sleep(2)
         raise RuntimeError("no hay captura del emulador")
@@ -96,16 +123,18 @@ class Device:
         return self._run("shell", cmd)
 
     def tap(self, x, y, wait=0.0):
-        self.shell(f"input tap {int(x)} {int(y)}")
+        x, y = self._xy(x, y)
+        self.shell(f"input tap {x} {y}")
         if wait:
             time.sleep(wait)
 
     def taps(self, pts):
         if pts:
-            self.shell(" ; ".join(f"input tap {int(x)} {int(y)}" for x, y in pts))
+            self.shell(" ; ".join("input tap %d %d" % self._xy(x, y) for x, y in pts))
 
     def swipe(self, x1, y1, x2, y2, ms=500, wait=0.0):
-        self.shell(f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {ms}")
+        (x1, y1), (x2, y2) = self._xy(x1, y1), self._xy(x2, y2)
+        self.shell(f"input swipe {x1} {y1} {x2} {y2} {ms}")
         if wait:
             time.sleep(wait)
 
@@ -127,7 +156,13 @@ class Device:
         time.sleep(0.8)
 
     def launch_game(self):
-        self.shell("monkey -p com.supercell.clashofclans -c android.intent.category.LAUNCHER 1")
+        self.shell(f"monkey -p {self.package} -c android.intent.category.LAUNCHER 1")
+
+    def stop_game(self):
+        self.shell(f"am force-stop {self.package}")
+
+    def game_in_front(self):
+        return self.package.rsplit(".", 1)[-1] in self.foreground()
 
     def foreground(self):
         out = self.shell("dumpsys window")
