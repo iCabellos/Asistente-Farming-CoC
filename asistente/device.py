@@ -74,6 +74,16 @@ class Device:
         subprocess.run([self.adb, "connect", self.serial], capture_output=True, timeout=10, creationflags=NO_WINDOW)
 
     def shot(self) -> Image.Image:
+        # en crudo (RGBA sin comprimir): ~0,22 s en vez de ~0,7 s con PNG; si algo no cuadra, PNG como antes
+        try:
+            d = self._run("exec-out", "screencap", binary=True)
+            if d and len(d) > 16:
+                w, h = int.from_bytes(d[0:4], "little"), int.from_bytes(d[4:8], "little")
+                off = len(d) - w * h * 4
+                if 0 < w <= 4096 and 0 < h <= 4096 and 12 <= off <= 16 and int.from_bytes(d[8:12], "little") == 1:
+                    return Image.frombuffer("RGBA", (w, h), d[off:], "raw", "RGBA", 0, 1).convert("RGB")
+        except Exception:
+            pass
         for _ in range(3):
             data = self._run("exec-out", "screencap", "-p", binary=True)
             if data:

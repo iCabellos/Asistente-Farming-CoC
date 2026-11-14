@@ -70,7 +70,8 @@ ASISTENTE_DIR = ROOT / "asistente"
 
 CONFIG = ASISTENTE_DIR / "config.json"
 TASKS = {"fill_storages": "Llenar almacenes", "farm": "Farmear", "builder_base": "Llenar aldea nocturna",
-         "build": "Mejorar lo recomendado"}
+         "build": "Mejorar lo recomendado", "walls": "Mejorar muros"}
+ATTACKS = {"farm": (6, 20)}   # sólo «farmear» lleva número; las demás siguen hasta cumplir su objetivo
 
 
 def routine_info():
@@ -88,7 +89,35 @@ def routine_info():
             "storage": storage,
             "labels": {n: a.get("label", n) for n, a in cfg.get("accounts", {}).items()},
             "state": st, "running": (ASISTENTE_DIR / "ENABLED").exists(), "now": time.time(),
-            "paused_owner": _pause_until() > time.time()}
+            "paused_owner": _pause_until() > time.time(), "goto": _pending_goto()}
+
+
+def _pending_goto():
+    """Orden «hacer este paso ya» que el asistente aún no ha recogido (fichero IR_A), o None."""
+    try:
+        return json.loads((ASISTENTE_DIR / "IR_A").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def goto_step(order):
+    """Deja la orden de saltar al paso `index` de la rutina; el asistente la atiende en su siguiente punto
+    seguro (nunca con tropas desplegadas). Si estaba detenido, lo arranca empezando por ese paso."""
+    routine = json.loads(CONFIG.read_text(encoding="utf-8")).get("routine", [])
+    i = order.get("index")
+    if not isinstance(i, int) or not 0 <= i < len(routine):
+        raise ValueError("paso no válido")
+    step = routine[i]
+    if (order.get("account"), order.get("task")) != (step["account"], step["task"]):
+        raise ValueError("la rutina ha cambiado: recarga el visor")
+    data = json.dumps({"index": i, "account": step["account"], "task": step["task"], "ts": time.time()})
+    tmp = ASISTENTE_DIR / "IR_A.tmp"
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(ASISTENTE_DIR / "IR_A")
+    (ASISTENTE_DIR / "SKIP_REST").unlink(missing_ok=True)     # la orden ya interrumpe el descanso
+    if not (ASISTENTE_DIR / "ENABLED").exists():
+        (ASISTENTE_DIR / "STOP").unlink(missing_ok=True)
+        (ASISTENTE_DIR / "ENABLED").touch()                    # el vigilante lo lanza y recoge la orden
 
 
 def _pause_until():
@@ -121,10 +150,13 @@ def save_routine(routine):
         if acc not in cfg["accounts"] or task not in TASKS:
             raise ValueError(f"paso no válido: {s}")
         step = {"account": acc, "task": task}
-        if task in ("farm", "builder_base"):
-            step["attacks"] = max(1, min(20, int(s.get("attacks") or (10 if task == "builder_base" else 6))))
+        if task in ATTACKS:
+            default, top = ATTACKS[task]
+            step["attacks"] = max(1, min(top, int(s.get("attacks") or default)))
         if s.get("enabled") is False:
             step["enabled"] = False
+            if task == "walls" and s.get("queue"):
+                step["queue"] = True                     # se activa sola al acabar los muros del paso anterior
         clean.append(step)
     if not clean:
         raise ValueError("la rutina no puede quedar vacía")
@@ -166,6 +198,17 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/asistente/skip_rest":
             (ASISTENTE_DIR / "SKIP_REST").touch()
             return self.send_json(routine_info())
+        if u.path == "/asistente/skip_pause":
+            # el asistente ve que falta PAUSA_DUENO y vuelve a la rutina (lo mira cada 2 s)
+            (ASISTENTE_DIR / "PAUSA_DUENO").unlink(missing_ok=True)
+            return self.send_json(routine_info())
+        if u.path == "/asistente/goto":
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                goto_step(json.loads(self.rfile.read(n) or b"{}"))
+                return self.send_json(routine_info())
+            except (ValueError, TypeError, AttributeError, json.JSONDecodeError) as e:
+                return self.send_json({"error": str(e)}, 400)
         if u.path == "/asistente/start":
             (ASISTENTE_DIR / "STOP").unlink(missing_ok=True)
             (ASISTENTE_DIR / "ENABLED").touch()          # el vigilante lo arranca y lo mantiene vivo

@@ -33,3 +33,17 @@ loot.jsonl
 .vercel
 .env*
 !.env.example
+asistente/capturas_control/
+
+# dudas del lector de cifras y pruebas de plantillas (se generan solas)
+asistente/ocr_fallos/
+asistente/tpl/pendiente/
+asistente/tpl/oro_auto_*
+asistente/IR_A
+asistente/EMPEZAR_EN
+
+# imágenes de referencia de la wiki: se bajan con asistente/ref_descargar.py
+asistente/ref/
+
+# plantillas con el nombre de tus cuentas en Supercell ID (personales)
+asistente/tpl/sid_*.png

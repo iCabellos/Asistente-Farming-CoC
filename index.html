@@ -37,6 +37,8 @@
   .routine .form-control { width:3.6rem; padding:.2rem .4rem; font-size:.8rem }
   .routine .current { background:rgba(245,184,46,.08); box-shadow:inset 3px 0 0 var(--c-gold) }
   .routine .disabled-step { opacity:.45 }
+  .routine .btn-list { gap:0 } .routine .btn-list .btn-icon { padding:.2rem; min-width:0 }
+  .routine .goto-step { background:rgba(66,153,225,.10); box-shadow:inset 3px 0 0 var(--tblr-azure) }
   .routine .sortable-ghost { opacity:.35 } .routine .sortable-chosen { background:rgba(66,153,225,.12) }
   .spin { display:inline-block; animation:spin 1.6s linear infinite } @keyframes spin { to { transform:rotate(360deg) } }
   /* almacenes */
@@ -77,7 +79,7 @@
       </div>
       <div class="d-flex align-items-center gap-2 ms-auto">
         <button class="btn btn-icon btn-ghost-secondary" id="btnTheme" aria-label="Cambiar tema"><i class="ti ti-sun" id="themeIcon"></i></button>
-        <button class="btn btn-ghost-secondary" id="btnSkip" title="Saltar el descanso y empezar la rutina ya"><i class="ti ti-player-skip-forward me-1"></i>Empezar ya</button>
+        <button class="btn btn-ghost-secondary d-none" id="btnSkip"></button>
         <button class="btn btn-primary" id="btnToggle" disabled><i class="ti ti-player-play me-1"></i>Iniciar</button>
       </div>
     </div>
@@ -208,7 +210,9 @@ function paintStatus() {
   const st = R.state || {}, now = Date.now() / 1000, b = $('statusBadge');
   let cls = 'off', txt = 'Detenido', ph = 'Detenido', phc = 'bg-secondary-lt', detail = '';
   if (R.running) {
-    if (R.paused_owner || st.phase === 'pause') { cls = 'pause'; txt = 'En pausa'; ph = 'Pausa'; phc = 'bg-yellow-lt';
+    if (R.goto) { cls = 'run'; txt = 'Cambiando de paso'; ph = `Ir al paso ${R.goto.index + 1}`; phc = 'bg-azure-lt';
+      detail = `Voy al paso <b>${R.goto.index + 1}</b> (${esc(label(R.goto.account))} · ${esc(R.tasks[R.goto.task] || '')}) en cuanto acabe la acción en curso`; }
+    else if (R.paused_owner || st.phase === 'pause') { cls = 'pause'; txt = 'En pausa'; ph = 'Pausa'; phc = 'bg-yellow-lt';
       detail = `Estás jugando: se aparta · sigue en <b>${fmtMin((st.pause_until || now) - now)}</b>`; }
     else if (st.phase === 'rest') { cls = 'rest'; txt = 'Descansando'; ph = 'Descanso'; phc = 'bg-azure-lt';
       detail = `Revisa donaciones · siguiente vuelta en <b>${fmtMin((st.rest_until || now) - now)}</b>`; }
@@ -218,6 +222,13 @@ function paintStatus() {
   b.innerHTML = `<span class="status-dot ${cls}"></span><span>${txt}</span>`;
   $('phaseBadge').className = 'badge ' + phc; $('phaseBadge').textContent = ph;
   $('phaseText').innerHTML = detail || 'Arrastra las tareas para cambiar la prioridad.';
+  const sk = $('btnSkip'), mode = !R.running || R.goto ? '' : (R.paused_owner || st.phase === 'pause') ? 'pause' : st.phase === 'rest' ? 'rest' : '';
+  if (sk.dataset.mode !== mode) {
+    sk.dataset.mode = mode;
+    sk.className = 'btn ' + (mode === 'pause' ? 'btn-warning' : 'btn-ghost-secondary') + (mode ? '' : ' d-none');
+    sk.innerHTML = mode === 'pause' ? '<i class="ti ti-player-skip-forward me-1"></i>Ya no juego' : '<i class="ti ti-player-skip-forward me-1"></i>Empezar ya';
+    sk.title = mode === 'pause' ? 'Saltar la pausa de «estás jugando»: vuelve a la rutina ya' : 'Saltar el descanso y empezar la rutina ya';
+  }
   const bt = $('btnToggle'); bt.disabled = false;
   bt.className = 'btn ' + (R.running ? 'btn-outline-danger' : 'btn-primary');
   bt.innerHTML = R.running ? '<i class="ti ti-player-stop me-1"></i>Detener' : '<i class="ti ti-player-play me-1"></i>Iniciar';
@@ -225,18 +236,26 @@ function paintStatus() {
 $('btnToggle').onclick = () => api(R.running ? 'asistente/stop' : 'asistente/start', {}).then(j => {
   R.running = j.running; paintStatus(); renderRoutine(); toast(j.running ? 'Asistente iniciado' : 'Asistente detenido: termina lo que está haciendo', j.running ? 'success' : 'secondary');
 }).catch(e => toast(e.message, 'danger'));
-$('btnSkip').onclick = () => api('asistente/skip_rest', {}).then(() => toast('Empieza la rutina en unos segundos', 'info'));
+$('btnSkip').onclick = () => {
+  const pause = $('btnSkip').dataset.mode === 'pause';
+  api(pause ? 'asistente/skip_pause' : 'asistente/skip_rest', {}).then(j => { R = j; renderAll();
+    toast(pause ? 'Pausa saltada: vuelve a la rutina en unos segundos' : 'Empieza la rutina en unos segundos', 'info'); })
+    .catch(e => toast(e.message, 'danger'));
+};
 
 // ============================================================ rutina (SortableJS)
 let draft = null, dirty = false;
 const RES = {ok: ['ti-circle-check text-green', 'Hecho'], full: ['ti-circle-check-filled text-green', 'Almacenes llenos'],
              skip: ['ti-eye-off text-yellow', 'Saltada: la estabas usando tú'], error: ['ti-alert-triangle text-red', 'Falló; se reintenta en la próxima vuelta'],
-             off: ['ti-player-pause text-secondary', 'Desactivada']};
+             off: ['ti-player-pause text-secondary', 'Desactivada'],
+             max: ['ti-trophy text-green', 'Muros al máximo de su ayuntamiento']};
 function stepIcon(i, s) {
+  if (s.enabled === false && s.queue) return ['ti-clock-pause text-azure', 'En cola: se activa sola cuando los muros del paso de muros anterior lleguen al máximo'];
   if (s.enabled === false) return RES.off;
   const st = R.state || {}, res = (st.results || {})[String(i)];
   if (!R.running) return ['ti-circle-dashed text-secondary', 'Asistente detenido'];
   if (dirty) return ['ti-point text-secondary', 'Guarda para ver el estado'];
+  if (R.goto && R.goto.index === i) return ['ti-arrow-big-right-lines text-azure', 'Pedido desde aquí: va en cuanto acabe la acción en curso'];
   if (st.phase === 'run' && st.current === i) return ['ti-settings spin text-yellow', 'Haciéndolo ahora'];
   if (st.phase === 'pause' && st.current === i) return ['ti-player-pause-filled text-yellow', 'En pausa'];
   if (res && RES[res]) return RES[res];
@@ -244,20 +263,24 @@ function stepIcon(i, s) {
 }
 function setDirty(v) { dirty = v; $('btnSave').disabled = !v; $('btnUndo').disabled = !v; $('dirtyText').textContent = v ? 'Cambios sin guardar' : ''; }
 const editList = () => (draft = draft || R.routine.map(s => ({...s})));
+const ATTACKS = {farm: [6, 20, 'Ataques por vuelta']};   // el resto no tiene tope: sigue hasta cumplir su objetivo
 function renderRoutine() {
   const list = draft || R.routine, box = $('routine');
   box.innerHTML = list.map((s, i) => {
     const [ico, tip] = stepIcon(i, s);
-    const cur = !dirty && R.running && R.state.current === i && ['run', 'pause'].includes(R.state.phase);
-    const n = ['farm', 'builder_base'].includes(s.task)
-      ? `<input type="number" class="form-control" min="1" max="20" data-k="attacks" value="${s.attacks || (s.task === 'farm' ? 6 : 10)}" title="${s.task === 'farm' ? 'Ataques máximos por vuelta' : 'Tope de batallas por vuelta'}">` : '';
-    return `<div class="list-group-item ${cur ? 'current' : ''} ${s.enabled === false ? 'disabled-step' : ''}" data-i="${i}">
+    const cur = !dirty && R.running && !R.goto && R.state.current === i && ['run', 'pause'].includes(R.state.phase);
+    const go = !dirty && R.goto && R.goto.index === i;
+    const at = ATTACKS[s.task];
+    const n = at
+      ? `<input type="number" class="form-control" min="1" max="${at[1]}" data-k="attacks" value="${s.attacks || at[0]}" title="${at[2]}">` : '';
+    return `<div class="list-group-item ${cur ? 'current' : ''} ${go ? 'goto-step' : ''} ${s.enabled === false ? 'disabled-step' : ''}" data-i="${i}">
       <i class="ti ti-grip-vertical handle"></i><span class="prio">${i + 1}</span>
       <span class="st" data-bs-toggle="tooltip" title="${esc(tip)}"><i class="ti ${ico}"></i></span>
       <select class="form-select acc" data-k="account">${R.accounts.map(a => `<option value="${esc(a)}"${a === s.account ? ' selected' : ''}>${esc(label(a))}</option>`).join('')}</select>
       <select class="form-select task" data-k="task">${Object.entries(R.tasks).map(([k, v]) => `<option value="${k}"${k === s.task ? ' selected' : ''}>${esc(v)}</option>`).join('')}</select>
       ${n}
       <div class="btn-list flex-nowrap">
+        <button class="btn btn-sm btn-icon btn-ghost-primary" data-a="goto" ${dirty ? 'disabled' : ''} title="Hacer este paso ya: deja lo que esté haciendo (sin cortar una batalla empezada) y sigue la rutina desde aquí"><i class="ti ti-bolt"></i></button>
         <button class="btn btn-sm btn-icon btn-ghost-secondary" data-a="toggle" title="${s.enabled === false ? 'Activar' : 'Desactivar (se salta)'}"><i class="ti ${s.enabled === false ? 'ti-player-play' : 'ti-player-pause'}"></i></button>
         <button class="btn btn-sm btn-icon btn-ghost-danger" data-a="del" title="Quitar"><i class="ti ti-x"></i></button>
       </div></div>`;
@@ -269,11 +292,19 @@ Sortable.create($('routine'), {handle: '.handle', animation: 160, ghostClass: 's
 $('routine').addEventListener('change', e => {
   const it = e.target.closest('[data-i]'), k = e.target.dataset.k; if (!it || !k) return;
   const s = editList()[+it.dataset.i]; s[k] = k === 'attacks' ? +e.target.value : e.target.value;
-  if (k === 'task' && ['farm', 'builder_base'].includes(s.task) && !s.attacks) s.attacks = s.task === 'farm' ? 6 : 10;
+  if (k === 'task' && ATTACKS[s.task] && !s.attacks) s.attacks = ATTACKS[s.task][0];
   setDirty(true); renderRoutine();
 });
 $('routine').addEventListener('click', e => {
   const b = e.target.closest('button[data-a]'), it = e.target.closest('[data-i]'); if (!b || !it) return;
+  if (b.dataset.a === 'goto') {
+    const s = R.routine[+it.dataset.i]; if (dirty || !s) return toast('Guarda o deshaz los cambios primero', 'warning');
+    return api('asistente/goto', {index: +it.dataset.i, account: s.account, task: s.task}).then(j => {
+      const was = R.running; R = j; renderAll();
+      toast(`<i class="ti ti-bolt me-1"></i>Voy al paso ${+it.dataset.i + 1}: ${esc(label(s.account))} · ${esc(R.tasks[s.task] || '')}` +
+            (was ? '' : ' · arrancando el asistente'), 'info');
+    }).catch(e => toast(e.message, 'danger'));
+  }
   const l = editList(), i = +it.dataset.i;
   if (b.dataset.a === 'del') { if (l.length > 1) l.splice(i, 1); }
   else if (l[i].enabled === false) delete l[i].enabled; else l[i].enabled = false;

@@ -6,15 +6,27 @@ Entre batalla y batalla: dona lo que pidan en el clan y pide tropas si es gratis
 Normas: sólo batallas NORMALES, nunca gemas ni martillos, nunca guerra/competitiva; mejoras sólo en
 las cuentas con "auto_build". Si el dueño entra en una cuenta desde otro dispositivo, el asistente se aparta.
 """
+import colorsys
 import io
+import itertools
 import json
 import random
+import re
 import sys
+import threading
 import time
 from pathlib import Path
 
-from device import Device, color, is_green, is_grey, is_orange, is_red, is_yellow
+import cv2
+import numpy as np
+from PIL import Image
+
+from device import Device, color, is_green, is_orange, is_red, is_yellow
 from eyes import Eyes
+try:
+    import ocr as ocr_mod                     # comprobaciones por píxeles (precio en rojo…)
+except Exception:
+    ocr_mod = None
 import math
 import vision
 
@@ -27,14 +39,10 @@ STOP = HERE / "STOP"
 import shutil
 _adb = CFG.get("adb") if CFG.get("adb") and Path(CFG["adb"]).exists() else (shutil.which("adb") or "adb")
 dev = Device(_adb, CFG["serial"])
-eyes = Eyes(CFG["ollama"], CFG["model"])
+eyes = Eyes(CFG["ollama"], CFG["model"], CFG.get("model_keep_alive", "5m"))
 blocked_until = {}                      # cuenta -> timestamp (el dueño está jugando)
 current = None                          # cuenta abierta
 
-# Líneas de despliegue (vista con el zoom al mínimo) por lado; se prueban de fuera hacia dentro.
-SIDES = {"UL": ((250, 470), (770, 55)), "UR": ((1150, 55), (1670, 470)),
-         "LL": ((250, 520), (690, 845)), "LR": ((1670, 520), (1230, 845))}
-CENTER = (960, 470)
 
 
 # ---------------- diario (lo ve el visor web) ----------------
@@ -59,11 +67,61 @@ def tap(x, y, why, wait=0.8):
     time.sleep(wait)
 
 
-def check_stop():
+def wait_for(cond, timeout, step=0.4):
+    """Espera a que `cond()` sea cierto (como mucho `timeout` s) en vez de dormir un tiempo fijo."""
+    t0 = time.time()
+    while True:
+        if cond():
+            return True
+        if time.time() - t0 > timeout:
+            return False
+        time.sleep(step)
+
+
+def check_stop(redirect=True):
+    """Punto seguro para atender órdenes del visor: parar (STOP) y, si `redirect`, saltar a un paso (IR_A).
+    Con tropas ya desplegadas se llama con redirect=False: la batalla en curso se acaba antes de obedecer."""
     if STOP.exists():
         STOP.unlink()
         log("warn", "Parado por orden (fichero STOP).")
         sys.exit(0)
+    if redirect:
+        check_goto()
+
+
+GOTO_FILE = HERE / "IR_A"               # orden del visor «haz este paso ya»: {"index", "account", "task"}
+
+
+class Redirect(BaseException):
+    """Orden de saltar a un paso de la rutina. Hereda de BaseException para que ningún `except Exception`
+    intermedio se la trague: sube hasta main(), que empieza la vuelta en ese paso."""
+    def __init__(self, index, step):
+        super().__init__(index)
+        self.index, self.step = index, step
+
+
+def check_goto():
+    if not GOTO_FILE.exists():
+        return
+    try:
+        order = json.loads(GOTO_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        order = None
+    GOTO_FILE.unlink(missing_ok=True)
+    if not isinstance(order, dict):
+        log("warn", "Orden del visor ilegible (IR_A): la ignoro.")
+        return
+    reload_config()
+    routine, i = CFG["routine"], order.get("index")
+    want = (order.get("account"), order.get("task"))
+    if not (isinstance(i, int) and 0 <= i < len(routine) and (routine[i]["account"], routine[i]["task"]) == want):
+        # la rutina cambió entre el clic y ahora: se busca el mismo paso por cuenta y tarea
+        i = next((k for k, s in enumerate(routine) if (s["account"], s["task"]) == want), None)
+    if i is None:
+        log("warn", f"El visor pidió {want[0]} · {want[1]}, que ya no está en la rutina: lo ignoro.")
+        return
+    clear_pause()                        # lo manda el dueño: si había pausa por «está jugando», se acaba
+    raise Redirect(i, routine[i])
 
 
 # ---------------- pantallas ----------------
@@ -75,18 +133,40 @@ def upgrade_window(img):
     return red and all(max(c) < 110 and max(c) - min(c) < 25 for c in frame)
 
 
+def _hsv(c):
+    h, s, v = colorsys.rgb_to_hsv(*(x / 255 for x in c[:3]))
+    return h * 360, s, v
+
+
+def _red_any(c):
+    """Rojo del botón Terminar/Rendirse, también con la neblina blanca de las nubes (por tono; QA)."""
+    h, s, v = _hsv(c)
+    return is_red(c) or ((h >= 345 or h <= 10) and s >= 0.3 and v >= 0.7)
+
+
+def _orange_any(c):
+    h, s, v = _hsv(c)
+    return is_orange(c) or (15 <= h <= 45 and s >= 0.3 and v >= 0.8)
+
+
+def home_button(img):
+    """Botón amarillo de «Batalla» abajo a la izquierda (aldea). Se miran sus bordes además del centro: con
+    algunos eventos el icono lleva llamas naranjas justo en el centro (10-nov)."""
+    return any(is_yellow(color(img, x, y, 3)) for x, y in ((120, 1000), (60, 1000), (180, 1000), (60, 1040)))
+
+
 def screen(img=None):
     img = img or dev.shot()
     if upgrade_window(img):
         return "upgrade", img
     # batalla primero: el botón rojo "Terminar batalla" (aldea principal y), en la nocturna, algo más arriba
-    if is_red(color(img, 60, 780, 3)) or is_red(color(img, 60, 750, 3)):
+    if _red_any(color(img, 60, 780, 3)) or _red_any(color(img, 60, 750, 3)):
         # botón naranja «Siguiente»: el precio cambia de sitio según su longitud (350 / 1700), se miran varios puntos
-        orange = any(is_orange(color(img, x, y, 3)) for x, y in ((1780, 820), (1640, 815), (1640, 725), (1880, 815)))
+        orange = any(_orange_any(color(img, x, y, 3)) for x, y in ((1780, 820), (1640, 815), (1640, 725), (1880, 815)))
         return ("search" if orange else "battle"), img
-    if is_green(color(img, 880, 945, 3)) and not is_yellow(color(img, 120, 1000)):
+    if is_green(color(img, 880, 945, 3)) and not home_button(img):
         return "result", img
-    if is_yellow(color(img, 120, 1000)):
+    if home_button(img):
         return "home", img
     return "unknown", img
 
@@ -227,9 +307,9 @@ def system_dialog(img):
 
 def go_home(max_tries=10):
     """Lleva el juego a la aldea cerrando popups. Devuelve False si el dueño ha entrado."""
-    last_close = None
-    for _ in range(max_tries):
-        if PAUSE["until"] > time.time():
+    last_close, waits = None, 0
+    for _ in range(max_tries + 4):
+        if paused():
             return False
         if "clashofclans" not in dev.foreground():
             dev.launch_game()
@@ -267,7 +347,21 @@ def go_home(max_tries=10):
         if is_orange(color(img, 1122, 450, 3)) and is_orange(color(img, 1122, 520, 3)):
             tap(1122, 490, "cerrar chat global", 1.5)
             continue
+        # tras una batalla o un cambio de pantalla el juego pasa unos segundos por las nubes o una animación:
+        # esperar antes de tocar nada. Antes se acababa pulsando ATRÁS y salía «¿Salir del juego?» (lo veía el
+        # usuario, 10-nov) y además se gastaba una pregunta al modelo
+        if finding_rivals(img):
+            time.sleep(1)
+            continue
+        waits += 1
+        if waits <= 3:
+            time.sleep(1.2)
+            continue
         what, close = eyes.screen_kind(img)
+        if what == "aldea" and not upgrade_window(img) and not builder_panel_open(img):
+            # el modelo ve la aldea aunque el botón de Batalla no tenga su amarillo de siempre (10-nov: con un
+            # evento sale con llamas y no se reconocía → se pulsaba ATRÁS → «¿Quieres salir del juego?»)
+            return True
         if what == "otro_dispositivo":
             # confirmación: ese aviso siempre trae un botón verde "Recargar"
             if any("recarg" in button_text(img, bx, by) or "reload" in button_text(img, bx, by)
@@ -300,7 +394,13 @@ def go_home(max_tries=10):
             tap(*xr, "cerrar ventana (X roja)", 1.5)
             last_close = xr
             continue
-        # 3) tecla atrás (si abre "¿Salir del juego?", la siguiente vuelta lo cancela)
+        # 3) tecla atrás, sólo como último recurso (si abre "¿Salir del juego?", la siguiente vuelta lo cancela)
+        try:                                   # para ver qué pantalla era (la 1.ª no se pisa con la 2.ª)
+            img.save(HERE / ("atras.png" if not (HERE / "atras.png").exists()
+                             or time.time() - (HERE / "atras.png").stat().st_mtime > 60 else "atras2.png"))
+        except Exception:
+            pass
+        log("think", f"Pantalla que no reconozco («{what}») y sin botón para cerrar: pulso ATRÁS (captura en atras.png).")
         dev.back(1.5)
         last_close = None
     return screen()[0] == "home"
@@ -349,27 +449,40 @@ def owner_detected():
     """El dueño juega en otro dispositivo. Al reabrir, el juego entra SIEMPRE en la última aldea (la suya)
     y le echaría: así que el asistente entero se para con el juego cerrado un buen rato."""
     mins = CFG.get("owner_pause_minutes", 45)
-    blocked_until[current] = time.time() + 3600
     PAUSE["until"] = time.time() + mins * 60
+    blocked_until[current] = PAUSE["until"]          # igual que la pausa: si no, tras ella venía un descanso
     PAUSE_FILE.write_text(str(PAUSE["until"]))
     log("warn", f"El dueño está jugando en {current}: cierro el juego y paro el asistente {mins} min para no echarle.")
     dev.shell("am force-stop com.supercell.clashofclans")
 
 
+def clear_pause():
+    """Acaba la pausa por el dueño y desbloquea sus cuentas (las vuelve a usar el asistente)."""
+    PAUSE["until"] = 0
+    blocked_until.clear()
+    PAUSE_FILE.unlink(missing_ok=True)
+
+
+def paused():
+    """¿Sigue la pausa por el dueño? Si el visor ha borrado PAUSA_DUENO («Saltar pausa»), se acaba ya."""
+    if PAUSE["until"] > time.time() and not PAUSE_FILE.exists():
+        clear_pause()
+        log("think", "Pausa saltada desde el visor: vuelvo a la rutina.")
+    return PAUSE["until"] > time.time()
+
+
 def owner_pause():
-    """Espera (sin abrir el juego) mientras dure la pausa por el dueño."""
-    if PAUSE["until"] <= time.time():
+    """Espera (sin abrir el juego) mientras dure la pausa por el dueño. Mira el visor cada 2 s."""
+    if not paused():
         return
     set_state(phase="pause", pause_until=PAUSE["until"])
-    while PAUSE["until"] > time.time():
+    beat = 0
+    while paused():
         check_stop()
-        left = int((PAUSE["until"] - time.time()) / 60)
-        log("think", f"Pausa: el dueño está jugando. Quedan {left} min.")
-        for _ in range(30):
-            if PAUSE["until"] <= time.time():
-                break
-            check_stop()
-            time.sleep(10)
+        if time.time() - beat >= 300:          # latido cada 5 min para que el vigilante no lo crea colgado
+            beat = time.time()
+            log("think", f"Pausa: el dueño está jugando. Quedan {int((PAUSE['until'] - beat) / 60)} min.")
+        time.sleep(2)
     PAUSE_FILE.unlink(missing_ok=True)
     set_state(phase="run")
     log("think", "Fin de la pausa: vuelvo a abrir el juego.")
@@ -390,6 +503,34 @@ def which_account(img=None):
     return None
 
 
+SID_LIST = (1440, 370, 1800, 1080)        # columna de los nombres en la lista de Supercell ID (panel derecho)
+
+
+def _dark(img):
+    return (np.asarray(img.convert("RGB")).astype(np.int16).max(axis=2) < 90).astype(np.float32)
+
+
+def sid_list_open(img):
+    """¿Está abierta la lista de Supercell ID? Panel derecho gris claro liso con la X blanca arriba."""
+    a = np.asarray(img.convert("RGB")).astype(np.int16)
+    strip = a[500:540, 1330:1900]
+    return strip.min() > 225 and strip.max() - strip.min() < 30
+
+
+def sid_card_y(img, acc):
+    """y donde tocar la tarjeta de la cuenta en la lista de Supercell ID, por la plantilla de su nombre
+    (tpl/sid_<cuenta>.png), o None. El modelo no la encontraba (10-nov): la lista pone «TheRlvan11», con ele,
+    y se le pedía «TheRIvan11». Plantillas: 1,0 en su tarjeta y ≤0,51 en las demás."""
+    p = HERE / "tpl" / f"sid_{acc}.png"
+    if not p.exists():
+        return None
+    t = _dark(Image.open(p))
+    r = cv2.matchTemplate(_dark(img.crop(SID_LIST)), t, cv2.TM_CCOEFF_NORMED)
+    _, v, _, (_, y) = cv2.minMaxLoc(r)
+    y += SID_LIST[1] + t.shape[0] // 2
+    return y + 15 if v >= 0.85 and y + 15 < 1060 else None
+
+
 def switch_to(acc):
     global current
     if not go_home():
@@ -400,17 +541,33 @@ def switch_to(acc):
         return True
     label = CFG["accounts"][acc]["switch_label"]
     log("think", f"Cambio a la cuenta {acc}.")
-    tap(100, 110, "abrir perfil", 2.5)
-    tap(1264, 206, "cambiar de cuenta (Supercell ID)", 4)
     pos = None
-    for scroll in range(3):
-        pos = eyes.find(dev.shot(), f'la tarjeta de la cuenta "{label}" en la lista de Supercell ID (panel derecho)')
-        if pos and pos[0] > 1330 and pos[1] < 1000:
+    for attempt in range(2):
+        tap(100, 110, "abrir perfil", 2.5)
+        # el perfil se abre en la última pestaña usada: sin pasar por «Ajustes», (1264,206) es otra cosa
+        tap(1518, 90, "pestaña Ajustes", 1.5)
+        tap(1264, 206, "cambiar de cuenta (Supercell ID)", 4)
+        if sid_list_open(dev.shot()):
             break
-        pos = None
-        dev.swipe(1620, 900, 1620, 450, 500, wait=1.5)
+        log("warn", "No se ha abierto la lista de Supercell ID; vuelvo a intentarlo.")
+        go_home()
+    else:
+        return False
+    for scroll in range(4):
+        img = dev.shot()
+        y = sid_card_y(img, acc)
+        if y:
+            pos = (1620, y)
+            break
+        if not (HERE / "tpl" / f"sid_{acc}.png").exists():      # cuenta sin plantilla: que la busque el modelo
+            pos = eyes.find(img, f'la tarjeta de la cuenta "{label}" en la lista de Supercell ID (panel derecho)')
+            if pos and pos[0] > 1330 and pos[1] < 1000:
+                break
+            pos = None
+        dev.swipe(1620, 900, 1620, 560, 600, wait=1.5)
     if not pos:
-        log("warn", f"No encuentro la cuenta {label} en la lista.")
+        dev.shot().save(HERE / "sin_cuenta.png")
+        log("warn", f"No encuentro la cuenta {label} en la lista (captura en sin_cuenta.png).")
         dev.back(1)
         go_home()
         return False
@@ -533,6 +690,9 @@ def donate_once(x, y):
 
 def clan_duties():
     """Abre el chat del clan, dona TODO lo que pidan y pide tropas si es gratis."""
+    if mass_on() and time.time() - MASS["clan"] < 600:
+        return                                     # evento en masa: el clan, como mucho cada 10 min
+    MASS["clan"] = time.time()
     if not go_home():
         return
     img = None
@@ -591,14 +751,7 @@ def clan_duties():
         dlg.save(HERE / "ultima_peticion.png")
         g, o = color(dlg, 1250, 790, 4), color(dlg, 680, 790, 4)     # Enviar (verde) y Cancelar (naranja), fuera del texto
         if g[1] > 150 and g[1] > g[0] + 40 and g[1] > g[2] + 60 and o[0] > 200 and o[2] < 90:
-            msg = CFG["accounts"].get(current, {}).get("request_message")
-            if msg:                            # mensaje de la petición en español (el juego guarda el último)
-                tap(1200, 550, "escribir mensaje de la petición", 1.2)
-                dev.shell("input keyevent KEYCODE_MOVE_END")
-                dev.shell(" ; ".join(["input keyevent KEYCODE_DEL"] * 60))
-                dev.shell("input text " + msg.replace(" ", "%s"))
-                time.sleep(0.5)
-                dev.back(1.0)                  # cierra el teclado; la ventana vuelve a su sitio
+            # sin escribir mensaje (pedido por el usuario 13-nov: es perder tiempo); se envía tal cual
             tap(1175, 745, "enviar petición", 1.5)
             log("done", "Tropas del castillo pedidas.")
     if chat_open():
@@ -616,17 +769,6 @@ def good_target(loot, rule, full=()):
     if rule["mode"] == "gold_or_elixir":
         return g >= rule["gold"] or e >= rule["elixir"]
     return (g >= rule["gold"] and e >= rule["elixir"]) or (d >= rule["dark"] > 0 and (g + e) >= rule["gold"])
-
-
-def line_points(side, n, inset=0.0):
-    (x1, y1), (x2, y2) = SIDES[side]
-    pts = []
-    for i in range(n):
-        t = (i + 0.5) / n
-        x, y = x1 + (x2 - x1) * t, y1 + (y2 - y1) * t
-        x, y = x + (CENTER[0] - x) * inset, y + (CENTER[1] - y) * inset
-        pts.append((x + random.uniform(-8, 8), min(855, y + random.uniform(-8, 8))))
-    return pts
 
 
 def read_bar(img):
@@ -692,92 +834,6 @@ def speed_button(img):
     return green > 0.6 * len(box)
 
 
-def spell_target(side):
-    """Dónde van los hechizos: donde están peleando nuestras tropas (lo busca la visión, sólo cerca de la
-    entrada); si no lo ve claro, un punto fijo a un 30 % del borde hacia el centro."""
-    mid = line_points(side, 1)[0]
-    fallback = (mid[0] + (CENTER[0] - mid[0]) * 0.3, mid[1] + (CENTER[1] - mid[1]) * 0.3)
-    try:
-        p = eyes.find(dev.shot(), "el grupo de tropas atacantes peleando (donde se concentran las barras de vida "
-                                  "y los combates), no la barra de cartas de abajo")
-    except Exception:
-        p = None
-    if p and p[1] < 860:
-        d_mid = (p[0] - mid[0]) ** 2 + (p[1] - mid[1]) ** 2
-        d_far = (p[0] - (2 * CENTER[0] - mid[0])) ** 2 + (p[1] - (2 * CENTER[1] - mid[1])) ** 2
-        d_center = (p[0] - CENTER[0]) ** 2 + (p[1] - CENTER[1]) ** 2
-        if d_mid < d_far and d_center > 150 ** 2:     # el centro exacto es la respuesta «por defecto» del modelo
-            log("think", f"Hechizos donde pelean las tropas: {int(p[0])},{int(p[1])}.")
-            return p
-    log("think", "No veo claro dónde pelean; hechizos a la entrada.")
-    return fallback
-
-
-def deploy(side):
-    bar = read_bar(dev.shot())
-    log("think", f"Ataco por {side}. Barra: " + ", ".join(s["kind"] for s in bar))
-    mid = line_points(side, 1)[0]
-    # 1) tropas, asedio/castillo y héroes: tocar por fuera del borde hasta que la casilla quede gris
-    order = [s for s in bar if s["kind"] in ("troop", "siege")] + [s for s in bar if s["kind"] == "hero"]
-    for s in order:
-        tap(s["x"], 975, f"seleccionar {s['kind']}", 0.3)
-        done = False
-        for inset in (0.0, 0.07, 0.14, 0.21, 0.28):
-            n = 1 if s["kind"] == "hero" else 6
-            for _ in range(1 if s["kind"] == "hero" else 5):
-                pts = line_points(side, n, inset)
-                dev.taps(pts)
-                log("act", f"desplegar {s['kind']}", "taps", [[int(x), int(y)] for x, y in pts])
-                time.sleep(0.4)
-                if slot_used(s["left"]):
-                    done = True
-                    break
-            if done:
-                break
-    time.sleep(6)
-    # 2) hechizos entre el lado de entrada y el centro; luego se desliza la barra por si hay más a la derecha
-    tx, ty = spell_target(side)
-    for _ in range(2):
-        cards = read_bar(dev.shot())
-        first_hero = min((c["x"] for c in cards if c["kind"] == "hero"), default=0)
-        # a la derecha de los héroes sólo hay hechizos (los del castillo tienen otro color de fondo)
-        spells = [c for c in cards if c["kind"] == "spell" or (c["kind"] in ("troop", "siege") and c["x"] > first_hero > 0)]
-        for s in spells:
-            x, y = tx + random.uniform(-25, 25), ty + random.uniform(-20, 20)
-            tap(s["x"], 975, "seleccionar hechizo", 0.3)
-            for _ in range(12):
-                tap(x, y, "lanzar hechizo", 0.35)
-                if slot_used(s["left"]):
-                    break
-        dev.swipe(1700, 975, 400, 975, 400, wait=1)
-    # 3) habilidades: las casillas de héroe que no estén grises
-    for s in read_bar(dev.shot()):
-        if s["kind"] == "hero":
-            tap(s["x"], 975, "habilidad del héroe", 0.3)
-
-
-def leftovers(side):
-    """Segunda pasada: tira lo que haya quedado sin gastar en la barra (tropas, asedio, hechizos)."""
-    mid = line_points(side, 1)[0]
-    left = [c for c in read_bar(dev.shot()) if c["kind"] in ("troop", "siege", "spell")]
-    if not left:
-        return
-    log("think", f"Quedan {len(left)} casillas sin gastar; las tiro.")
-    tx, ty = spell_target(side) if any(c["kind"] == "spell" for c in left) else (0, 0)
-    for c in left:
-        tap(c["x"], 975, f"seleccionar {c['kind']} sobrante", 0.3)
-        for _ in range(12):
-            if c["kind"] == "spell":
-                pts = [(tx + random.uniform(-25, 25), ty + random.uniform(-20, 20))]
-            else:
-                pts = line_points(side, 4, 0.1)
-            dev.taps(pts)
-            time.sleep(0.4)
-            if slot_used(c["left"]):
-                break
-    log("act", "desplegar sobrantes")
-
-
 def _battle_sig(img):
     """Huella del botín restante y del % de daño: si no cambia, la batalla ya no avanza."""
     a = img.crop((40, 130, 300, 290)).convert("L").resize((52, 32))
@@ -785,7 +841,7 @@ def _battle_sig(img):
     return list(a.getdata()) + list(b.getdata())
 
 
-def wait_battle_end(stall_seconds=20, max_seconds=200, events=()):
+def wait_battle_end(stall_seconds=20, max_seconds=200, events=(), poll=3):
     """Espera al resultado; si el botín y el % llevan stall_seconds quietos, termina la batalla.
     events: [(instante, función)] que se ejecutan a su hora (habilidades, hielos…). En cuanto sale la
     pantalla de resultado se acaba, aunque queden eventos pendientes."""
@@ -807,7 +863,7 @@ def wait_battle_end(stall_seconds=20, max_seconds=200, events=()):
             except Exception as e:
                 log("warn", f"Evento de batalla falló: {e}")
             continue
-        time.sleep(0.8 if events else 3)
+        time.sleep(0.8 if events else poll)
         if any(not getattr(f, "is_snap", False) for _, f in events):
             continue                     # mientras queden habilidades/hielos no se da por parada
         sig = _battle_sig(img)
@@ -826,15 +882,8 @@ def wait_battle_end(stall_seconds=20, max_seconds=200, events=()):
         time.sleep(2)
 
 
-# ---------------- ataque planificado (visión por colores + plantillas de cartas) ----------------
-SIDE_CORNERS = {"UL": ("L", "T"), "UR": ("T", "R"), "LR": ("R", "B"), "LL": ("B", "L")}
 NO_TAP = [(15, 755, 262, 856), (255, 750, 905, 856),      # Terminar batalla, Potenciar ejército/héroes
           (1760, 545, 1915, 695), (1580, 690, 1915, 856)]    # botón de velocidad, Siguiente/daño
-SPECIAL = {"healer", "wallbreaker", "siege", "queen", "king", "warden", "prince", "cc", "champion", "duke",
-           "totem", "revive", "earthquake",
-           "lightning", "cc_lightning", "freeze", "cc_freeze", "rage"}
-TANKS = {"giant", "golem", "pekka", "giant_skeleton"}      # van delante a comerse las defensas
-AIR = {"edrag", "balloon", "dragon", "dragonrider", "superdragon", "baby_dragon", "minion", "archer"}
 
 
 def _safe(x, y):
@@ -846,55 +895,6 @@ def _dilate(m, k):
     return cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
 
 
-def _push_out(geo, x, y, nx, ny, start=18):
-    """Primer punto fuera de la aldea (con margen) avanzando hacia fuera por (nx, ny)."""
-    md = geo["mask_d"]
-    for k in range(14):
-        px, py = x + nx * (start + 10 * k), y + ny * (start + 10 * k)
-        if _safe(px, py) and md[int(py), int(px)] == 0:
-            return px, py
-    return None
-
-
-def side_points(geo, side, n, extra=0):
-    """n puntos de despliegue a lo largo del lado, justo por fuera del borde; y la normal hacia fuera."""
-    a, b = (geo["corners"][k] for k in SIDE_CORNERS[side])
-    ex, ey = b[0] - a[0], b[1] - a[1]
-    L = math.hypot(ex, ey) or 1
-    nx, ny = -ey / L, ex / L
-    cx, cy = geo["center"]
-    mx, my = (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
-    if nx * (mx - cx) + ny * (my - cy) < 0:
-        nx, ny = -nx, -ny
-    pts = []
-    for i in range(n):
-        t = 0.08 + 0.84 * (i + 0.5) / n
-        p = _push_out(geo, a[0] + ex * t, a[1] + ey * t, nx, ny, 18 + extra)
-        if p:
-            pts.append(p)
-    return pts, (nx, ny)
-
-
-def queen_corner(geo, k):
-    """Punto para la reina en la esquina k: en el vértice hay un edificio y la flecha (horizontal desde
-    L/R, vertical desde T/B) cruza la aldea por el medio. None si no sirve."""
-    x, y = geo["corners"][k]
-    lft, top, rgt, asistente = geo["box"]
-    if k in "LR":
-        if abs(y - (top + asistente) / 2) > 0.18 * (asistente - top):
-            return None
-    elif abs(x - (lft + rgt) / 2) > 0.18 * (rgt - lft) or y < 75 or y > 840:
-        return None
-    # lo más lejos posible en el eje (dentro de su alcance): así un error de unos px en la altura del
-    # edificio apenas tuerce la flecha
-    d = {"L": (-1, 0), "R": (1, 0), "T": (0, -1), "B": (0, 1)}[k]
-    for off in (100, 75, 50, 28):
-        q = (x + d[0] * off, y + d[1] * off)
-        if _safe(*q) and not geo["mask_d"][int(q[1]), int(q[0])]:
-            return q
-    return None
-
-
 def _map_geometry():
     m = vision.default_mask()
     import numpy as np
@@ -903,50 +903,6 @@ def _map_geometry():
                         "B": (960, int(ys.max()))},
             "center": (float(xs.mean()), float(ys.mean())), "mask": m, "src": "mapa",
             "box": (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))}
-
-
-def plan_attack(img, acc=None):
-    """Elige lado de entrada, defensas aéreas a fulminar y esquina para la reina."""
-    geo = vision.village_geometry(img, fallback=True)
-    ads = vision.find_air_defenses(img)
-    if geo["src"] != "mapa" and ads:
-        big = _dilate(geo["mask"], 61)
-        if any(not big[min(1079, int(y)), min(1919, int(x))] for x, y in ads):
-            # una defensa aérea fuera del contorno: el contorno está mal → rombo del mapa entero
-            geo = _map_geometry()
-    geo["mask_d"] = _dilate(geo["mask"], 13)
-    exact = geo["src"] != "mapa"            # sin contorno real no se arriesga la reina en esquina
-    acfg = CFG["accounts"].get(acc, {})
-    per = acfg.get("lightning_per_ad", 3)
-    n_zap = acfg.get("lightning_total", 9) // per          # 0 rayos → todas las aéreas van a hielo
-    best = None
-    for side, (ka, kb) in SIDE_CORNERS.items():
-        pts, normal = side_points(geo, side, 9)
-        if len(pts) < 4:
-            continue
-        mx = sum(p[0] for p in pts) / len(pts)
-        my = sum(p[1] for p in pts) / len(pts)
-        ds = sorted(ads, key=lambda a: (a[0] - mx) ** 2 + (a[1] - my) ** 2)
-        zap, rest = ds[:n_zap], ds[n_zap:]
-        score = min(math.hypot(r[0] - mx, r[1] - my) for r in rest) if rest else 1500
-        score += 15 * len(pts)
-        qc = None
-        for k in ((ka, kb) if exact else ()):
-            qp = queen_corner(geo, k)
-            if qp and not qc:
-                qc = (k, qp)
-        if qc:
-            score += 200
-        if best is None or score > best["score"]:
-            best = {"side": side, "pts": pts, "normal": normal, "mid": (mx, my), "zap": zap, "rest": rest,
-                    "queen": qc, "score": score, "geo": geo, "per_ad": per}
-    if best and not best["queen"] and exact:   # una esquina buena aunque no toque el lado de entrada
-        for k in "LRTB":
-            qp = queen_corner(geo, k)
-            if qp:
-                best["queen"] = (k, qp)
-                break
-    return best
 
 
 def deployed(img, c):
@@ -962,32 +918,18 @@ def _slot_sig(img, c):
 def place_unit(c, points, label, wait=0.45):
     """Despliega un héroe/asedio: si la casilla cambia (sale barra de vida, se oscurece, sube la carta)
     es que ha salido; si no cambia nada, el punto no valía y se prueba el siguiente."""
-    for p in points[:6]:
+    for p in points[:8]:
         refresh_card(dev.shot(), c)
         tap(c["x"], 975, f"seleccionar {label}", 0.3)
-        before = _slot_sig(dev.shot(), c)     # ya seleccionada: que el resalte no cuente como cambio
-        tap(*p, f"desplegar {label}", wait)
-        img = dev.shot()
-        if deployed(img, c) or card_used(img, c["left"]):
-            return p
-        diff = sum(abs(a - b) for a, b in zip(before, _slot_sig(img, c))) / len(before)
-        if diff > 9:
-            return p
+        tap(*humanize([p], 8, 6)[0], f"desplegar {label}", wait)
+        for _ in range(2):                    # la barra de vida tarda un poco en salir
+            img = dev.shot()
+            if deployed(img, c) or card_used(img, c["left"]):
+                return p
+            time.sleep(0.35)
+        # (antes valía «la carta ha cambiado»: 13-nov dio por desplegados 4 héroes que no salieron)
     log("warn", f"No he conseguido desplegar {label}.")
     return None
-
-
-def back_points(plan, n=4):
-    """Puntos de la línea más cercanos al centro del lado, un poco más por fuera (validados)."""
-    mid, (nx, ny) = plan["mid"], plan["normal"]
-    out = []
-    for x, y in sorted(plan["pts"], key=lambda p: (p[0] - mid[0]) ** 2 + (p[1] - mid[1]) ** 2):
-        q = _push_out(plan["geo"], x, y, nx, ny, 25)
-        out.append(q or (x, y))
-    out = out[:n]
-    # por si el contorno era malo: el centro del lado en el borde del mapa (siempre legal)
-    edge = map_edge_points(plan["side"], 5)
-    return out + edge[1:4]
 
 
 def bar_cards(img=None):
@@ -1020,12 +962,6 @@ def map_edge_points(side, n, inset=0.08):
     return out
 
 
-def _shift(plan, pts, d):
-    """Desplaza los puntos d px por la normal del lado (d>0 hacia fuera, d<0 hacia la aldea)."""
-    nx, ny = plan["normal"]
-    return [(x + nx * d, y + ny * d) for x, y in pts if _safe(x + nx * d, y + ny * d)]
-
-
 def refresh_card(img, c):
     """La barra se desplaza un poco durante la batalla: posición actual de la carta (mismo nombre)."""
     if not c.get("name"):
@@ -1051,59 +987,6 @@ def _card_empty(img, c):
     return ImageStat.Stat(a).stddev[0] < 20
 
 
-def deploy_card(c, pts, plan, label, passes=4):
-    """Despliega TODO lo de una carta: ráfagas sobre los mismos puntos mientras el número de la carta
-    vaya bajando; si una ráfaga no saca nada, los puntos se mueven (más por fuera, luego hacia dentro),
-    por si caían en zona prohibida o fuera del mapa. Nunca toca de más una carta ya vacía (el juego
-    pasaría a la siguiente carta y la soltaría donde no toca)."""
-    base, k, bursts, remaining = list(pts), 0, 0, 1
-    # orden de reserva: borde del mapa del propio lado y luego de los lados vecinos (por si ese lado
-    # está entero dentro de la zona roja, p. ej. un campo de muros pegado al borde)
-    order = {"UL": ["UL", "LL", "UR", "LR"], "UR": ["UR", "UL", "LR", "LL"],
-             "LR": ["LR", "UR", "LL", "UL"], "LL": ["LL", "UL", "LR", "UR"]}[plan["side"]]
-    passes = max(passes, 6)
-    tap(c["x"], 975, f"seleccionar {label}", 0.25)
-    while bursts < 20 and k < passes:
-        img = dev.shot()
-        refresh_card(img, c)
-        if card_used(img, c["left"]):
-            return True
-        if bursts == 0:                        # el número se lee sólo la primera vez (cuesta ~2 s)
-            try:
-                remaining = eyes.card_count(img, c["left"]) or 1
-            except Exception:
-                remaining = 1
-        # nunca más toques que unidades quedan: al vaciarse, el juego selecciona la carta siguiente
-        n = max(1, min(remaining, 3))          # tandas de 3 como mucho, comprobando la carta entre tanda y tanda
-        before = _card_sig(img, c)
-        burst = [pts[(bursts * 3 + i) % len(pts)] for i in range(n)]
-        remaining -= len(burst)
-        dev.taps([(int(x), int(y)) for x, y in burst])
-        log("act", f"desplegar {label} ×{len(burst)}", "taps", [[int(x), int(y)] for x, y in burst])
-        bursts += 1
-        time.sleep(0.4)
-        img = dev.shot()
-        refresh_card(img, c)
-        if card_used(img, c["left"]):
-            return True
-        if remaining <= 0:                     # según la cuenta ya salió todo: vuelve a seleccionar y comprueba
-            tap(c["x"], 975, f"seleccionar {label}", 0.25)
-            remaining = 1
-        moved = sum(abs(a - b) for a, b in zip(before, _card_sig(img, c))) / len(before) > 6
-        if not moved:                         # nada salió: los puntos no valen
-            remaining += len(burst)
-            if k == 0:
-                pts = _shift(plan, base, 40) or base
-            else:                              # contorno mal leído: al borde del mapa, y si no, otro lado
-                sd = order[min(k - 1, 3)]
-                pts = map_edge_points(sd, max(3, len(base))) or base
-                if k >= 2:
-                    log("warn", f"{label}: no sale por {order[k - 2]}; pruebo el borde {sd}.")
-            k += 1
-            tap(c["x"], 975, f"seleccionar {label}", 0.25)
-    return slot_used(c["left"])
-
-
 BAR = {"scrolled": False}
 
 
@@ -1112,9 +995,6 @@ def scroll_bar(right):
     if right != BAR["scrolled"]:
         dev.swipe(*((1700, 975, 300, 975) if right else (300, 975, 1700, 975)), 350, wait=0.6)
         BAR["scrolled"] = right
-
-
-CARD_POS = {}                      # (nombre, barra desplazada) -> carta; se vacía en cada batalla
 
 
 def find_card(names):
@@ -1147,6 +1027,8 @@ def cast_spell(names, x, y, label):
 
 
 REVIEW = HERE / "ultimo_ataque"
+
+
 REVIEW.mkdir(exist_ok=True)
 
 
@@ -1176,6 +1058,12 @@ def save_plan_image(shot, plan):
             cv2.circle(a, (int(x), int(y)), 35, (0, 255, 255), 4)
         for x, y in plan["rest"]:
             cv2.circle(a, (int(x), int(y)), 35, (255, 0, 0), 4)
+        for s in plan.get("storages") or []:      # oro en verde, elixir en rosa; grosor = peso en el botín
+            col = (0, 220, 0) if s["kind"] == "gold" else (200, 0, 255)
+            cv2.rectangle(a, (int(s["x"]) - 28, int(s["y"]) - 28), (int(s["x"]) + 28, int(s["y"]) + 28), col,
+                          max(2, min(8, int(2 + 6 * s.get("w", 0)))))
+        if plan.get("main"):
+            cv2.circle(a, (int(plan["main"][0]), int(plan["main"][1])), 16, (0, 0, 255), -1)
         if plan["queen"]:
             k, (x, y) = plan["queen"]
             cv2.circle(a, (int(x), int(y)), 14, (0, 0, 255), -1)
@@ -1198,387 +1086,1093 @@ def snap(tag):
 
 
 HEROES = {"queen", "king", "warden", "prince", "champion", "duke"}
-SPELLS = {"lightning", "cc_lightning", "freeze", "cc_freeze", "rage", "totem", "revive", "earthquake"}
 
 
-def spam_card(c, pts, label, rounds=4, side=None):
-    """Suelta toda la carta de golpe: ráfagas por todo el lado hasta que se vacía (sin contar unidades).
-    Si queda tropa, la siguiente ráfaga va un poco más hacia dentro (por si caía fuera del mapa)."""
-    for r in range(rounds):
+def find_storages(shot, geo):
+    """Almacenes del rival para CUALQUIER TH, nivel y aspecto: [{kind: gold|elixir|dark, x, y}].
+    1) SIFT contra las imágenes de la wiki (ref/almacenes: todos los niveles), ~3 s, sin modelo; 2) se completa
+    con la cúpula rosa (color) y las plantillas de oro seguras; 3) sólo si no sale ningún almacén de oro, el
+    modelo mira candidatos uno a uno (lo suyo pesa la mitad: en escenarios oscuros confunde cabañas y torres)."""
+    mask = geo.get("mask")
+    t0 = time.time()
+    try:
+        out = [dict(s) for s in vision.sift_storages(shot, mask)]
+    except Exception as e:
+        log("warn", f"SIFT de almacenes falló: {e}")
+        out = []
+    t_sift = time.time() - t0
+    for s in vision.storages(shot, mask):
+        if s["kind"] == "gold" and s["score"] < 0.62:
+            continue
+        if all(math.hypot(s["x"] - o["x"], s["y"] - o["y"]) > 45 for o in out):
+            out.append(dict(s))
+    # gemelos: con uno de cada tipo encontrado, sus copias en la misma aldea (mismo nivel = mismo aspecto)
+    for kind in ("gold", "elixir"):
+        seeds = sorted((o for o in out if o["kind"] == kind), key=lambda o: -o.get("score", 0))
+        if seeds and len(seeds) < 4:
+            for x, y, v in vision.twins(shot, seeds[0]["x"], seeds[0]["y"], mask, n=4 - len(seeds)):
+                if all(math.hypot(x - o["x"], y - o["y"]) > 45 for o in out):
+                    out.append({"kind": kind, "x": x, "y": y, "score": v, "twin": True,
+                                "trust": seeds[0].get("trust", 1.0)})
+    # un TH18 tiene 4 de oro y 4 de elixir: se quedan los más claros
+    for kind in ("gold", "elixir"):
+        same = sorted((o for o in out if o["kind"] == kind), key=lambda o: -o.get("score", 0))
+        for extra in same[4:]:
+            out.remove(extra)
+    ng = sum(1 for o in out if o["kind"] == "gold")
+    log("think", f"Almacenes por las imágenes de la wiki en {t_sift:.1f} s: " + ", ".join(
+        f"{o['kind']} {int(o['x'])},{int(o['y'])}" for o in out) + ".")
+    if ng or not CFG.get("storages_model", True):
+        return out
+    cands = [c for c in vision.storage_candidates(shot, mask)
+             if c["hint"] == "oro" and all(math.hypot(c["x"] - s["x"], c["y"] - s["y"]) > 45 for s in out)][:6]
+    t0, asked = time.time(), 0
+    for c in cands:
+        if sum(1 for s in out if s["kind"] == "gold") >= 4 or time.time() - t0 > 12:
+            break
+        x, y = int(c["x"]), int(c["y"]) - 8
+        try:
+            k = eyes.building_kind(shot.crop((x - 60, y - 60, x + 60, y + 60)).resize((240, 240)))
+        except Exception:
+            break
+        asked += 1
+        if k == "oro":
+            out.append({"kind": "gold", "x": c["x"], "y": c["y"], "score": 0.6, "trust": 0.5})
+    if asked:
+        log("think", f"Sin almacenes de oro reconocidos: el modelo ha revisado {asked} candidatos en "
+                     f"{time.time() - t0:.0f} s.")
+    seed = next((o for o in out if o["kind"] == "gold"), None)
+    if seed:
+        for x, y, v in vision.twins(shot, seed["x"], seed["y"], mask, n=3):
+            if all(math.hypot(x - o["x"], y - o["y"]) > 45 for o in out):
+                out.append({"kind": "gold", "x": x, "y": y, "score": v, "twin": True, "trust": seed.get("trust", 1.0)})
+    return out
+
+
+def storage_map(shot, geo, loot=None):
+    """Almacenes del rival por píxeles (`vision.storages`) con su peso: el botín disponible de cada recurso
+    repartido entre sus almacenes (si no se leyó el botín, 1 por almacén). Devuelve (lista, pesos por
+    cuadrante UL/UR/LL/LR, pesos por mitad L/R)."""
+    c4 = geo["corners"]
+    cx = (c4["L"][0] + c4["R"][0]) / 2              # ejes por las esquinas: la media de la máscara se va
+    cy = (c4["T"][1] + c4["B"][1]) / 2              # hacia donde haya más edificios
+    st = find_storages(shot, geo)
+    n = {k: sum(1 for s in st if s["kind"] == k) for k in ("gold", "elixir", "dark")}
+    loot = dict(loot or {})
+    loot["dark"] = (loot.get("dark") or 0) * 60      # el oscuro vale mucho más por unidad
+    tot = sum(loot.get(k) or 0 for k in ("gold", "elixir", "dark"))
+    for s in st:
+        v = loot.get(s["kind"]) or 0
+        # botín en millones por almacén; sin botín leído, todos igual
+        s["w"] = ((v / n[s["kind"]] / 1e6) if tot else 1.0) * s.get("trust", 1.0)
+    quad = {k: 0.0 for k in ("UL", "UR", "LL", "LR")}
+    for s in st:
+        # pegado al eje (±60 px) cuenta a medias para cada lado
+        fl = min(1.0, max(0.0, 0.5 - (s["x"] - cx) / 120))
+        fu = min(1.0, max(0.0, 0.5 - (s["y"] - cy) / 120))
+        s["left"] = fl
+        for k, f in (("UL", fu * fl), ("UR", fu * (1 - fl)), ("LL", (1 - fu) * fl), ("LR", (1 - fu) * (1 - fl))):
+            quad[k] += s["w"] * f
+    half = {"L": quad["UL"] + quad["LL"], "R": quad["UR"] + quad["LR"]}
+    return st, quad, half
+
+
+STORAGE = {}                               # lado de la aldea con más almacenes (lo dice el modelo, por batalla)
+
+
+
+# ---------------- ataque dinámico (13-nov) ----------------
+# Sin coreografía fija por nombre de tropa: se lee la barra, todo el ejército entra por el tramo del borde que da
+# a los almacenes con más botín y cada hechizo se lanza según su FUNCIÓN: los de defensas a las defensas, los de
+# tropas sobre las propias tropas (donde se ve movimiento). Asedio y castillo: un toque y no se vuelven a pulsar.
+SPELL_ROLES_DEFAULT = {
+    "defensas": ["lightning", "cc_lightning", "earthquake", "freeze", "cc_freeze", "poison", "bat", "overgrowth",
+                 "skeleton"],
+    "tropas": ["rage", "heal", "jump", "haste", "invisibility", "totem", "revive", "clone", "recall"],
+}
+SPELL_ES = {"lightning": "rayo", "cc_lightning": "rayo", "earthquake": "terremoto", "freeze": "hielo",
+            "cc_freeze": "hielo", "poison": "veneno", "bat": "murciélagos", "overgrowth": "crecimiento",
+            "rage": "furia", "heal": "curación", "jump": "salto", "haste": "celeridad",
+            "invisibility": "invisibilidad", "totem": "tótem", "revive": "resurrección", "clone": "clonación",
+            "recall": "retorno", "skeleton": "esqueletos"}
+
+
+def spell_roles():
+    """{"defensas": set, "tropas": set}; editable en config.json → "spell_roles"."""
+    r = CFG.get("spell_roles") or {}
+    return {k: set(r.get(k) or v) for k, v in SPELL_ROLES_DEFAULT.items()}
+
+
+def _role_of(name, kind, img, b):
+    """Función de una carta reconocida por plantilla (o None si hay que preguntar al modelo)."""
+    roles = spell_roles()
+    if name in HEROES:
+        return "hero"
+    if name == "siege":
+        return "siege"
+    if name == "cc":
+        return "empty" if _card_empty(img, b) else "cc"
+    if name in roles["defensas"]:
+        return "spell_def"
+    if name in roles["tropas"]:
+        return "spell_boost"
+    if name is not None:
+        return "troop"
+    if kind == "siege":
+        return "siege"
+    if kind == "troop" and not _card_empty(img, b):
+        return "troop"                        # fondo azul de tropa: no hace falta preguntar
+    return None
+
+
+SIEGE_NAMES = {"wall_wrecker", "battle_blimp", "stone_slammer", "siege_barracks", "log_launcher", "flame_flinger",
+               "battle_drill", "troop_launcher", "sky_wagon"}
+HERO_NAMES = {"archer_queen": "queen", "barbarian_king": "king", "grand_warden": "warden", "royal_champion": "champion",
+              "minion_prince": "prince", "dragon_duke": "duke"}
+SPELL_NAMES = {"healing": "heal"}
+
+
+def avatar_card(av):
+    """Retrato de la wiki → (nombre interno, función). Los hechizos, por su función en `spell_roles` (uno
+    desconocido se lanza sobre las tropas)."""
+    n = re.sub(r"\d+$", "", av.lower().replace("hero_", ""))
+    if n.endswith("_spell"):
+        n = SPELL_NAMES.get(n[:-6], n[:-6])
+        return n, "spell_def" if n in spell_roles()["defensas"] else "spell_boost"
+    if n in HERO_NAMES:
+        return HERO_NAMES[n], "hero"
+    if n in SIEGE_NAMES:
+        return "siege", "siege"
+    return n.replace("p.e.k.k.a", "pekka").replace("super_yeti", "superyeti").replace(".", ""), "troop"
+
+
+def bar_inventory():
+    """Todas las cartas de la barra (también las de la derecha, que hay que desplazar): [{name, role, x, left,
+    scrolled}]. Las que no reconocen las plantillas las clasifica el modelo EN SEGUNDO PLANO (con la lista de
+    hechizos de cada función); quedan con role None hasta que contesta."""
+    out, ask = [], []
+    for right in (False, True):
+        scroll_bar(right)
         img = dev.shot()
-        refresh_card(img, c)
-        if card_used(img, c["left"]):
-            return
-        if side and r:
-            pts = map_edge_points(side, 9, 0.08 + 0.06 * r) or pts
-        tap(c["x"], 975, f"seleccionar {label}", 0.1)
-        dev.taps([(int(x), int(y)) for x, y in pts])      # 9 toques repartidos por todo el lado
-        log("act", f"desplegar {label} de golpe", "taps", [[int(x), int(y)] for x, y in pts])
-
-
-def spam_attack(shot):
-    """Ataque TH18 probado a mano (2★ 90 %). Sin planes largos: todo de golpe y los hechizos a su sitio."""
-    plan = plan_attack(shot)
-    geo = plan["geo"]
-    c4 = geo["corners"]                       # L, R, T, B
-    cx, cy = geo["center"]
-    # lado de la reina: la esquina izquierda o la derecha (las que dejan la flecha cruzar en horizontal),
-    # la que tenga más cerca las aéreas (así los dragones las encuentran pronto); el duque, la contraria
-    ads = plan["zap"] + plan["rest"]
-    def near(k):
-        x, y = c4[k]
-        return sum(1 for a in ads if abs(a[0] - x) < 500)
-    qk = "L" if near("L") >= near("R") else "R"
-    dk = "R" if qk == "L" else "L"
-    off = lambda k, d: (c4[k][0] + (-d if k == "L" else d), c4[k][1])   # un poco por fuera de la esquina
-    qpos, dpos = off(qk, 25), off(dk, 25)
-    for p_ in (qpos, dpos):
-        if not _safe(*p_):
-            pass
-    side = "UL" if qk == "L" else "UR"        # lado del ejército: los dos lados que salen de la esquina
-    side2 = "LL" if qk == "L" else "LR"
-    pts = map_edge_points(side, 4, 0.12)[-3:] + [qpos] + map_edge_points(side2, 4, 0.12)[:3]
-    plan.update(side=side, pts=pts, normal=(-1 if qk == "L" else 1, 0))
-    log("think", f"Ataque TH18: reina por la esquina {qk}, duque por la contraria ({dk}); todo el ejército por {qk}.")
-    BAR["scrolled"] = False
-    cards = bar_cards()
-    t0 = time.time()
-
-    # 1) reina + flecha, duque en la esquina contraria + mochila (se juntan en el centro)
-    # reserva por si la esquina leída cae en zona roja: la esquina del mapa (siempre legal) y un poco más dentro
-    mapc = {"L": [(285, 495), (330, 495), (380, 470)], "R": [(1635, 495), (1590, 495), (1540, 470)]}
-    qcands, dcands = [qpos] + mapc[qk], [dpos] + mapc[dk]
-    for name, cands, label in (("queen", qcands, "flecha de la reina"), ("duke", dcands, "mochila del duque")):
-        c = _find(cards, name)
-        if c:
-            got = place_unit(c, cands, f"{name} en la esquina", 0.3)
-            if got:
-                if name == "queen":
-                    qpos = got
-                tap(c["x"], 975, label, 0.15)
-
-    # 2) todo el ejército aéreo de golpe por el lado de la reina
-    for c in cards:
-        if c["name"] in HEROES or c["name"] in SPELLS or c["kind"] == "spell" or c["name"] == "archer":
-            continue
-        if c["kind"] in ("troop", "siege") or c["name"] in AIR | TANKS:
-            spam_card(c, pts, c["name"] or "tropa", side=None)
-
-    # 3) centinela y guerrera con el ejército; su habilidad 5 s después de empezar a pelear
-    for name in ("warden", "champion", "king", "prince"):
-        c = _find(cards, name)
-        if c:
-            place_unit(c, [qpos] + qcands + pts, f"{name} con el ejército", 0.3)
-    events = []
-    for name in ("warden", "champion", "king", "prince"):
-        events.append((t0 + 9, lambda n=name: tap_card((n,), f"habilidad de {n}")))
-
-    # 4) tótems delante del ejército (absorben el daño), terremotos al centro, revivir, arquera
-    inward = lambda k: (qpos[0] + (cx - qpos[0]) * k, qpos[1] + (cy - qpos[1]) * k)
-    for i, k in enumerate((0.14, 0.2, 0.26)):
-        events.append((t0 + 5 + i, lambda k=k: cast_spell(("totem",), *inward(k), "tótem delante del ejército")))
-    for k in range(2):
-        events.append((t0 + 12 + k, lambda: cast_spell(("earthquake",), cx + random.uniform(-30, 30), cy + random.uniform(-20, 20), "terremoto al centro")))
-    events.append((t0 + 24, lambda: cast_spell(("revive",), cx - 30, cy + 10, "revivir en el centro")))
-    for i, k in enumerate((0.4, 0.55, 0.7, 0.85)):
-        events.append((t0 + 14 + 4 * i, lambda k=k: cast_spell(("totem",), *inward(k), "tótem siguiendo al ejército")))
-    events.append((t0 + 27, lambda: cast_spell(("rage", "freeze", "cc_freeze"), cx, cy, "hechizo del castillo al centro")))
-    ar = _find(cards, "archer")
-    if ar:
-        events.append((t0 + 30, lambda: spam_card(ar, pts, "arquera de limpieza", rounds=3)))
-    return plan, events
-
-
-def plan_leftovers(plan):
-    """Tropas que hayan quedado sin salir (no hechizos: esos tienen su momento)."""
-    img = dev.shot()
-    left = [c for c in bar_cards(img) if not card_used(img, c["left"])
-            and (c["kind"] in ("troop", "siege") or c["name"] in AIR | TANKS)
-            and c["name"] not in SPECIAL                       # héroes, asedio, castillo y hechizos tienen su momento
-            and c["name"] is not None and c["name"] != "archer"]   # desconocidas fuera; la arquera sale luego a limpiar
-    for c in left:
-        log("think", f"Queda {c['name'] or 'tropa'} sin salir; la despliego.")
-        deploy_card(c, plan["pts"], plan, c["name"] or "tropa", passes=2)
-
-
-DUKE_DONE = set()
-COMBO = {}
-
-
-def duke_down():
-    """¿El duque ha caído? (su carta en gris)."""
-    img = dev.shot()
-    for c in read_bar(img):                  # vivo: su carta se reconoce y no está gris
-        if vision.card_identity(img, c["left"])[0] == "duke":
-            COMBO["duke_left"] = c["left"]
-            return card_grey(img, c["left"])
-    left = COMBO.get("duke_left")            # muerto: la carta gris oscura ni sale en la barra → mirar su sitio
-    return left is not None and card_grey(img, left)
-
-
-def execute_plan(plan):
-    """Ataque coherente: rayos a las aéreas → reina (flecha) + sanadoras → línea de tropas → asedio →
-    héroes → habilidades y hielos a su hora. Devuelve los eventos programados para la espera."""
-    BAR["scrolled"] = False
-    side, pts, mid = plan["side"], plan["pts"], plan["mid"]
-    nx, ny = plan["normal"]
-    backs = back_points(plan)                             # detrás de la línea, para héroes y asedio
-    back = backs[0]
-    q = plan["queen"]
-    log("think", f"Plan (contorno por {plan['geo']['src']}): entro por {side}; rayos a {len(plan['zap'])} aéreas {plan['zap']}; "
-                 f"{'reina en esquina ' + q[0] if q else 'reina con la tropa'}; aéreas sin rayos: {plan['rest']}.")
-    cards = bar_cards()
-    log("think", "Barra: " + ", ".join(c["name"] or c["kind"] for c in cards))
-    t0 = time.time()
-    events = []
-
-    # 1) rayos: 3 por aérea (4 a la primera si hay del castillo), propios primero y luego el del castillo
-    for i, (ax, ay) in enumerate(plan["zap"]):
-        need = plan.get("per_ad", 3)
-        while need > 0:
-            img = dev.shot()
-            c = next((c for c in bar_cards(img) if c["name"] in ("lightning", "cc_lightning")
-                      and not card_used(img, c["left"])), None)
-            if not c:
-                break
-            tap(c["x"], 975, "seleccionar rayo", 0.2)
-            for _ in range(need):
-                tap(ax + random.uniform(-4, 4), ay + random.uniform(-4, 4), f"rayo a la aérea {int(ax)},{int(ay)}", 0.3)
-            need = 0
-            if card_used(dev.shot(), c["left"]) and c["name"] == "lightning":
-                need = 1                     # la propia se agotó a medias: uno más con la del castillo
-
-    # 2) reina: en la esquina y flecha gigante al instante; sanadoras detrás de ella
-    qc, hc = _find(cards, "queen"), _find(cards, "healer")
-    if qc:
-        qp = place_unit(qc, ([q[1]] if q else []) + backs, "reina", 0.2) or back
-        if q and qp == q[1]:
-            time.sleep(0.4)
-            tap(qc["x"], 975, "flecha gigante de la reina", 0.3)
-            for i in range(4):               # capturas para revisar la flecha
-                dev.shot().save(HERE / f"flecha{i}.png")
-                time.sleep(0.3)
-        else:
-            events.append((5, lambda: tap_card(("queen",), "habilidad de la reina")))
-        dk = _find(cards, "duke")
-        gx, gy = plan["geo"]["center"]
-        line = lambda k: (qp[0] + (gx - qp[0]) * k, qp[1] + (gy - qp[1]) * k)   # de la reina al centro
-        COMBO.update(line=line, revived=False, start=time.time())
-        if dk:                               # duque justo detrás de la reina, en la línea de la flecha + mochila
-            COMBO["duke_left"] = dk["left"]
-            if place_unit(dk, [qp] + backs, "duque en la línea de la flecha"):
-                time.sleep(0.3)
-                tap_card(("duke",), "mochila del duque")
-                DUKE_DONE.add(id(dk))
-        # terremotos en la línea: uno al centro y otro a 3/4 del camino, donde llegan flecha y duque
-        for k in (1.0, 0.78, 1.0):            # el 3.º sólo por si alguno no salió
-            x, y = line(k)
-            cast_spell(("earthquake",), x + random.uniform(-10, 10), y + random.uniform(-8, 8), "terremoto en la línea del duque")
-            time.sleep(0.3)
-        # primer tótem de escudo por delante del duque, para que las defensas apunten al tótem
-        cast_spell(("totem",), *line(0.35), "tótem: escudo del duque")
-        if hc:
-            off = {"L": (-28, 0), "R": (28, 0), "T": (0, -28), "B": (0, 28)}.get(q[0] if q else "", (nx * 25, ny * 25))
-            hp = (qp[0] + off[0], qp[1] + off[1])
-            hp = hp if _safe(*hp) else qp
-            tap(hc["x"], 975, "seleccionar sanadoras", 0.25)
-            dev.taps([(int(hp[0]), int(hp[1]))] * 2)
-            log("act", "sanadoras detrás de la reina", "taps", [[int(hp[0]), int(hp[1])]])
-
-    # 3) tropa: si hay tanques, delante y concentrados; detrás rompemuros, luego los que pegan y por
-    #    último los aéreos (globos) cuando las defensas ya miran a los tanques. Sin tanques: aéreos en línea.
-    t0 = time.time()                         # los tiempos de hielos/habilidades cuentan desde aquí
-    # tropa = por nombre (el color de la carta engaña: las «super» son rojas como los héroes)
-    troops = [c for c in cards if c["name"] is not None and c["name"] not in SPECIAL
-              and (c["kind"] == "troop" or c["name"] in AIR | TANKS)]
-    tanks = [c for c in troops if c["name"] in TANKS]
-    air = [c for c in troops if c["name"] in AIR]
-    dps = [c for c in troops if c not in tanks and c not in air]
-    centre = pts[len(pts) // 4: len(pts) - len(pts) // 4] or pts
-    for c in tanks:
-        deploy_card(c, centre, plan, c["name"])
-    if tanks:
-        time.sleep(2.5)
-        wb0 = _find(cards, "wallbreaker")
-        if wb0:
-            deploy_card(wb0, centre[:2], plan, "rompemuros", passes=2)
-    for c in dps:
-        deploy_card(c, centre if tanks else pts, plan, c["name"])
-    if tanks and air:
-        time.sleep(2)
-    air.sort(key=lambda c: c["name"] not in ("dragon", "superdragon", "edrag", "dragonrider"))
-    # globos por el extremo del lado (con el asedio aéreo): abren otro frente y buscan defensas
-    flank = pts[-3:] if len(pts) >= 5 else pts
-    for c in [c for c in air if c["name"] == "balloon"]:
-        deploy_card(c, flank, plan, "globos (por el extremo)")
-    sg = _find(cards, "siege")
-    if sg:
-        place_unit(sg, flank + backs, "asedio aéreo con los globos")
-    air = [c for c in air if c["name"] not in ("balloon", "archer")]
-    drg = next((c for c in air if c["name"] in ("dragon", "superdragon")), None)
-    if drg and len(pts) >= 4:                # funnel: limpian los extremos para que el grueso vaya al centro
-        for end in (pts[0], pts[-1]):
-            tap(drg["x"], 975, "seleccionar dragón de funnel", 0.25)
-            tap(*end, "dragón de funnel en el extremo", 0.3)
-        log("think", "Funnel: un dragón en cada extremo; el grueso entra por el centro del lado en unos segundos.")
-        time.sleep(4)
-    centre = pts[len(pts) // 5: len(pts) - len(pts) // 5] or pts
-    for i, c in enumerate(air):
-        deploy_card(c, centre, plan, c["name"])
-    if hc and not qc:
-        deploy_card(hc, [back], plan, "sanadoras")
-
-    # 4) asedio detrás del centro de la línea
-    sc = _find(cards, "siege")
-    if sc and not slot_used(sc["left"]):
-        place_unit(sc, backs, "asedio")
-    cc = _find(cards, "cc")
-    if cc and cc.get("name") == "cc" and _card_empty(dev.shot(), cc):
-        log("think", "Castillo vacío (aún no han donado): no lo despliego.")
-        cc = None
-    if cc:
-        deploy_card(cc, backs[:2], plan, "tropas del castillo", passes=2)
-    time.sleep(1.0)
-
-    # 5) héroes detrás de la tropa (habilidad a su hora); rompemuros con el rey
-    # guerrera: habilidad pronto, la lanza limpia defensas desde lejos; centinela: cuando los dragones
-    # llegan a las defensas, para barrer un hueco y proteger al grupo
-    delays = {"warden": 9, "prince": 14, "king": 6, "champion": 5, "duke": 3}
-    for hero in ("warden", "prince", "king", "champion", "duke"):
-        c = _find(cards, hero)
-        if not c or id(c) in DUKE_DONE:
-            continue
-        if not place_unit(c, backs, hero):
-            continue
-        events.append((delays[hero], lambda h=hero: tap_card((h,), f"habilidad de {h}")))
-    wb = _find(cards, "wallbreaker")
-    if wb and not slot_used(wb["left"]):
-        deploy_card(wb, backs[:2], plan, "rompemuros", passes=2)
-    # cartas que no conozco (otra cuenta, tropas del castillo): a la línea / detrás
-    for c in cards:
-        if c["name"] is None and c["kind"] == "troop":
-            deploy_card(c, pts, plan, "tropa")
-        elif c["name"] is None and c["kind"] == "hero":
-            if not place_unit(c, backs, "héroe"):
+        hero_x = 10 ** 6
+        for b in read_bar(img):
+            if b["left"] < 10 or b["left"] > 1790 or card_used(img, b["left"]):
+                continue                       # cortada por el borde (se ve entera al desplazar) o gastada
+            name = vision.card_identity(img, b["left"])[0]
+            role = None
+            if name is None and not _card_empty(img, b):
+                # sin plantilla: el retrato de la wiki (cualquier tropa, héroe, hechizo o asedio de cualquier TH)
+                av, sc = vision.avatar_identity(img, b["left"])
+                if av:
+                    name, role = avatar_card(av)
+                    log("think", f"Carta en x={b['left']} reconocida por su retrato: {av} ({sc}) → {name}, {role}.")
+            if role is None:
+                role = _role_of(name, b["kind"], img, b)
+            if role == "hero":
+                hero_x = min(hero_x, b["left"])
+            if role == "siege" and name is None and b["left"] > hero_x:
+                role = None                    # a la derecha de los héroes sólo hay hechizos: el color engaña
+            if role == "empty":
                 continue
-            events.append((8, lambda c=c: tap(c["x"], 975, "habilidad del héroe", 0.2)))
+            c = dict(b, name=name, role=role, scrolled=right)
+            if right and (any(o["name"] == name for o in out if name) or not name and b["left"] < 900):
+                continue                       # ya vista con la barra sin desplazar
+            out.append(c)
+            if role is None:
+                ask.append((c, img))
+    scroll_bar(False)
 
-    # 6) hielos: a la aérea que quedó sin rayos cuando lleguen los dragones; luego al centro
-    cx, cy = plan["geo"]["center"]
-    for i, (rx, ry) in enumerate(plan["rest"][:3]):
-        eta = 3 + math.hypot(rx - mid[0], ry - mid[1]) / 55      # dragones ~55 px/s con zoom mínimo
-        events.append((eta, lambda rx=rx, ry=ry: cast_spell(("freeze", "cc_freeze"), rx, ry, "hielo a la aérea")))
-        if i == 0:
-            events.append((eta + 6, lambda rx=rx, ry=ry: cast_spell(("freeze", "cc_freeze"), rx, ry, "hielo a la aérea")))
-    events.append((20, lambda: cast_spell(("freeze", "cc_freeze"), cx, cy, "hielo al centro")))
-    events.append((26, lambda: cast_spell(("freeze", "cc_freeze"), cx, cy, "hielo al centro")))
-    # lo que sobre: donde estén peleando ahora (lo busca la visión; si no, hacia el centro)
-    def late(names, label):
-        img = dev.shot()
-        if not any(c["name"] in names and not card_used(img, c["left"]) for c in bar_cards(img)):
-            return
-        x, y = spell_target(side)
-        cast_spell(names, x, y, label)
-    for t in (32, 38, 44):
-        events.append((t, lambda: late(("freeze", "cc_freeze"), "hielo sobrante")))
-        events.append((t + 3, lambda: late(("rage",), "furia sobrante")))
-    # terremotos: los dos juntos sobre la aérea más lejana (la última a la que llegan los dragones),
-    # para debilitarla antes de que llegue la tropa (los hielos van a las cercanas)
-    if not q:                              # sin flecha en esquina los terremotos no salieron: al centro igual
-        for k in range(2):
-            events.append((1 + k, lambda: cast_spell(("earthquake",), cx, cy, "terremoto al centro")))
-    # tótems: escudo del duque a lo largo de su línea (absorben el DPS que iría a él); 2 se guardan
-    line = COMBO.get("line")
-    if line:
-        for i, k in enumerate((0.55, 0.75, 0.9)):
-            events.append((2 + 4 * i, lambda k=k: cast_spell(("totem",), *COMBO["line"](k), "tótem: escudo del duque")))
-        # el resto, delante de la tropa principal cuando entra al centro
-        for i, k in enumerate((0.45, 0.65)):
-            tx_, ty_ = mid[0] + (cx - mid[0]) * k, mid[1] + (cy - mid[1]) * k
-            events.append((16 + 5 * i, lambda tx_=tx_, ty_=ty_: cast_spell(("totem",), tx_, ty_, "tótem delante de la tropa")))
+    def classify():
+        roles = spell_roles()
+        for c, img in ask[:4]:                 # como mucho 4 preguntas (~2 s cada una)
+            try:
+                k = eyes.card_kind(img, c["left"], [SPELL_ES.get(n, n) for n in sorted(roles["defensas"])],
+                                   [SPELL_ES.get(n, n) for n in sorted(roles["tropas"])])
+            except Exception:
+                k = None
+            c["role"] = {"tropa": "troop", "heroe": "hero", "asedio": "siege", "hechizo_defensas": "spell_def",
+                         "hechizo_tropas": "spell_boost"}.get(k)
+            if c["role"] is None:              # sin respuesta clara: nada se queda en la barra
+                c["role"] = "spell_boost" if c["kind"] == "spell" else "troop"
+            log("think", f"Carta sin plantilla en x={c['left']}: el modelo dice «{k}».")
+    th = threading.Thread(target=classify, daemon=True)
+    th.start()
+    return out, th
+
+
+def pick(c):
+    """Pone la barra donde está la carta y devuelve su posición actual, o None si ya está gastada. Las cartas
+    con nombre se buscan por nombre (la barra se mueve un poco); las demás, por su sitio."""
+    scroll_bar(c["scrolled"])
+    img = dev.shot()
+    bar = read_bar(img)
+    if c.get("name"):
+        same = [b for b in bar if vision.card_identity(img, b["left"])[0] == c["name"]]
+        if not same and c["name"] in ("freeze", "lightning", "cc_freeze", "cc_lightning", "rage", "totem",
+                                      "earthquake", "revive"):
+            scroll_bar(not c["scrolled"])      # al gastarse cartas la barra se reordena: mirar al otro lado
+            img = dev.shot()
+            same = [b for b in read_bar(img) if vision.card_identity(img, b["left"])[0] == c["name"]]
+            if same:
+                c["scrolled"] = BAR["scrolled"]
+            else:                              # vuelve a donde estaba: la buscará por su sitio
+                scroll_bar(c["scrolled"])
+                img = dev.shot()
+                bar = read_bar(img)
+        if not same:
+            # 13-nov: tras lanzar un terremoto la carta queda resaltada y elevada, la plantilla no la reconoce y
+            # el 2.º terremoto no salía. Por su sitio, si allí hay una carta sin gastar
+            same = [b for b in bar if abs(b["left"] - c["left"]) < 50]
     else:
-        for i, k in enumerate((0.22, 0.32, 0.42, 0.52, 0.62, 0.72)):
-            tx_, ty_ = mid[0] + (cx - mid[0]) * k, mid[1] + (cy - mid[1]) * k
-            events.append((5 + 4 * i, lambda tx_=tx_, ty_=ty_: cast_spell(("totem",), tx_, ty_, "tótem delante de la tropa")))
-    # arquera de limpieza, cuando la tropa ya está dentro
-    ar = _find(cards, "archer")
-    if ar:
-        events.append((22, lambda: deploy_card(ar, backs[:2], plan, "arquera de limpieza", passes=2)))
+        same = [b for b in bar if abs(b["left"] - c["left"]) < 50]
+    same = [b for b in same if not card_used(img, b["left"])
+            and (c.get("role") == "hero" or not card_grey(img, b["left"]))]   # x0 en gris = gastada
+    if not same:
+        return None
+    b = min(same, key=lambda b: abs(b["left"] - c["left"]))
+    c.update(left=b["left"], x=b["x"])
+    return c
 
-    # revivir: se vigila la carta del duque; en cuanto cae, revivir donde iba (su línea, según el tiempo)
-    # y un tótem al lado para que el duque revivido aguante más
-    def check_duke():
-        if COMBO.get("revived") or not COMBO.get("line"):
-            return
-        if not duke_down():
-            return
-        t = time.time() - COMBO.get("start", time.time())
-        k = min(1.0, 0.45 + t / 40)          # vuela por la línea hacia el centro
-        x, y = COMBO["line"](k)
-        if cast_spell(("revive",), x, y, f"revivir al duque (cayó hacia el {int(k * 100)} % de su línea)"):
-            COMBO["revived"] = True
-            cast_spell(("totem",), x + 25, y, "tótem que protege al duque revivido")
-    for t in range(4, 60, 2):
-        events.append((t, check_duke))
-    if not COMBO.get("line"):
-        events.append((30, lambda: cast_spell(("revive",), *spell_target(side), "resurrección sobre los héroes")))
-    # furias: siguen a la tropa (de la entrada hacia el centro)
-    for i, k in enumerate((0.2, 0.32, 0.44, 0.56, 0.68, 0.8)):
-        rx, ry = mid[0] + (cx - mid[0]) * k, mid[1] + (cy - mid[1]) * k
-        events.append((3 + 3.5 * i, lambda rx=rx, ry=ry: cast_spell(("rage",), rx, ry, "furia sobre la tropa")))
-    # hechizos que no conozco (furia, curación… de otra cuenta): sobre la tropa al entrar
-    tgt = (mid[0] + (cx - mid[0]) * 0.3, mid[1] + (cy - mid[1]) * 0.3)
 
-    def unknown_spell(c):
-        tap(c["x"], 975, "seleccionar hechizo", 0.25)
-        for _ in range(6):
-            tap(tgt[0] + random.uniform(-25, 25), tgt[1] + random.uniform(-20, 20), "lanzar hechizo", 0.35)
-            if slot_used(c["left"]):
+def entry_points(geo, st, ads):
+    """Tramo del borde por donde entra TODO: los puntos del borde del mapa con más botín cerca (cada almacén
+    pesa su parte del botín y cuenta menos cuanto más lejos), agrupados alrededor del mejor (≤340 px) y
+    separados ≥90 px. Sin almacenes: frente a la defensa aérea más expuesta o, si no, el lado izquierdo."""
+    # candidatos densos y HASTA LAS PUNTAS (13-nov: almacenes junto a la punta de abajo, pegados a la barra de
+    # cartas, y el punto más cercano quedaba a 200 px porque cada lado se recortaba un 12 % por los extremos)
+    cands = []
+    for (x1, y1), (x2, y2) in MAP_SIDES.values():
+        for i in range(21):
+            t = 0.03 + 0.94 * i / 20
+            x, y = x1 + (x2 - x1) * t, y1 + (y2 - y1) * t
+            q = (x + (960 - x) * 0.12, y + (470 - y) * 0.12)
+            if _safe(*q):
+                cands.append(q)
+    cx = (geo["corners"]["L"][0] + geo["corners"]["R"][0]) / 2
+    cy = (geo["corners"]["T"][1] + geo["corners"]["B"][1]) / 2
+    targets = [(s["x"], s["y"], s["w"]) for s in st if s.get("w", 0) > 0]
+    if not targets:
+        targets = [(x, y, 1.0) for x, y in ads] or [(cx - 400, cy, 1.0)]
+
+    def value(p):
+        return sum(w / (1 + math.hypot(p[0] - x, p[1] - y) / 220) for x, y, w in targets)
+    best = max(cands, key=value)
+    # tramo COMPACTO alrededor del mejor (antes se ensanchaba hasta 580 px para reunir 5 puntos y el ejército
+    # acababa repartido por todo un lado, lejos del botín): mejor 3-4 puntos juntos frente a los almacenes
+    near = sorted((p for p in cands if math.hypot(p[0] - best[0], p[1] - best[1]) <= 360), key=value, reverse=True)
+    out = []
+    for gap in (85, 60):
+        out = []
+        for p in near:
+            if all(math.hypot(p[0] - q[0], p[1] - q[1]) >= gap for q in out):
+                out.append(p)
+            if len(out) >= 7:
                 break
-    for i, c in enumerate(c for c in cards if c["name"] is None and c["kind"] == "spell"):
-        events.append((7 + 3 * i, lambda c=c: unknown_spell(c)))
-    return [(t0 + t, f) for t, f in events]
+        if len(out) >= 4:
+            break
+    # de un extremo al otro del tramo (el del medio es la entrada principal: héroes, asedio, castillo)
+    ax, ay = best[0] - cx, best[1] - cy
+    out.sort(key=lambda p: (p[0] - cx) * -ay + (p[1] - cy) * ax)
+    # cada punto, lo más dentro posible SIN pisar la aldea (contorno ensanchado ~20 px = zona roja): 13-nov, en
+    # una aldea que llenaba el mapa los puntos fijos al 12 % caían entre edificios y no salía ni una tropa
+    md = _dilate(geo["mask"].astype("uint8"), 41)
+    M = (960, 470)
+
+    def ray(p, k):                            # mismo rayo del borde del mapa, a otra profundidad k
+        ex, ey = (p[0] - 0.12 * M[0]) / 0.88, (p[1] - 0.12 * M[1]) / 0.88
+        return ex + (M[0] - ex) * k, ey + (M[1] - ey) * k
+
+    def legal(p):
+        for k in (0.2, 0.16, 0.12, 0.09, 0.06):
+            q = ray(p, k)
+            if _safe(*q) and not md[min(1079, int(q[1])), min(1919, int(q[0]))]:
+                return q
+        return ray(p, 0.04)
+    outer = [q for q in (ray(p, 0.04) for p in out) if _safe(*q)]
+    legal_pts = [legal(p) for p in out]
+    main = legal_pts[min(range(len(out)), key=lambda i: math.hypot(out[i][0] - best[0], out[i][1] - best[1]))]
+    return legal_pts, main, (cx, cy), outer
+
+
+def inset_points(pts, centre, k):
+    """Los mismos puntos movidos k (fracción) hacia el centro; k<0 hacia fuera. Sólo los tocables."""
+    cx, cy = centre
+    return [(x + (cx - x) * k, y + (cy - y) * k) for x, y in pts if _safe(x + (cx - x) * k, y + (cy - y) * k)]
+
+
+def humanize(pts, dx=14, dy=10):
+    """Como una persona: cada toque un poco desplazado y en otro orden (nunca dos veces el mismo píxel)."""
+    out = []
+    for x, y in pts:
+        for _ in range(4):
+            q = (x + random.uniform(-dx, dx), y + random.uniform(-dy, dy))
+            if _safe(*q):
+                break
+        else:
+            q = (x, y)
+        out.append(q)
+    random.shuffle(out)
+    return out
+
+
+# Papel de cada tropa en el ejército (datos, no coreografía): los tanques van primero y concentrados, los
+# rompemuros con ellos, el resto después por todo el tramo y el apoyo (sanadoras…) detrás. Lo desconocido = daño.
+TROOP_ROLES = {"tank": ["giant", "golem", "pekka", "superyeti", "super_yeti", "yeti", "giant_skeleton", "lavahound",
+                        "lava_hound", "ice_golem", "super_giant", "electro_titan", "root_rider", "battle_ram",
+                        "goblin_giant", "boxer_giant", "mighty_yak", "druid"],
+               "breaker": ["wallbreaker", "wall_breaker", "super_wallbreaker", "super_wall_breaker"],
+               "support": ["healer", "apprentice_warden"]}
+
+
+def troop_role(name):
+    roles = CFG.get("troop_roles") or TROOP_ROLES
+    for r, names in roles.items():
+        if name in names:
+            return r
+    return "dps"
+
+
+EDGE = {"tag": None}
+PROBE_TROOPS = ["archer", "barbarian", "goblin", "minion", "skeleton", "bat", "sneaky_archer", "super_archer",
+                "super_barbarian", "sneaky_goblin", "super_minion", "wizard"]   # baratas: para tantear
+PROBE = {"k": 0.0}                         # profundidad que valió en el último tanteo                       # qué variante de puntos funcionó en la última batalla
+
+
+def edge_variants(pts, centre, outer):
+    """Variantes de los puntos de entrada, de la que funcionó la última vez a las demás. Cada escenario pone
+    el borde jugable en otro sitio (13-nov: en la nieve sólo valían puntos MÁS FUERA del borde del mapa)."""
+    v = [("contorno", pts), ("borde", list(outer)), ("fuera", inset_points(pts, centre, -0.05)),
+         ("muy fuera", inset_points(pts, centre, -0.10)), ("dentro", inset_points(pts, centre, 0.06))]
+    v = [(t, q) for t, q in v if q]
+    v.sort(key=lambda tq: tq[0] != EDGE["tag"])
+    return v
+
+
+def unleash(c, variants, label):
+    """Suelta TODA la carta: ráfagas (2 toques por punto) mientras quede algo; si una ráfaga no saca nada (zona
+    roja o fuera del mapa) se pasa a la siguiente variante de puntos. Devuelve la variante que funcionó (o
+    None). Tocar una carta vacía es inocuo (el juego dice «Selecciona una unidad diferente»)."""
+    v, sig, good, partial = 0, None, None, 0
+    gone = lambda im: card_grey(im, c["left"]) or _card_empty(im, c)   # vacía: gris o ya sin «xN»
+    for burst in range(10):
+        if not pick(c):
+            return good or (variants[v] if burst else None)
+        img = dev.shot()
+        if burst and gone(img):
+            return variants[v]
+        now = _card_sig(img, c)
+        if sig is not None:
+            if sum(abs(a - b) for a, b in zip(now, sig)) / len(now) > 6:
+                good = variants[v]             # el número de la carta ha bajado: estos puntos valen
+                partial += 1
+                # 3.ª ráfaga que sólo saca algunas: la mayoría de estos puntos caen en zona roja (13-nov: 5-8
+                # ráfagas por carta en una aldea pegada al borde, 76 s de despliegue) → siguiente variante
+                if partial >= 3 and v + 1 < len(variants):
+                    v, partial = v + 1, 0
+            else:
+                time.sleep(0.4)                # la carta tarda en ponerse gris al vaciarse: mirar otra vez
+                img = dev.shot()
+                if gone(img) or not pick(c):
+                    return variants[v]
+                v += 1                         # la ráfaga anterior no sacó nada: otros puntos
+                if v >= len(variants):
+                    log("warn", f"{label}: no consigo desplegarla.")
+                    return good
+        sig = now
+        tag, use = variants[v]
+        dev.tap(c["x"] + random.uniform(-12, 12), 975 + random.uniform(-15, 15))
+        time.sleep(random.uniform(0.08, 0.2))
+        taps = humanize([q for q in use for _ in range(2)])     # 2 por punto: x7 sale de una vez
+        dev.taps(taps)
+        log("act", f"desplegar {label} (puntos: {tag})", "taps", [[int(x), int(y)] for x, y in taps])
+        time.sleep(random.uniform(0.18, 0.4))
+    return good
+
+
+def once(c, p, label):
+    """Asedio / castillo: UN toque en el campo y nunca más (volver a pulsar la carta del asedio activa su
+    habilidad, pedido del usuario)."""
+    if not pick(c):
+        return
+    dev.tap(c["x"], 975)
+    time.sleep(0.12)
+    dev.tap(int(p[0]), int(p[1]))
+    log("act", f"{label} (un solo toque)", "tap", [[int(p[0]), int(p[1])]])
+    time.sleep(0.3)
+
+
+def cast_at(c, x, y, label, n=1):
+    """n hechizos de la carta c en (x, y) (seleccionada UNA vez: la carta sigue seleccionada entre lanzamientos;
+    tocar de más con la carta vacía es inocuo). False si la carta ya está gastada."""
+    if not pick(c):
+        return False
+    x, y = (x, y) if _safe(x, y) else (min(1880, max(30, x)), min(850, max(80, y)))
+    tap(c["x"] + random.uniform(-12, 12), 975 + random.uniform(-15, 15), f"seleccionar {label}",
+        random.uniform(0.1, 0.25))
+    for i in range(n):
+        q = humanize([(x, y)], 10, 8)[0]
+        tap(*q, f"{label} → {int(q[0])},{int(q[1])}", random.uniform(0.2, 0.4))
+    return True
+
+
+class Battle:
+    """Una batalla: inventario, despliegue y la vigilancia de después (hechizos y habilidades a su momento)."""
+
+    def __init__(self, shot, geo, ads, st, pts, main, centre):
+        self.shot, self.geo, self.ads, self.st = shot, geo, list(ads), st
+        self.pts, self.main, self.centre = pts, main, centre
+        self.heroes = {}                       # nombre -> instante en que toca su habilidad (0 = hecha)
+        self.hero_cards = {}
+        self.front = None                      # (x, y, t): donde pelean nuestras tropas
+        self.prev = None
+        self.hit = {}                          # objetivo -> instante del último hechizo de defensas
+        self.last_boost = self.last_def = 0
+        self.sweeps = []
+        self.t0 = time.time()
+        self.outer = []                        # los mismos puntos en el borde extremo del mapa (reserva)
+
+    # -- despliegue --
+    def deploy(self):
+        cards, th = bar_inventory()
+        self.cards = cards
+        log("think", "Barra: " + ", ".join(f"{c['name'] or '?'}({c['role'] or '?'})" for c in cards))
+        # 1) hechizos de defensas que conviene lanzar YA: rayos a las aéreas más cercanas a la entrada (antes de
+        #    que lleguen las tropas), terremotos al núcleo
+        ads = sorted(self.ads, key=lambda a: math.hypot(a[0] - self.main[0], a[1] - self.main[1]))
+        per = max(1, CFG["accounts"].get(self.acc, {}).get("lightning_per_ad", 3))
+        for c in [c for c in cards if c["role"] == "spell_def" and c["name"] in ("lightning", "cc_lightning")]:
+            if not ads:
+                break
+            for i in range(12):
+                ax, ay = ads[min(i // per, len(ads) - 1)]
+                if not cast_at(c, ax, ay, f"rayo a la aérea {int(ax)},{int(ay)}"):
+                    break
+            c["done"] = not pick(c)
+        core = (self.centre[0] + (self.main[0] - self.centre[0]) * 0.15,
+                self.centre[1] + (self.main[1] - self.centre[1]) * 0.15)
+        self.core = core
+        # 2) todo el ejército por el tramo, en el orden de la barra; la variante de puntos que funciona se
+        #    aprende con la primera carta y la usan las siguientes, los héroes y el asedio
+        self.variants = edge_variants(self.pts, self.centre, self.outer)
+        troops = [c for c in cards if c["role"] == "troop"]
+        order = {"tank": 0, "breaker": 1, "dps": 2, "support": 3}
+        troops.sort(key=lambda c: order[troop_role(c["name"])])   # estable: dentro de cada grupo, la barra
+        # tanteo desactivado por defecto (13-nov: 9 ataques con tanteo 1,1★ de media frente a 1,58★ sin él; las
+        # tropas de tanteo salen sueltas y antes que el resto)
+        legal = self.probe(troops) if CFG.get("probe") else []
+        if len(legal) >= 2:
+            self.variants.insert(0, ("probado", legal))
+            self.good = legal
+        log("think", "Orden del ejército: " + ", ".join(f"{c['name'] or 'tropa'} ({troop_role(c['name'])})"
+                                                       for c in troops) + ".")
+        prev = None
+        for c in troops:
+            r = troop_role(c["name"])
+            if prev == "tank" and r != "tank":
+                time.sleep(random.uniform(1.5, 3.0))    # que los tanques se adelanten y atraigan las defensas
+            # tanques y rompemuros concentrados en el centro del tramo; el apoyo, detrás (más fuera)
+            if r in ("tank", "breaker"):
+                vs = [(t, self.near_main(q)[:3 if r == "tank" else 2]) for t, q in self.variants]
+            elif r == "support":
+                time.sleep(random.uniform(0.8, 1.6))
+                vs = [(t, self.near_main(q)[:3]) for t, q in self.variants if t != "dentro"]
+            else:
+                vs = self.variants
+            self.learn(unleash(c, vs, c["name"] or "tropa"))
+            prev = r
+        # 3) héroes con el ejército (habilidad a los ~7 s); el punto donde sale uno se usa para los demás
+        th.join(timeout=10)                     # cartas que el modelo estaba clasificando
+        for c in cards:
+            if c["role"] == "troop" and not c.get("name"):
+                self.learn(unleash(c, self.variants, "tropa"))
+        for c in cards:
+            if c["role"] != "hero" or not pick(c):
+                continue
+            ok = place_unit(c, self.unit_points(), f"{c['name'] or 'héroe'} con el ejército", 0.3)
+            if ok:
+                self.unit_ok = ok
+                key = c["name"] or f"héroe@{c['left']}"
+                self.heroes[key] = time.time() + CFG.get("hero_ability_seconds", 7)
+                self.hero_cards[key] = c
+        # 4) asedio: como un héroe (sólo vale con su barra de vida; sin desplegar, tocar la carta sólo la
+        #    selecciona; desplegado, ya no se vuelve a tocar: nunca su habilidad). Castillo: un toque.
+        for c in cards:
+            if c["role"] == "siege" and pick(c):
+                ok = place_unit(c, self.unit_points(), "máquina de asedio (sin habilidad)", 0.3)
+                self.unit_ok = ok or getattr(self, "unit_ok", None)
+                c["role"] = "done"
+            elif c["role"] == "cc":
+                once(c, self.edge_main(), "tropas del castillo")
+                c["role"] = "done"
+        # 5) terremotos (todos al mismo sitio, se suman) al núcleo, ya con la tropa en camino
+        for c in [c for c in cards if c["role"] == "spell_def" and c["name"] == "earthquake"]:
+            cast_at(c, core[0], core[1], "terremotos al núcleo", n=6)
+            c["done"] = not pick(c)            # si queda alguno, lo lanza el barrido final
+        self.t0 = time.time()
+        self.sweeps = [self.t0 + 6, self.t0 + 16]
+        snap("despliegue")
+
+    def probe(self, troops):
+        """Tantea cada punto de entrada con UNA tropa, como una persona: si el número de la carta baja, el punto
+        vale; si no, el mismo rayo un poco más hacia fuera. Empieza por la profundidad que valió la última vez y
+        para con 4 puntos buenos. 13-nov: sin tantear, una aldea pegada al borde costó 76 s de despliegue; el
+        primer tanteo (dos llamadas a ADB y dos capturas por toque) 24 s; así ~0,6 s por toque."""
+        t0, legal, taps = time.time(), [], 0
+        # se tantea con lo más barato (13-nov: tanteando con la 1.ª carta, los globos salían sueltos antes que el
+        # resto y morían solos; con el tanteo bajaron las estrellas): baratas primero, luego de atrás adelante
+        cheap = CFG.get("probe_troops") or PROBE_TROOPS
+        cards = sorted(troops, key=lambda c: (c["name"] not in cheap, -troops.index(c)))
+        depths = [0.0, -0.03, -0.06, -0.10, -0.14]
+        depths.sort(key=lambda k: k != PROBE.get("k", 0.0))
+        img = None
+        for p in self.near_main(self.pts):
+            if len(legal) >= 4:
+                break
+            while cards and not pick(cards[0]):
+                cards.pop(0)                   # carta gastada: se tantea con la siguiente
+                img = None
+            if not cards:
+                break
+            c = cards[0]
+            for k in depths:
+                q = p if k == 0.0 else (inset_points([p], self.centre, k) or [None])[0]
+                if q is None:
+                    continue
+                img = img or dev.shot()
+                before = _card_sig(img, c)
+                qq = humanize([q], 6, 5)[0]
+                dev.taps([(c["x"] + random.uniform(-10, 10), 975 + random.uniform(-12, 12)), qq])   # un comando
+                taps += 1
+                time.sleep(0.25)
+                img = dev.shot()
+                now = _card_sig(img, c)
+                if card_grey(img, c["left"]) or _card_empty(img, c) or                         sum(abs(x - y) for x, y in zip(now, before)) / len(now) > 6:
+                    legal.append(q)
+                    PROBE["k"] = k
+                    break
+        log("think", f"Tanteo: {len(legal)} puntos de entrada valen ({taps} toques, {time.time() - t0:.1f} s).",
+            "", [[int(x), int(y)] for x, y in legal])
+        return legal
+
+    def learn(self, good):
+        """Variante de puntos que ha funcionado: la primera para todo lo que queda (y la próxima batalla)."""
+        if isinstance(good, tuple) and good[1]:
+            self.good = good[1]
+            EDGE["tag"] = good[0]
+            self.variants.sort(key=lambda tq: tq[0] != good[0])
+
+    def near_main(self, pts):
+        return sorted(pts, key=lambda p: math.hypot(p[0] - self.main[0], p[1] - self.main[1]))
+
+    def edge_main(self):
+        """Punto para lo que sólo tiene un toque (asedio, castillo): uno de los que ya han funcionado."""
+        if getattr(self, "unit_ok", None):
+            return self.unit_ok
+        pts = getattr(self, "good", None) or self.outer or [self.main]
+        return self.near_main(pts)[0]
+
+    def unit_points(self):
+        """Puntos para héroes y asedio: donde ya salió uno; luego los de la variante que funcionó con las
+        tropas alternando los extremos del tramo (13-nov: un extremo entero caía en zona roja y sólo se
+        probaba ese); luego las demás variantes."""
+        def ends(q):
+            q = self.near_main(q)
+            out = []
+            while q:
+                out.append(q.pop(0))
+                if q:
+                    out.append(q.pop())
+            return out
+        out = ([self.unit_ok] if getattr(self, "unit_ok", None) else []) + ends(getattr(self, "good", None) or [])
+        for _, q in self.variants:
+            out += ends(q)[:2]
+        seen, uniq = set(), []
+        for p in out:
+            k = (int(p[0]) // 20, int(p[1]) // 20)
+            if k not in seen:
+                seen.add(k)
+                uniq.append(p)
+        return uniq
+
+    # -- vigilancia --
+    def spells(self, role):
+        return [c for c in self.cards if c["role"] == role and not c.get("done") and not c.get("spent")]
+
+    def busy(self):
+        """Algo pendiente que justifica seguir mirando aunque la batalla parezca quieta."""
+        now = time.time()
+        return any(t for t in self.heroes.values()) or bool(self.sweeps) or bool(
+            self.front and now - self.front[2] < 6 and now - self.t0 < 90
+            and (self.spells("spell_def") or [s for s in self.spells("spell_boost") if s["name"] != "revive"]))
+
+    def tick(self, img):
+        now = time.time()
+        if self.prev is not None:
+            a = vision.activity(self.prev, img, self.geo.get("mask"))
+            if a:
+                x, y, s = a
+                if self.front and now - self.front[2] < 3:
+                    x, y = 0.6 * x + 0.4 * self.front[0], 0.6 * y + 0.4 * self.front[1]
+                self.front = (x, y, now)
+        self.prev = img
+        # habilidades de los héroes
+        for k, t in list(self.heroes.items()):
+            if t and now >= t:
+                c = self.hero_cards[k]
+                if pick(c):
+                    tap(c["x"], 975, f"habilidad de {k}", 0.2)
+                self.heroes[k] = 0
+                return
+        # repaso: lo que no haya salido (sin guardar nada)
+        if self.sweeps and now >= self.sweeps[0]:
+            self.sweeps.pop(0)
+            for c in self.cards:               # héroes que no salieron: otra vez, del borde extremo hacia dentro
+                key = c["name"] or f"héroe@{c['left']}"
+                if c["role"] == "hero" and key not in self.heroes and not c.get("retried") and pick(c):
+                    c["retried"] = True
+                    if place_unit(c, self.unit_points(), f"{key} (no había salido)", 0.3):
+                        self.heroes[key] = time.time() + CFG.get("hero_ability_seconds", 7)
+                        self.hero_cards[key] = c
+            for c in self.cards:
+                if c["role"] == "troop" and pick(c):
+                    log("think", f"Queda {c['name'] or 'tropa'} sin salir: la suelto.")
+                    self.learn(unleash(c, self.variants, c["name"] or "tropa"))
+            return
+        if not self.front or now - self.front[2] > 2.5:
+            return                             # sin ver a nuestras tropas no se lanza nada
+        fx, fy, _ = self.front
+        cx, cy = self.centre
+        d = math.hypot(cx - fx, cy - fy) or 1
+        ahead = lambda k: (fx + (cx - fx) / d * k, fy + (cy - fy) / d * k)
+        # resurrección: en cuanto cae un héroe, donde pelean
+        img_bar = None
+        for k, c in self.hero_cards.items():
+            if c.get("dead"):
+                continue
+            img_bar = img_bar or dev.shot()
+            if card_grey(img_bar, c["left"]):
+                c["dead"] = True
+                rv = next((s for s in self.spells("spell_boost") if s["name"] == "revive"), None)
+                if rv and cast_at(rv, fx, fy, f"resurrección: ha caído {k}"):
+                    return
+        # de defensas: a la defensa a la que llegan (aérea a ≤230 px de la tropa) o, si no hay, justo delante
+        defs = self.spells("spell_def")
+        if defs and now - self.last_def >= 3 and now - self.t0 > 3:
+            tgt = None
+            for ax, ay in sorted(self.ads, key=lambda a: math.hypot(a[0] - fx, a[1] - fy)):
+                if math.hypot(ax - fx, ay - fy) <= 230 and now - self.hit.get((ax, ay), 0) > 7:
+                    tgt = (ax, ay)
+                    break
+            if tgt is None and now - self.t0 > 12:
+                tgt = ahead(90)
+            if tgt:
+                s = defs[0]
+                if cast_at(s, *tgt, f"{SPELL_ES.get(s['name'], 'hechizo')} a las defensas"):
+                    self.hit[tgt] = now
+                    s["tries"] = s.get("tries", 0) + 1
+                if not pick(s) or s.get("tries", 0) >= 12:
+                    s["spent"] = True
+                self.last_def = now
+                return
+        # de tropas: sobre el grupo, un poco por delante; uno cada ~4 s
+        boosts = [s for s in self.spells("spell_boost") if s["name"] != "revive"]
+        if boosts and now - self.last_boost >= 4 and now - self.t0 > 4:
+            s = boosts[0]
+            k = 70 if s["name"] == "totem" else 35       # el tótem delante, para que las defensas le apunten
+            if cast_at(s, *ahead(k), f"{SPELL_ES.get(s['name'], 'hechizo')} sobre las tropas"):
+                s["tries"] = s.get("tries", 0) + 1
+            if not pick(s) or s.get("tries", 0) >= 12:
+                s["spent"] = True
+            self.last_boost = now
+
+
+def _flush(b):
+    """Antes de acabar, se gasta TODO lo que quede (pedido del usuario 13-nov): hechizos de defensas a la aérea
+    más cercana a la tropa (rayos) o al núcleo; de tropas y resurrección, donde se vio pelear por última vez
+    (o al núcleo); y un último repaso de héroes y tropas que no salieran."""
+    if getattr(b, "flushed", False):
+        return
+    b.flushed = True
+    b.sweeps = [0]
+    try:
+        b.tick(dev.shot())
+    except Exception as e:
+        log("warn", f"Repaso final: {e}")
+    core = getattr(b, "core", b.centre)
+    spot = (b.front[0], b.front[1]) if b.front else core
+    for c in b.cards:
+        if c["role"] not in ("spell_def", "spell_boost") or not pick(c):
+            continue
+        if c["role"] == "spell_def":
+            ads = sorted(b.ads, key=lambda a: math.hypot(a[0] - spot[0], a[1] - spot[1]))
+            tgt = ads[0] if ads and c["name"] in ("lightning", "cc_lightning") else core
+        else:
+            tgt = spot
+        log("think", f"Queda {SPELL_ES.get(c['name'], c['name'] or 'hechizo')}: lo lanzo antes de acabar.")
+        cast_at(c, *tgt, f"{SPELL_ES.get(c['name'], 'hechizo')} (lo que quedaba)", n=6)
+        c["spent"] = True
+
+
+def fight(b, stall_seconds=15, max_seconds=200):
+    """Vigila la batalla: decisiones de `b` en cada vuelta, x4 en el último minuto y fin cuando todo está
+    desplegado y el botín y el daño llevan `stall_seconds` quietos."""
+    t0 = time.time()
+    snaps = [t0 + dt for dt in (15, 35, 60, 90)]
+    last, since, fast = None, time.time(), False
+    while time.time() - t0 < max_seconds:
+        kind, img = screen()
+        if kind in ("result", "home"):
+            return
+        if not fast and speed_button(img):
+            tap(*SPEED_BTN, "velocidad x4", 0.5)
+            fast = True
+        if snaps and time.time() >= snaps[0]:
+            snaps.pop(0)
+            snap(f"batalla{3 - len(snaps)}")
+        try:
+            b.tick(img)
+        except Exception as e:
+            log("warn", f"Fallo en la batalla: {e}")
+        sig = _battle_sig(img)
+        if last is None or sum(abs(x - y) for x, y in zip(sig, last)) / len(sig) > 1.5 or b.busy():
+            last, since = sig, time.time()
+        elif time.time() - since >= stall_seconds:
+            if not getattr(b, "flushed", False):
+                _flush(b)                      # nada se queda sin usar; si eso reactiva la batalla, se sigue
+                last, since = None, time.time()
+                continue
+            log("think", f"Botín y daño quietos {stall_seconds} s: termino la batalla.")
+            break
+        if not getattr(b, "flushed", False) and time.time() - b.t0 > 75:
+            _flush(b)                          # a los 75 s ya no hay motivo para guardar nada
+        time.sleep(0.3)
+    if screen()[0] == "result":
+        return
+    tap(137, 805, "terminar batalla", 1.5)
+    tap(1167, 693, "confirmar", 5)
+    for _ in range(5):
+        if screen()[0] == "result":
+            return
+        time.sleep(2)
+
+
+def battle_geometry(img):
+    """Contorno de la aldea y defensas aéreas (sin modelo). Si una aérea cae fuera del contorno, el contorno
+    está mal y se usa el rombo del mapa entero."""
+    geo = vision.village_geometry(img, fallback=True)
+    ads = vision.find_air_defenses(img)
+    if geo["src"] != "mapa" and ads:
+        big = _dilate(geo["mask"], 61)
+        if any(not big[min(1079, int(y)), min(1919, int(x))] for x, y in ads):
+            geo = _map_geometry()
+    return geo, ads
+
+
+def dynamic_attack(acc, shot, loot):
+    """Ataque completo: dónde está el botín → por dónde entrar → desplegar → vigilar hasta el final."""
+    geo, ads = battle_geometry(shot)
+    try:
+        st, quad, half = storage_map(shot, geo, loot)
+    except Exception as e:
+        log("warn", f"No he podido buscar los almacenes: {e}")
+        st, quad = [], {}
+    pts, main, centre, outer = entry_points(geo, st, ads)
+    ng = sum(1 for s in st if s["kind"] == "gold")
+    log("think", f"Almacenes: {ng} de oro y {len(st) - ng} de elixir; botín por cuadrante "
+                 + ", ".join(f"{k} {v:.1f}" for k, v in quad.items())
+                 + f". Entro por {int(main[0])},{int(main[1])} ({len(pts)} puntos); {len(ads)} aéreas vistas.",
+        "", [[int(x), int(y)] for x, y in pts])
+    plan = {"geo": geo, "pts": pts, "zap": ads, "rest": [], "queen": None, "storages": st, "main": main}
+    try:
+        save_plan_image(shot, plan)
+    except Exception as e:
+        log("warn", f"No he guardado la imagen del plan: {e}")
+    BAR["scrolled"] = False
+    b = Battle(shot, geo, ads, st, pts, main, centre)
+    b.outer = outer
+    b.acc = acc
+    b.deploy()
+    fight(b, stall_seconds=CFG.get("stall_seconds", 15))
+
+
+# ---------------- evento de tropa en masa (p. ej. «M.O.M.M.A en masa») ----------------
+# Con "mass_event": true en config.json, en cuanto la 1.ª carta de la barra de batalla (la de más a la izquierda)
+# sale GRIS, el ataque es mecánico: primera aldea que salga, toda esa carta rodeando la aldea, esperar al 100 %
+# y a por la siguiente. Sin leer botín, sin planear y sin el modelo. Si la carta deja de salir, ataque normal.
+MASS = {"until": 0, "collected": 0, "clan": 0}
+MASS_ORDER = (3, 1, 5, 0, 6, 2, 4)            # dentro de cada lado, primero el centro: si faltan tropas, rodean igual
+
+
+def mass_on():
+    return bool(CFG.get("mass_event")) and MASS["until"] > time.time()
+
+
+def mass_event_card(img):
+    """La carta del evento en masa. Por su dibujo (plantillas `mass_cards` de cards/, p. ej. «momma»: el
+    9-nov-2026 salió en la 4.ª casilla, fondo azul, «x25», en cualquier sitio de la barra) o, si no, la primera
+    carta con el fondo gris."""
+    bar = read_bar(img)
+    names = set(CFG.get("mass_cards", ["momma"]))
+    for c in bar:
+        if c["kind"] != "used" and vision.card_identity(img, c["left"])[0] in names:
+            return c
+    if not bar or bar[0]["left"] > 400:
+        return None
+    c = bar[0]
+    cols = [color(img, c["left"] + dx, y, 3) for dx, y in CFG.get("mass_card_points", ((10, 905), (10, 1010), (122, 905)))]
+    grey = all(max(k) - min(k) < 30 and 70 < sum(k) / 3 < 235 for k in cols)
+    return c if grey else None
+
+
+def _card_lum(img, c):
+    a = img.crop((c["left"] + 5, 895, c["left"] + 135, 1050)).convert("L")
+    return sum(a.getdata()) / (a.width * a.height)
+
+
+# borde del mapa con el zoom mínimo, en orden: esquina izquierda → arriba → esquina derecha → abajo. Abajo el
+# rombo se corta con la barra de cartas (y=858): ese tramo no es borde y no se usa.
+MAP_BORDER = [(262, 520), (262, 470), (950, -10), (970, -10), (1658, 470), (1658, 520), (1180, 858)]
+MAP_BORDER_LOW = [(740, 858), (262, 520)]
+
+
+def _border_samples(poly, step=12):
+    out = []
+    for (x1, y1), (x2, y2) in zip(poly, poly[1:]):
+        L = math.hypot(x2 - x1, y2 - y1)
+        for i in range(max(1, int(L // step))):
+            t = i / max(1, int(L // step))
+            out.append((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t))
+    return out
+
+
+# de fuera a dentro; los negativos caen POR FUERA del rombo habitual: sirven si la cámara no se alejó del todo
+# (escenario de lava: la aldea llenaba la pantalla y todos los anillos caían dentro). Con la cámara bien
+# alejada caen en el bosque y no hacen nada.
+MASS_INSETS = (0.04, 0.06, 0.08, 0.10, -0.03, -0.07, -0.11, -0.16, 0.12, 0.145, 0.17, 0.20, 0.235, 0.27, 0.31,
+               0.36, 0.41)
+
+
+# Las cuatro PUNTAS del mapa (pedido del usuario 2026-11-09 21:15: «literalmente los extremos, las puntas»):
+# izquierda, derecha, arriba (lo más arriba tocable, y≈80) y abajo (lo más abajo antes de la barra y sin los
+# botones de la izquierda). Cada punta: el vértice y dos toques un poco abiertos a lo largo de sus lados.
+MASS_TIPS = {
+    # vértices visibles con el zoom mínimo; arriba y abajo el vértice queda tapado (contador / barra de cartas),
+    # así que se usan los dos puntos del BORDE más cercanos a esa punta que aún se pueden tocar
+    "izquierda": [(262, 495), (280, 482), (280, 508)],
+    "derecha": [(1658, 495), (1640, 482), (1640, 508)],
+    "arriba-izq": [(833, 78), (815, 90)],
+    "arriba-der": [(1087, 78), (1105, 90)],
+    "abajo-der": [(1190, 850), (1210, 836)],
+    "abajo-izq": [(578, 742), (560, 729)],
+}
+MASS_TIP_INSETS = (0.03, 0.06, -0.04, 0.09, -0.08, 0.13, 0.18)   # de lo más extremo hacia dentro (y fuera)
+
+
+def mass_tip_taps(total=25):
+    """Una sola tanda de toques: en cada inset (de fuera a dentro), las 4 puntas por turnos, ~total/4 por punta.
+    Las tropas salen en los primeros toques válidos, así que cada punta se queda con las suyas en su sitio más
+    extremo; los toques que sobran no hacen nada («Selecciona una unidad diferente»)."""
+    per = -(-total // len(MASS_TIPS))
+    out = []
+    for ins in CFG.get("mass_tip_insets", MASS_TIP_INSETS):
+        for pts in MASS_TIPS.values():
+            ring = [(x + (960 - x) * ins, y + (470 - y) * ins) for x, y in pts]
+            ring = [q for q in ring if _safe(*q)]
+            if ring:
+                out += [ring[i % len(ring)] for i in range(per)]
+    return out
+
+
+def mass_rings(n_angles=32, offset=0.0):
+    """Anillos de puntos, del borde extremo del mapa hacia dentro, en `n_angles` ángulos repartidos por todo el
+    perímetro tocable. Cada escenario pone el borde jugable en otro sitio (en el del barco pirata, el de
+    MAP_BORDER cae fuera): se prueba de fuera a dentro y cada tropa sale en el punto válido más exterior."""
+    raw = _border_samples(MAP_BORDER) + _border_samples(MAP_BORDER_LOW)
+    base = [raw[int((i + offset) * len(raw) / n_angles) % len(raw)] for i in range(n_angles)]
+    rings = []
+    for ins in CFG.get("mass_insets", MASS_INSETS):
+        ring = [(x + (960 - x) * ins, y + (470 - y) * ins) for x, y in base]
+        rings.append([q for q in ring if _safe(*q)])
+    return rings
+
+
+def _spread(pts, k):
+    """k puntos repartidos entre `pts` (en orden de perímetro), no los k primeros."""
+    if k >= len(pts):
+        return list(pts)
+    return [pts[int(i * len(pts) / k)] for i in range(k)]
+
+
+def mass_left(img, c):
+    """Cuántas tropas quedan en la carta del evento («x19»). Texto literal + regex."""
+    b = (c["left"], 885, c["left"] + 140, 945)
+    d = eyes.ask(img.crop(b).resize((420, 180)), 'Copia exactamente el texto blanco de arriba. Responde {"text": "..."}')
+    m = re.search(r"x\s*(\d+)", str(d.get("text") or ""), re.I)
+    return int(m[1]) if m else None
+
+
+def mass_points(img, n, inset=None):
+    """n puntos por el BORDE EXTREMO del mapa, repartidos a la misma distancia por todo el perímetro tocable
+    (esquinas izquierda y derecha incluidas): ahí siempre se puede desplegar. Lo pidió el usuario: el contorno
+    de la aldea por colores fallaba en aldeas grandes y los toques caían en la zona roja (seleccionaban
+    edificios). Sin modelo."""
+    inset = CFG.get("mass_inset", 0.08) if inset is None else inset
+    raw = _border_samples(MAP_BORDER) + _border_samples(MAP_BORDER_LOW)
+    pts = [(x + (960 - x) * inset, y + (470 - y) * inset) for x, y in raw]
+    pts = [q for q in pts if _safe(*q)]
+    if not pts:
+        return [], "borde"
+    # mismos pasos a lo largo del perímetro tocable: todos los ángulos cubiertos
+    k = len(pts) / n
+    return [pts[int(i * k) % len(pts)] for i in range(n)], "borde del mapa"
+
+
+def mass_attack(acc, c):
+    """Evento en masa: toda la carta gris rodeando la aldea, esperar al 100 % y volver. Sin pensar."""
+    MASS["until"] = time.time() + 1200
+    t0 = time.time()
+    dev.zoom_out(3)                           # bien alejada: el borde del mapa tiene que verse
+    img = dev.shot()
+    c = mass_event_card(img) or c             # tras el zoom la barra puede haberse movido un poco
+    lum0 = _card_lum(img, c)
+    used, why = 0, "quedan tropas"
+    # sin pensar: todas las puntas de golpe y una sola comprobación al final
+    pts = mass_tip_taps(int(CFG.get("mass_count", 25)))
+    # en tandas de 30 toques (cada toque de Android tarda ~0,14 s: 195 de golpe pasaban de los 30 s de adb y
+    # rompían la batalla). La 1.ª tanda = la punta más extrema de las 6; casi siempre basta con ella.
+    done = False
+    for i in range(0, len(pts), 30):
+        chunk = pts[i:i + 30]
+        tap(c["x"], 975, "seleccionar la carta del evento", 0.15)
+        dev.taps([(int(x), int(y)) for x, y in chunk])
+        log("act", f"desplegar tropas del evento en las puntas del mapa (toques {i + 1}-{i + len(chunk)})", "taps",
+            [[int(x), int(y)] for x, y in chunk])
+        time.sleep(0.4)
+        img = dev.shot()
+        if screen(img)[0] in ("result", "home") or _card_lum(img, c) < lum0 * 0.75:
+            done = True
+            break
+    rings = [] if done else mass_rings()
+    why = "carta vacía" if done else why
+    for k, ring in enumerate(rings):          # reserva (rara): el borde entero, de fuera a dentro
+        if not ring:
+            continue
+        tap(c["x"], 975, "seleccionar la carta del evento", 0.15)
+        for j in range(0, len(ring), 30):
+            dev.taps([(int(x), int(y)) for x, y in ring[j:j + 30]])
+        used = k + 1
+        log("act", f"quedaban tropas: borde, anillo {k + 1} ({len(ring)} puntos)", "taps",
+            [[int(x), int(y)] for x, y in ring])
+        time.sleep(0.5)
+        img = dev.shot()
+        if screen(img)[0] in ("result", "home"):
+            why = "batalla ya terminada"
+            break
+        if _card_lum(img, c) < lum0 * 0.75:
+            why = "carta vacía"
+            break
+    log("think", f"Evento: puntas + {used} anillo(s) de reserva ({why}).")
+    snap("despliegue")
+    # desde el borde tardan en llegar y hay ratos sin daño mientras andan: 30 s quietos antes de rendirse
+    wait_battle_end(stall_seconds=CFG.get("mass_stall_seconds", 30), max_seconds=200, poll=1)
+    res_img = dev.shot()
+    res_img.save(REVIEW / "resultado.png")
+    if screen(res_img)[0] == "result":
+        tap(960, 925, "volver a casa", 1.5)
+        wait_for(lambda: screen()[0] == "home", 8, 0.4)
+    for _ in range(4):
+        if go_home():
+            break
+        time.sleep(2)
+    LAST_GAIN.clear()
+    LAST_GAIN["mass"] = True                   # botín sin leer: no cuenta como ataque «seco»
+    log("done", f"Ataque en masa en {acc} terminado en {int(time.time() - t0)} s.")
+    return True
+
+
+def finding_rivals(img):
+    """Pantalla blanca de «Buscando rivales…» (el servidor tarda): casi toda la imagen muy clara."""
+    a = img.convert("L").resize((48, 27))
+    if sum(1 for v in a.getdata() if v > 225) > 0.75 * 48 * 27:
+        return True
+    # nubes que aún no se han ido: la aldea se ve desvaída (casi sin color y muy clara) (03:41, 10-nov)
+    hsv = np.asarray(img.resize((96, 54)).convert("HSV")).astype(np.float32) / 255
+    return hsv[..., 1].mean() < 0.16 and hsv[..., 2].mean() > 0.72
+
+
+READS = {"t": 0}
+
+
+def log_reads():
+    """Cada 15 min: cuántas lecturas de pantalla se hicieron sin modelo (OCR/píxeles) y cuántas con él."""
+    if time.time() - READS["t"] >= 900:
+        READS["t"] = time.time()
+        o, m, dudas = eyes.summary()
+        log("think", f"Lecturas de pantalla desde el arranque: {o} sin modelo, {m} con el modelo"
+                     + (f" (el OCR dudó y preguntó al modelo: {', '.join(f'{k} ×{v}' for k, v in dudas.items())})"
+                        if dudas else "") + ".")
 
 
 def attack(acc):
     """Busca un rival que cumpla el criterio, ataca, espera y apunta el botín. True si atacó."""
+    log_reads()
     rule = CFG["accounts"][acc]["min_loot"]
     if not main_village():
         return False
-    try:
-        collect_resources()
-    except Exception as e:
-        log("warn", f"No he podido recoger recursos: {e}")
+    mass = mass_on()                     # evento en masa: nada de leer almacenes ni elegir botín
+    if not mass or time.time() - MASS["collected"] > 600:
+        try:
+            collect_resources()
+        except Exception as e:
+            log("warn", f"No he podido recoger recursos: {e}")
+        MASS["collected"] = time.time()
     full = ()
     cap = CFG["accounts"][acc]["capacity"]
-    if cap:
-        res = eyes.my_resources(dev.shot())
+    if cap and not mass:
+        shot = dev.shot()
+        res = eyes.my_resources(shot)
         a = CFG["accounts"][acc]
         fr = a.get("full_ratio", CFG["full_ratio"])
         ratio = {"gold": fr, "elixir": fr, "dark": a.get("dark_full_ratio", CFG.get("dark_full_ratio", 0.5))}
-        full = tuple(k for k in ("gold", "elixir", "dark") if (res.get(k) or 0) >= cap[k] * ratio[k])
+        full = tuple(k for k in ("gold", "elixir", "dark") if k in cap and (bar_full(shot, k) or (
+                     cap_ok(k, cap[k]) and (res.get(k) or 0) >= cap[k] * ratio[k])))
         focus = a.get("farm_focus")
         if focus:
             full = tuple(k for k in ("gold", "elixir", "dark") if k not in focus or k in full)
         if full:
             log("think", f"Ya lleno en {acc}: {', '.join(full)} → sólo busco lo que falta.")
-    home_before = eyes.my_resources(dev.shot())
-    note_resources(acc, home_before)
-    tap(120, 960, "abrir Batalla", 2.5)
+    home_before = {} if mass else eyes.my_resources(dev.shot())
+    if not mass:
+        note_resources(acc, home_before)
+    check_stop()                         # última ocasión de obedecer al visor antes de gastar el ejército
+    if mass:                                  # en masa: esperar a cada pantalla en vez de dormir fijo
+        tap(120, 960, "abrir Batalla", 0.6)
+        wait_for(battle_menu_open, 5, 0.3)
+    else:
+        tap(120, 960, "abrir Batalla", 2.5)
     if not battle_menu_open():
         log("warn", "El menú Batalla no se ha abierto.")
         go_home()
         return False
-    tap(400, 800, "Buscar batalla (NORMAL, tarjeta izquierda)", 3)
-    if screen()[0] != "search" and is_green(color(dev.shot(), 1820, 990, 4)):
-        tap(1695, 962, "Atacar (confirmar ejército)", 8)
+    if mass:
+        tap(400, 800, "Buscar batalla (NORMAL, tarjeta izquierda)", 1.0)
+        army = lambda: is_green(color(dev.shot(), 1820, 990, 4))
+        wait_for(lambda: screen()[0] == "search" or army(), 5, 0.3)
+        if screen()[0] != "search" and army():
+            tap(1695, 962, "Atacar (confirmar ejército)", 1.0)
+    else:
+        tap(400, 800, "Buscar batalla (NORMAL, tarjeta izquierda)", 3)
+        if screen()[0] != "search" and is_green(color(dev.shot(), 1820, 990, 4)):
+            tap(1695, 962, "Atacar (confirmar ejército)", 8)
+    loot = None
     for n in range(CFG["accounts"][acc]["max_searches"]):
         check_stop()
         kind, img = screen()
-        for _ in range(5):            # las nubes entre bases a veces tardan
-            if kind == "search":
-                break
-            time.sleep(3)
+        waited = 0                    # las nubes entre bases a veces tardan; y «Buscando rivales…», más
+        step = 1 if mass else 3
+        while kind != "search" and (waited < 15 or finding_rivals(img) and waited < 90):
+            time.sleep(step)
+            waited += step
             kind, img = screen()
         if kind != "search":
             if True:
@@ -1586,6 +2180,28 @@ def attack(acc):
                 log("warn", "No estoy en la búsqueda; vuelvo a casa (captura en no_busqueda.png).")
                 go_home()
                 return False
+        if n == 0 and CFG.get("mass_event"):
+            c = mass_event_card(img)
+            for _ in range(3 if not c else 0):  # la barra a veces aún está apareciendo: se mira otra vez
+                time.sleep(0.8)
+                img = dev.shot()
+                c = mass_event_card(img)
+                if c:
+                    break
+            if c:
+                MASS["miss"] = 0
+                if not mass:
+                    img.save(REVIEW / "evento_detectado.png")
+                    log("think", "Carta del evento en masa en la barra: ataques en masa (sin mirar botín).")
+                return mass_attack(acc, c)
+            if mass:
+                MASS["miss"] = MASS.get("miss", 0) + 1
+                img.save(HERE / "evento_no_visto.png")
+                if MASS["miss"] >= 3:          # tres búsquedas seguidas sin la carta: el evento ha terminado
+                    MASS["until"] = 0
+                    log("think", "Ya no sale la carta del evento (3 búsquedas seguidas): vuelvo al ataque normal.")
+                else:
+                    log("think", f"No veo la carta del evento ({MASS['miss']}/3): ataque normal esta vez.")
         loot = eyes.loot_available(img)
         ok = good_target(loot, rule, full) or n == CFG["accounts"][acc]["max_searches"] - 1
         log("think", f"Rival: {loot['gold']} oro / {loot['elixir']} elixir / {loot['dark']} oscuro → "
@@ -1594,44 +2210,8 @@ def attack(acc):
             break
         tap(1750, 765, "Siguiente", 5)
     dev.zoom_out(2)
-    before = eyes.my_resources(dev.shot())
-    shot = dev.shot()
-    plan = None
-    try:
-        plan = plan_attack(shot, acc)
-    except Exception as e:
-        log("warn", f"No he podido planificar el ataque: {e}")
-    try:
-        save_plan_image(shot, plan)
-    except Exception as e:
-        log("warn", f"No he guardado la imagen del plan: {e}")
-    if plan and CFG["accounts"].get(acc, {}).get("attack_mode") == "spam":
-        plan, events = spam_attack(shot)
-        snap("despliegue")
-        t_end = time.time()
-        for k, dt in enumerate((15, 35, 60, 90)):
-            f = lambda k=k: snap(f"batalla{k}")
-            f.is_snap = True
-            events.append((t_end + dt, f))
-        wait_battle_end(events=events)
-    elif plan:
-        events = execute_plan(plan)
-        snap("despliegue")
-        time.sleep(2)
-        plan_leftovers(plan)
-        t_end = time.time()
-        for k, dt in enumerate((15, 35, 60, 90)):
-            f = lambda k=k: snap(f"batalla{k}")
-            f.is_snap = True                 # las capturas no retrasan el «botín quieto → terminar»
-            events.append((t_end + dt, f))
-        wait_battle_end(events=events)
-    else:
-        side = eyes.best_side(shot)
-        log("think", "No veo bien el contorno de la aldea: ataque simple.")
-        deploy(side)
-        time.sleep(4)
-        leftovers(side)
-        wait_battle_end()
+    # el mismo ataque para todas las cuentas: lee la barra y la aldea y decide (sin coreografía por tropa)
+    dynamic_attack(acc, dev.shot(), loot)
     res_img = dev.shot()
     res_img.save(REVIEW / "resultado.png")
     res = {}
@@ -1655,6 +2235,7 @@ def attack(acc):
     loot_log(acc, "batalla normal", res.get("stars"), res.get("pct"), gained)
     if res.get("pct") is not None:
         log("think", f"Resultado: {res.get('stars')}★ {res.get('pct')} %.")
+    LAST_GAIN.clear()
     LAST_GAIN.update(gained)
     log("done", f"Ataque terminado en {acc}: +{gained['gold']} oro, +{gained['elixir']} elixir, +{gained['dark']} oscuro.")
     return True
@@ -1664,16 +2245,23 @@ def collect_resources():
     """Recoge las burbujas de colectores/minas/taladros de la aldea (sólo toques sobre la propia aldea)."""
     if not go_home():
         return
-    img = dev.shot()
-    if selection_bar(img):
-        log("think", "Hay un edificio seleccionado: no recojo para no tocar sus botones.")
-        return
-    pts = [(x, y) for x, y in eyes.resource_bubbles(img)
-           if safe_map_point(x, y) and y < 700]           # lejos de botones y de la barra de un edificio
-    if pts:
-        dev.taps(pts)
-        log("act", f"recoger {len(pts)} burbujas de recursos", "taps", [[int(x), int(y)] for x, y in pts])
-        time.sleep(1.5)
+    # De una en una y volviendo a mirar tras cada toque (QA): si el juego recoge de golpe todas las de un tipo,
+    # las demás ya no tienen burbuja y tocarlas seleccionaría el edificio. Por debajo de y=700 (donde sale la
+    # barra de un edificio seleccionado) sólo se toca si no hay ninguno seleccionado.
+    tapped = []
+    for _ in range(30):
+        img = dev.shot()
+        sel = selection_bar(img)
+        pts = [(x, y) for x, y in eyes.resource_bubbles(img)
+               if safe_map_point(x, y) and (y < 700 or not sel)
+               and all(abs(x - tx) > 25 or abs(y - ty) > 25 for tx, ty in tapped)]
+        if not pts:
+            break
+        x, y = min(pts, key=lambda p: p[1])  # de arriba abajo: lejos de la barra de abajo
+        dev.tap(x, y, 0.5)
+        tapped.append((x, y))
+    if tapped:
+        log("act", f"recoger {len(tapped)} burbujas de recursos", "taps", [[int(x), int(y)] for x, y in tapped])
         deselect()
 
 
@@ -1682,9 +2270,47 @@ BARS = {"main": (("gold", 1700, 57, (1380, 85, 1910, 240)), ("elixir", 1700, 130
         "builder": (("gold", 1560, 52, (1020, 80, 1910, 240)), ("elixir", 1700, 130, (1020, 160, 1910, 315)))}
 
 
-def read_capacity(acc, village="main"):
+BAR_FILL = {"gold": (76, 1497), "elixir": (150, 1497), "dark": (222, 1590)}   # fila sin cifras, extremo izquierdo
+BAR_HUE = {"gold": (0.08, 0.2), "elixir": (0.75, 0.9), "dark": (0.72, 0.9)}
+
+
+def bar_full(img, res):
+    """¿La barra de arriba a la derecha (aldea principal) está llena? Se mide por píxeles, sin el modelo: el
+    relleno es un color plano que crece de derecha a izquierda; lleno = llega al extremo izquierdo. Sirve
+    de segunda opinión cuando la capacidad leída está mal (310 000 → 3101000 dejaba el oscuro «a medias»)."""
+    y, left = BAR_FILL[res]
+    ref = img.getpixel((1830, y))[:3]
+    h, s, _ = colorsys.rgb_to_hsv(*(c / 255 for c in ref))
+    lo, hi = BAR_HUE[res]
+    if not (lo <= h <= hi and s >= 0.5):
+        return False                       # casi vacía (en 1830 ya hay fondo) o tapada por una ventana
+    x = 1830
+    while x > left - 15 and sum(abs(a - b) for a, b in zip(img.getpixel((x - 1, y))[:3], ref)) < 40:
+        x -= 1
+    return x <= left + 8                   # 8 px ≈ 3 % de la barra (medido: lleno empieza entre +0 y +5)
+
+
+CAP_MAX = {"main": {"gold": 50_000_000, "elixir": 50_000_000, "dark": 600_000},
+           "builder": {"gold": 10_000_000, "elixir": 10_000_000}}
+
+
+def cap_ok(res, v, village="main"):
+    """¿Es una capacidad posible? (fuera de rango = lectura rota: el oscuro nunca pasa de ~500k)."""
+    return bool(v) and 1000 <= v <= CAP_MAX[village].get(res, 50_000_000)
+
+
+def extra_digit(long, short):
+    """¿`long` es `short` con una cifra metida? Es el error típico del modelo con el separador de miles:
+    «310 000» → 3101000, «28 500 000» → 128500000. Una mejora real nunca multiplica por 10."""
+    a, b = str(long), str(short)
+    return len(a) == len(b) + 1 and any(a[:i] + a[i + 1:] == b for i in range(len(a)))
+
+
+def read_capacity(acc, village="main", have=None):
     """Lee el máximo de cada recurso tocando su barra (ventana «Máx.») y lo guarda: si se amplían los
-    almacenes o aparece un recurso nuevo, no hay que tocar nada a mano."""
+    almacenes o aparece un recurso nuevo, no hay que tocar nada a mano. `have`: lo que hay ahora (un
+    máximo nunca es menor que lo que hay: decide entre dos lecturas que difieren en una cifra)."""
+    have = have or {}
     key = "capacity" if village == "main" else "builder_capacity"
     a = CFG["accounts"].get(acc, {})
     cap = dict(a.get(key) or {})
@@ -1692,11 +2318,33 @@ def read_capacity(acc, village="main"):
     for res, x, y, box in BARS[village]:
         dev.tap(x, y, 0.9)
         img = dev.shot()
-        d = eyes.ask(img.crop(box).resize(((box[2] - box[0]) * 2, (box[3] - box[1]) * 2)),
-                     'Lee el número blanco que va después de "Máx.:". Responde {"max": N} sin espacios; '
-                     '{"max": null} si no aparece ese texto.')
-        v = eyes._num(d.get("max"))
-        if v and v >= 1000 and v != cap.get(res):
+
+        def read(scale):
+            d = eyes.ask(img.crop(box).resize(((box[2] - box[0]) * scale, (box[3] - box[1]) * scale)),
+                         'Lee el número blanco que va después de "Máx.:". Responde {"max": N} sin espacios; '
+                         '{"max": null} si no aparece ese texto.')
+            return eyes._num(d.get("max"))
+        v = read(2)
+        old = cap.get(res) if cap_ok(res, cap.get(res), village) else None   # lo guardado también puede estar mal
+        now = have.get(res) or 0
+        if v and not cap_ok(res, v, village):
+            log("think", f"{acc}: capacidad de {res} imposible ({v}); me quedo con {old}.")
+            v = None
+        elif v and old and extra_digit(v, old) and now <= old:
+            log("think", f"{acc}: la lectura de {res} ({v}) es {old} con una cifra de más; me quedo con {old}.")
+            v = None
+        elif v and old and extra_digit(v, old):
+            pass                                   # tengo más que lo guardado: lo guardado era el corto y malo
+        elif v and old and extra_digit(old, v) and now > v:
+            log("think", f"{acc}: la lectura de {res} ({v}) es menor que lo que tengo ({now}); me quedo con {old}.")
+            v = None
+        elif v and old and extra_digit(old, v):
+            pass                                   # lo guardado era el que tenía la cifra de más: se corrige
+        elif v and v != old and read(3) != v:
+            # el modelo a veces mete una cifra de más (4251500 → 47251500): sólo vale si otra lectura coincide
+            log("think", f"{acc}: lectura dudosa de la capacidad de {res} ({v}); me quedo con {old}.")
+            v = None
+        if v and v != cap.get(res):
             log("think", f"{acc}: capacidad de {res}: {cap.get(res)} → {v}.")
             cap[res] = int(v)
             changed = True
@@ -1717,28 +2365,35 @@ def note_resources(acc, res, village="main"):
     set_state(resources=allr)
 
 
-def storages_full(acc):
+def storages_full(acc, kinds=None):
     if not main_village():
         return False
+    shot = dev.shot()
+    res = eyes.my_resources(shot)              # antes de tocar las barras: con la burbuja abierta no se lee
+    bars = {k for k in ("gold", "elixir", "dark") if bar_full(shot, k)}
     try:
-        read_capacity(acc)                     # el máximo real, después de cada ataque
+        read_capacity(acc, have=res)           # el máximo real, después de cada ataque
     except Exception as e:
         log("warn", f"No he podido leer la capacidad: {e}")
-    cap = CFG["accounts"][acc].get("capacity")
-    if not cap:
+    saved = CFG["accounts"][acc].get("capacity") or {}
+    if not saved:
         return False
-    res = eyes.my_resources(dev.shot())
+    cap = {k: v for k, v in saved.items() if cap_ok(k, v)}
+    for k in saved.keys() - cap.keys():
+        log("warn", f"{acc}: la capacidad guardada de {k} ({saved[k]}) es imposible; decide la barra.")
     note_resources(acc, res)
     a = CFG["accounts"][acc]
     r = a.get("full_ratio", CFG["full_ratio"])
     dr = a.get("dark_full_ratio", CFG.get("dark_full_ratio", 0.5))
-    focus = a.get("farm_focus")                # p. ej. ["elixir"]: sólo cuenta eso
-    if focus:
-        full = all((res.get(k) or 0) >= cap[k] * (dr if k == "dark" else r) for k in focus)
-    else:
-        full = all((res.get(k) or 0) >= cap[k] * r for k in ("gold", "elixir")) and (res.get("dark") or 0) >= cap.get("dark", 0) * dr
-    log("think", f"{acc}: oro {res['gold']}/{cap['gold']}, elixir {res['elixir']}/{cap['elixir']}, "
-                 f"oscuro {res['dark']}/{cap['dark']} → {'LLENO' if full else 'falta'}")
+
+    def by_number(k):
+        return k in cap and (res.get(k) or 0) >= cap[k] * (dr if k == "dark" else r)
+    kinds = kinds or a.get("farm_focus") or [k for k in ("gold", "elixir", "dark") if k in saved]   # farm_focus: sólo eso
+    full = all(k in bars or by_number(k) for k in kinds)    # barra al tope = lleno, diga lo que diga la lectura
+    by_bar = [k for k in kinds if k in bars and not by_number(k)]
+    log("think", f"{acc}: oro {res['gold']}/{cap.get('gold')}, elixir {res['elixir']}/{cap.get('elixir')}, "
+                 f"oscuro {res['dark']}/{cap.get('dark')} → {'LLENO' if full else 'falta'}"
+                 + (f" (barra llena en {', '.join(by_bar)} aunque las cifras no cuadren)" if by_bar else ""))
     return full
 
 
@@ -1791,25 +2446,35 @@ def cart_window_open(img):
     return x[0] > 150 and x[1] < 70 and all(90 < c[0] < 170 and 40 < c[1] < 110 and c[2] < 40 for c in wood)
 
 
+CART = {"pos": None}       # dónde se abrió el carro la última vez (la vista tras el zoom y el arrastre es fija)
+
+
 def collect_cart():
     """Recoge el elixir del Carro de elixir (junto al muelle de la aldea nocturna) si hay algo."""
     if not go_home() or not in_builder():
         return
     dev.zoom_out(2)
     dev.swipe(1400, 400, 600, 650, 600, wait=1.5)       # el muelle (barco + carro) queda a la vista
-    shot = dev.shot()
+    img = None
+    if CART["pos"]:                                     # sitio conocido: sin preguntar al modelo
+        tap(*CART["pos"], "abrir carro de elixir (sitio conocido)", 1.5)
+        img = dev.shot()
+        if not cart_window_open(img):
+            img, CART["pos"] = None, None
+            go_home()
     queries = ['la pequeña carreta de madera (carro de elixir) que está en la hierba, abajo a la izquierda del '
                'muelle de madera del barco',
                'la burbuja blanca con una gota de elixir morada que está en la orilla, junto al muelle de madera del '
                'barco (NO las de dentro de la aldea)']
-    img = None
-    for q in queries:
+    shot = None if img else dev.shot()
+    for q in ([] if img else queries):
         pos = eyes.find(shot, q)
         if not pos or not safe_map_point(*pos, bars_bottom=260) or pos[1] > 700:
             continue
         tap(*pos, "abrir carro de elixir", 2)
         img = dev.shot()
         if cart_window_open(img):
+            CART["pos"] = pos
             break
         img = None
         go_home()
@@ -1863,57 +2528,116 @@ def bb_state(img, x):
     return "muerta"
 
 
-def bb_deploy(x, label):
-    """Selecciona la carta y la suelta por el borde derecho hasta que la carta suba (desplegada)."""
-    tap(x, 935, f"seleccionar {label}", 0.3)          # 935: lejos del botón de cambiar tropa (abajo)
-    for i in range(6):
-        px, py = 1400 + random.uniform(-25, 25), 450 + 45 * i
-        tap(px, py, f"desplegar {label}", 0.5)
-        img = dev.shot()
-        if label == "máquina" or bb_state(img, x) != "pendiente":
+def bb_pending(img, troops):
+    return [x for x in troops if bb_state(img, x) == "pendiente"]
+
+
+def bb_live(img):
+    """¿Batalla nocturna lista para desplegar, aunque siga la cuenta atrás del principio (o el paso a la
+    2ª fase)? Basta con ver en la barra al menos 2 cartas sin desplegar (cabecera morada): soltar la
+    primera tropa empieza la batalla sin esperar a que acabe la cuenta."""
+    _, troops = bb_cards(img)
+    return len(bb_pending(img, troops)) >= 2
+
+
+# Puntos donde soltar tropas en la nocturna, alternando lados: según la base, la cámara la deja a la izquierda
+# (el borde derecho, x≈1400, está libre) o a la derecha (entonces la zona libre es la izquierda). Ninguno toca
+# botones: «Rendirse» y «Ejército potenciado» están abajo a la izquierda (y > 680) y la velocidad a la derecha.
+BB_DROPS = [(1400, 450), (560, 400), (1400, 570), (700, 290), (560, 520), (1400, 630)]
+BB_DROP = {"i": 0}                                  # el último punto que funcionó se prueba primero
+
+
+def bb_deploy(xs, labels):
+    """Suelta seguidas las cartas `xs` (seleccionar + tocar el mapa) y lo comprueba con una sola captura al
+    final; las que sigan sin subir se reintentan en el siguiente punto de BB_DROPS."""
+    machine = next((x for x in xs if labels[x] == "máquina"), None)
+    order = [BB_DROP["i"]] + [k for k in range(len(BB_DROPS)) if k != BB_DROP["i"]]
+    for k in order:
+        if not xs:
             return
+        bx, by = BB_DROPS[k]
+        pts = []
+        for x in xs:
+            dev.tap(x, 935)                         # 935: lejos del botón de cambiar tropa (abajo)
+            time.sleep(0.25)
+            px, py = bx + random.uniform(-25, 25), by
+            dev.tap(px, py)
+            time.sleep(0.2)
+            pts.append([int(px), int(py)])
+        log("act", "desplegar " + ", ".join(labels[x] for x in xs), "taps", pts)
+        time.sleep(0.3)
+        img = dev.shot()
+        # la máquina no tiene estado por colores: con un intento basta (como antes)
+        troops = [x for x in xs if x != machine]
+        xs = [x for x in troops if bb_state(img, x) == "pendiente"]
+        if len(xs) < len(troops):
+            if k != BB_DROP["i"]:
+                log("think", f"En esta base se despliega en {bx},{by}: lo recuerdo.")
+            BB_DROP["i"] = k
+        machine = None
+    if xs:
+        log("warn", "No he podido desplegar " + ", ".join(labels[x] for x in xs) + ".")
 
 
 def bb_battle():
-    """Juega una batalla de constructor (2 fases) hasta la pantalla de resultado."""
+    """Juega una batalla de constructor (2 fases) hasta la pantalla de resultado. Despliega en cuanto se ven
+    las cartas, sin esperar a la cuenta atrás. Devuelve False si la batalla no llegó a empezar."""
     t0 = time.time()
     machine_done = set()
-    while time.time() - t0 < 300:
-        check_stop()
+    seen = zoomed = False
+    while time.time() - t0 < 330:
+        check_stop(redirect=False)                  # ya buscando o jugando: la batalla se acaba antes
         kind, img = screen()
-        if kind == "result":
-            return
-        if kind != "battle":
-            time.sleep(3)
+        if kind == "result" and seen:
+            return True
+        if kind != "battle" and not bb_live(img):
+            if not seen and time.time() - t0 > 90:
+                log("warn", "La batalla de constructor no ha empezado (sigo en la búsqueda u otra pantalla).")
+                return False
+            time.sleep(0.7)
             continue
+        if not seen:
+            seen = True
+            log("think", f"Batalla nocturna a la vista a los {time.time() - t0:.0f} s: despliego ya, sin esperar "
+                         f"a la cuenta atrás.")
+        if not zoomed:                              # una vez por batalla, antes de soltar nada
+            dev.zoom_out(1)
+            zoomed = True
+            img = dev.shot()
         machine, troops = bb_cards(img)
+        labels = {x: f"tropa {i + 1}" for i, x in enumerate(troops)}
         # 1) desplegar lo que falte (en la 2ª fase la barra cambia: se vuelve a mirar cada vuelta)
+        todo = bb_pending(img, troops)
         if machine is not None and machine not in machine_done:
-            bb_deploy(machine, "máquina")
+            labels[machine] = "máquina"
+            todo.insert(0, machine)
             machine_done.add(machine)
-        for x in troops:
-            if bb_state(dev.shot(), x) == "pendiente":
-                bb_deploy(x, f"tropa {troops.index(x) + 1}")
+        if todo:
+            bb_deploy(todo, labels)
+            img = dev.shot()
         # 2) habilidades: tropas desplegadas con la cabecera morada y la máquina con sus barras moradas
-        img = dev.shot()
         for x in troops:
             if bb_state(img, x) == "lista":
-                tap(x, 960, f"habilidad tropa {troops.index(x) + 1}", 0.4)
+                tap(x, 960, f"habilidad tropa {troops.index(x) + 1}", 0.3)
         if machine is not None and any(_purple(color(img, machine + dx, 835, 2)) for dx in (-3, 37)):
-            tap(machine, 960, "habilidad de la máquina", 0.4)
-        time.sleep(2.5)
+            tap(machine, 960, "habilidad de la máquina", 0.3)
+        time.sleep(1.2)
     log("warn", "La batalla de constructor no terminó a tiempo.")
+    return seen
 
 
-def bb_storages(acc):
-    """(lleno?, recursos) de la aldea nocturna según capacidad y % objetivo de la cuenta."""
+def bb_storages(acc, res=None, read_cap=True):
+    """(lleno?, recursos) de la aldea nocturna según capacidad y % objetivo de la cuenta. `res`: recursos
+    recién leídos (para no volver a preguntar al modelo); `read_cap`: releer la capacidad (basta una vez)."""
     a = CFG["accounts"][acc]
-    try:
-        read_capacity(acc, "builder")
-    except Exception as e:
-        log("warn", f"No he podido leer la capacidad de la aldea nocturna: {e}")
+    if not res or res.get("gold") is None or res.get("elixir") is None:
+        res = eyes.my_resources(dev.shot())   # antes de tocar las barras
+    if read_cap or not a.get("builder_capacity"):
+        try:
+            read_capacity(acc, "builder", have=res)
+        except Exception as e:
+            log("warn", f"No he podido leer la capacidad de la aldea nocturna: {e}")
     cap = a.get("builder_capacity")
-    res = eyes.my_resources(dev.shot())
     note_resources(acc, res, "builder")
     if not cap:
         return False, res
@@ -1924,42 +2648,55 @@ def bb_storages(acc):
     return full, res
 
 
-def builder_base(acc, attacks):
-    """Aldea nocturna: batallas de constructor hasta llenar sus almacenes al % objetivo
-    (como mucho `attacks` batallas por vuelta)."""
+def builder_base(acc):
+    """Aldea nocturna: batallas de constructor, sin tope, hasta llenar sus almacenes al % objetivo. Sólo se
+    deja antes si dos batallas seguidas no suman nada (bonus diario agotado: seguir no llenaría nada)."""
     if not go_home():
         return
     if not in_builder() and not travel_boat(True):
         return
     collect_cart()
-    result = None
-    for n in range(attacks):
-        check_stop()
+    result, res, dry = None, None, 0
+    for n in itertools.count():
+        try:
+            check_stop()
+        except Redirect:                           # el visor manda otro paso: antes, de vuelta a la principal
+            go_home()
+            travel_boat(False)
+            go_home()
+            raise
         if not go_home():                          # cierra avisos (bonus estelar, etc.) antes de cada batalla
             break
-        full, before = bb_storages(acc)
+        full, before = bb_storages(acc, res, read_cap=(n == 0))
         if full:
             log("done", f"Almacenes de la aldea nocturna de {acc} llenos.")
             result = "full"
             break
-        tap(125, 960, "Batalla (aldea nocturna)", 3)
-        if not is_green(color(dev.shot(), 1270, 700, 3)):   # botón verde "Buscar" del menú de la nocturna
+        tap(125, 960, "Batalla (aldea nocturna)", 0.8)
+        if not wait_for(lambda: is_green(color(dev.shot(), 1270, 700, 3)), 6):   # botón verde "Buscar" del menú
             log("warn", "El menú de batalla de la aldea nocturna no se ha abierto.")
             go_home()
             break
-        tap(1425, 708, "Buscar batalla de constructor", 10)
-        dev.zoom_out(1)
-        bb_battle()
-        tap(960, 925, "volver", 6)
+        tap(1425, 708, "Buscar batalla de constructor", 1)
+        t_search = time.time()
+        if not bb_battle():
+            go_home()
+            break
+        tap(960, 925, "volver", 1)
+        wait_for(lambda: screen()[0] == "home", 8)   # con un aviso encima sigue go_home
+        log("think", f"Batalla nocturna completa en {time.time() - t_search:.0f} s (de «Buscar» a la aldea).")
         collect_cart()
+        res = None
         if go_home():
-            after = eyes.my_resources(dev.shot())
+            res = after = eyes.my_resources(dev.shot())
             gained = {k: max(0, (after.get(k) or 0) - (before.get(k) or 0)) for k in ("gold", "elixir")}
             note_resources(acc, after, "builder")
             loot_log(acc, "aldea nocturna", None, None, {**gained, "dark": 0})
             log("done", f"Batalla nocturna terminada: +{gained['gold']} oro, +{gained['elixir']} elixir.")
-            if gained["gold"] + gained["elixir"] < 2000 and n > 0:
-                log("done", "La aldea nocturna ya no suma (bonus agotado o almacenes llenos). Paso a lo siguiente.")
+            dry = dry + 1 if gained["gold"] + gained["elixir"] < 2000 else 0
+            if dry >= 2:
+                log("done", "La aldea nocturna ya no suma en dos batallas seguidas (bonus agotado o almacenes "
+                            "llenos). Paso a lo siguiente.")
                 break
     go_home()
     travel_boat(False)
@@ -1973,10 +2710,16 @@ CONFIRM_BTN = (1345, 940)          # «Confirmar» con recurso (el gris de la iz
 
 
 def builder_panel_open(img=None):
+    """Panel «Estructuras y héroes» abierto. Se mira su marco fijo (X roja, botón gris del filtro y el marco
+    de las pestañas de abajo), no el icono de la pestaña (con un constructor libre es un duende verde) ni la
+    lista (al desplazarla pasan etiquetas verdes de descuento)."""
     img = img or dev.shot()
-    x = color(img, 1905, 40, 2)                       # borde rojo del botón X (el centro es la cruz blanca)
-    tab = color(img, 1467, 1010, 4)                   # pestaña de constructores (abajo del panel)
-    return x[0] > 170 and x[1] < 90 and x[2] < 90 and tab[0] > 150 and 110 < tab[1] < 180
+    x, filt = color(img, 1905, 40, 2), color(img, 1460, 35, 2)
+    tab, low = color(img, 1420, 1060, 2), color(img, 1600, 1075, 2)
+    return (x[0] > 170 and x[1] < 90 and x[2] < 90
+            and all(70 < c < 165 for c in filt) and max(filt) - min(filt) < 35
+            and 135 < tab[0] < 185 and 115 < tab[1] < 165 and 100 < tab[2] < 150
+            and 95 < low[0] < 135 and 80 < low[1] < 120 and 70 < low[2] < 110)
 
 
 ROW_PITCH = 85                     # distancia entre filas del panel
@@ -2021,6 +2764,9 @@ def cancel_placement(img):
 
 
 def free_builders(img):
+    r = eyes.ocr("builders", img)                  # «1/7» por plantillas; si no está claro, el modelo
+    if r is not None:
+        return r
     d = eyes.ask(img.crop((1410, 1000, 1530, 1070)).resize((360, 210)),
                  'Hay un número tipo "a/b" (constructores libres / total). Responde {"free": a, "total": b}.')
     try:
@@ -2066,6 +2812,7 @@ def build_recommended(acc):
     started = 0
     skip = set()                              # filas que no abrieron ventana en esta pasada
     for _ in range(7):
+        check_stop()                          # el panel abierto lo cierra go_home() si el visor manda otro paso
         img = dev.shot()
         free, total = free_builders(img)
         if not free:
@@ -2132,6 +2879,525 @@ def build_recommended(acc):
     return started
 
 
+# ---------------- muros ----------------
+PANEL_LIST = (1405, 60, 1920, 960)        # lista del panel de constructores (se desplaza arrastrando)
+# Barra del muro seleccionado con el panel abierto (dos filas). Arriba: Infor. / Marcar fila / Mejorar más;
+# tras «Mejorar más»: Eliminar muro (−1) / Añadir +10 / Añadir +1 (igual en TH14 y TH18).
+# La barra cabe en UNA fila o se parte en DOS según lo que haya abajo a la derecha (p. ej. la caja de
+# recompensas): se detecta cuál es por dónde salen los botones de pago (2026-11-09).
+#   dos filas: Infor./Marcar fila/Mejorar más arriba (y=760) y los pagos debajo (precio y≈888)
+#   una fila:  Infor. 283 / Marcar fila 490 / Mejorar más 700 / pagos a la derecha, todo en y≈850 (precio y≈791)
+# Tras «Mejorar más», los tres primeros pasan a ser −1 / +10 / +1 en el mismo sitio.
+WALL_LAYOUTS = {
+    "dos filas": {"more": (906, 760), "add10": (698, 760), "add1": (906, 760),
+                  "title": (300, 580, 1400, 665), "strip": (380, 876, 1000, 900)},
+    "una fila": {"more": (700, 850), "add10": (490, 850), "add1": (700, 850),
+                 "title": (300, 675, 1400, 760), "strip": (380, 779, 1260, 803)},
+}
+WALL_MORE, WALL_ADD10, WALL_ADD1 = (906, 760), (698, 760), (906, 760)
+WALL_TITLE = (300, 580, 1400, 665)        # «Muro (Nivel 13) x1»
+# Los botones de pago cambian de sitio: 2 (oro, elixir) o 3 si hay anillos de muro (azul, sin precio,
+# NUNCA se toca). Se localizan por el icono de su precio: moneda amarilla u gota rosa.
+PAY_STRIP = (380, 876, 1000, 900)
+
+
+def wall_layout(img):
+    """Distribución de la barra del muro seleccionado: la que tenga botones de pago en su franja."""
+    best = max(WALL_LAYOUTS, key=lambda k: len(pay_buttons(img, WALL_LAYOUTS[k])))
+    return dict(WALL_LAYOUTS[best], name=best)
+
+
+def pay_buttons(img, lay=None):
+    """{recurso: (x del botón, recuadro del precio, y donde tocar)} de los botones «Mejorar» con precio en
+    oro/elixir, en la franja de la distribución `lay` (por defecto, la de dos filas)."""
+    strip = (lay or WALL_LAYOUTS["dos filas"])["strip"]
+    x0, y0, x1, y1 = strip
+    a = np.asarray(img.crop(strip)).astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    masks = {"gold": (r > 200) & (g > 160) & (b < 90), "elixir": (r > 150) & (b > 150) & (g < 110)}
+    out = {}
+    for res in ("elixir", "gold"):            # primero el elixir: el oro va siempre a su IZQUIERDA
+        m = masks[res]
+        cols = np.nonzero(m.sum(axis=0) >= 4)[0]
+        if len(cols) < 6:
+            continue
+        groups = np.split(cols, np.nonzero(np.diff(cols) > 3)[0] + 1)
+        for icon in sorted(groups, key=lambda g: -g[-1]):   # el icono va a la derecha de la cifra
+            # la moneda mide 18-20 columnas y ~230 píxeles; la gota, 17 y ~195. Un trozo amarillo de la aldea
+            # que asoma entre botones (10 columnas, 73 píxeles) se tomó por la moneda y el recuadro del precio
+            # dejó fuera el «1» de «14 000 000» (05:31, 10-nov).
+            if not 13 <= len(icon) <= 26 or m[:, icon].sum() < 120:
+                continue
+            ix = int(icon.mean()) + x0
+            if res == "gold" and "elixir" in out and ix > out["elixir"][0] + 66 - 100:
+                continue                       # algo amarillo dentro del botón del elixir (brillo): no es el oro
+            bx = ix - 66
+            under = color(img, bx, y0 + 124, 4)
+            # debajo, botón beis claro; el de anillos es azul (y su anillo dorado parece una moneda): nunca
+            if under[0] > 170 and under[1] > 170 and under[2] > 150 and under[2] <= under[0] + 5:
+                out[res] = (bx, (ix - 165, y0 - 4, ix + 20, y1 + 6), y0 + 74)
+                break
+    return out
+
+
+def _white(img):
+    a = np.asarray(img.convert("RGB")).astype(np.int16)
+    return (a.min(axis=2) > 205).astype(np.float32)
+
+
+MURO_TPL = _white(Image.open(HERE / "tpl" / "muro_panel.png").convert("RGB"))   # «Muro» blanco del panel
+NAME_X = (1475, 1515)                     # el nombre de cada fila empieza siempre en x≈1492
+
+
+def wall_rows_here(img):
+    """Filas «Muro…» visibles en el panel, por plantilla (el modelo se inventa las posiciones): [y del texto]."""
+    x0, y0, x1, y1 = NAME_X[0], 70, NAME_X[1] + MURO_TPL.shape[1], 955
+    r = cv2.matchTemplate(_white(img.crop((x0, y0, x1, y1))), MURO_TPL, cv2.TM_CCOEFF_NORMED)
+    ys = []
+    while True:
+        _, v, _, (_, y) = cv2.minMaxLoc(r)
+        if v < 0.9:                            # muros = 1,0; lo más parecido (Mortero) ≈ 0,8
+            return sorted(ys)
+        ys.append(y + y0)
+        r[max(0, y - 30):y + 30, :] = -1
+
+
+def _list_moved(prev, cur):
+    """¿Se ha movido la lista entre dos capturas? Busca una franja de la anterior en la nueva."""
+    g = lambda im: cv2.cvtColor(np.asarray(im.crop(PANEL_LIST)), cv2.COLOR_RGB2GRAY)
+    a, b = g(prev), g(cur)
+    band = a[330:530]
+    _, v, _, (_, y) = cv2.minMaxLoc(cv2.matchTemplate(b, band, cv2.TM_CCOEFF_NORMED))
+    return v < 0.9 or abs(y - 330) > 15
+
+
+def _settled_shot():
+    """Captura cuando la lista ha dejado de deslizarse (tras un arrastre sigue moviéndose un poco)."""
+    img = dev.shot()
+    for _ in range(6):
+        time.sleep(0.5)
+        again = dev.shot()
+        if not _list_moved(img, again):
+            return again
+        img = again
+    return img
+
+
+def _full_wall_rows(img):
+    """y del texto de las filas «Muro» enteras (las cortadas por arriba o por abajo no cuentan)."""
+    return [ty for ty in wall_rows_here(img) if ty - 10 >= 80 and ty + 62 <= 950]
+
+
+def wall_rows():
+    """Busca en el panel de constructores la fila «Muro x N» del nivel MÁS BAJO. El panel ordena las mejoras
+    de más cara a más barata, así que los muros de nivel bajo van al final: se baja hasta el final de la lista
+    y se sube hasta la primera pantalla con muros, y se elige la fila de más abajo (sin modelo: el modelo
+    confunde los separadores de miles y no sirve para comparar precios). Devuelve (filas, completo):
+    filas = [{y, count, price, seen}] con la elegida (y = centro de la fila en pantalla; seen = filas de muros
+    vistas en el recorrido); completo = se vio la lista entera (sin filas y completo = no queda ningún muro)."""
+    prev, seen, moved, stuck = None, 0, 0, 0
+    for page in range(30):                     # hacia abajo, hasta que el arrastre ya no mueva la lista
+        img = _settled_shot()
+        seen += len(_full_wall_rows(img))
+        if prev is not None and not _list_moved(prev, img):
+            stuck += 1
+            if stuck >= 2:                     # dos arrastres seguidos sin moverla: final de verdad
+                break
+        else:
+            if prev is not None:
+                moved += 1
+            stuck = 0
+        prev = img
+        dev.swipe(1660, 880, 1660, 300, 1300, wait=0.8)     # lento: casi sin inercia
+    else:
+        return [], False                       # lista sin final: algo raro
+    if not seen:
+        # «no queda ningún muro» sólo si la lista se ha recorrido de verdad (10-nov 12:58: la lista no se movió,
+        # no vio muros y dio el TH18 por terminado con 49 + 276 muros pendientes)
+        return [], moved >= 2
+    for page in range(20):                     # hacia arriba, hasta la primera pantalla con muros
+        ys = _full_wall_rows(img)
+        if ys:
+            ty = max(ys)                       # la de más abajo = la más barata = nivel más bajo
+            r = eyes.ocr("wall_row", img, ty)  # «Muro x 293» / «3 500 000» por plantillas; si no, el modelo
+            if r is not None:
+                return [{"y": ty + 25, "count": r["count"], "price": r["price"], "seen": seen}], True
+            d = eyes.ask(img.crop((1480, ty - 8, 1915, ty + 60)).resize((870, 136)),
+                         'Fila de mejora de Clash of Clans: un nombre tipo "Muro x N" y un precio debajo. Responde '
+                         '{"name": texto del nombre, "count": N (1 si no hay "x"), "price": P} sin espacios en los números.')
+            return [{"y": ty + 25, "count": eyes._num(d.get("count")) or 1, "price": eyes._num(d.get("price")),
+                     "seen": seen}], True
+        dev.swipe(1660, 300, 1660, 880, 1300, wait=0.8)
+        img = _settled_shot()
+    return [], False
+
+
+def _wall_title(img, lay=None):
+    """(nombre, nivel, cuántos) del título «Muro (Nivel 16) x11». Se pide el texto tal cual y los números se
+    sacan aquí: preguntando por los números, el modelo leía «x11» como «x1»."""
+    b = (lay or WALL_LAYOUTS["dos filas"])["title"]
+    t = eyes.ocr("wall_title", img, b)        # sólo si pone EXACTAMENTE «Muro (Nivel N) [xK]»; si no, el modelo
+    if t is not None:
+        return t
+    d = eyes.ask(img.crop(b).resize(((b[2] - b[0]) * 2, (b[3] - b[1]) * 2)),
+                 'Copia exactamente el texto grande amarillo. Responde {"text": "..."}')
+    text = str(d.get("text") or "")
+    lvl = re.search(r"nivel\s*(\d+)", text, re.I)
+    n = re.search(r"\)\s*x\s*(\d+)", text, re.I)
+    return text.split("(")[0].strip(), int(lvl[1]) if lvl else None, int(n[1]) if n else 1
+
+
+def _wall_price(img, box, scale=3):
+    """Precio de un botón de pago. Texto literal + cifras sacadas aquí: pidiendo el número, el modelo se comía
+    dígitos (leyó 6500000 donde ponía 16 500 000). El recuadro se ensancha un poco por la izquierda."""
+    box = (box[0] - 14, box[1], box[2], box[3])
+    try:
+        if ocr_mod is not None and ocr_mod.red_text(img, box):
+            log("think", "Precio en rojo (no llega): ese botón no se paga.")
+            return None                       # un precio rojo nunca se paga (por píxeles, independiente; QA)
+    except Exception:
+        pass
+    if scale == 3:                            # 1.ª lectura por plantillas; la de comprobación (scale=4), el modelo
+        v = eyes.ocr("price", img, box, end_gap=46)    # la cifra acaba a ~40 px del borde (icono)
+        if v is not None:
+            return v
+    d = eyes.ask(img.crop(box).resize(((box[2] - box[0]) * scale, (box[3] - box[1]) * scale)),
+                 'Copia exactamente el número blanco (con sus espacios). Responde {"text": "..."}')
+    digits = re.sub(r"\D", "", str(d.get("text") or ""))
+    return int(digits) if digits else None
+
+
+def _walls_question(img):
+    """(recurso, cantidad) de «¿Quieres mejorar los muros seleccionados por Oro x15000000?». Se pide el texto
+    tal cual y la cifra se saca aquí: con un ejemplo numérico en la pregunta, el modelo copiaba el ejemplo
+    (leyó 1000000 donde ponía x15000000)."""
+    box = (520, 420, 1400, 550)
+    d = eyes.ask(img.crop(box).resize(((box[2] - box[0]) * 2, (box[3] - box[1]) * 2)),
+                 'Copia exactamente el texto de la pregunta. Responde {"text": "..."}')
+    text = str(d.get("text") or "")
+    m = re.search(r"(oro|elixir)\s*x?\s*([\d][\d .,]*)", text, re.I)
+    digits = re.sub(r"\D", "", m[2]) if m else ""
+    return (m[1].lower() if m else ""), (int(digits) if digits else None)
+
+
+WALLS_OK = (1167, 692)                    # «Vale» de «Mejorar muros» (a la izquierda, «Cancelar» naranja)
+NO_BUILDER_X = (1350, 328)                # X de «¡No hay constructores libres!» (el botón verde es de GEMAS)
+
+
+def _green(c):
+    return c[1] > 160 and c[1] > c[0] + 50 and c[2] < 90
+
+
+def walls_confirm(img):
+    """Ventana «Mejorar muros»: cuerpo claro, «Cancelar» naranja a la izquierda y «Vale» verde a la derecha
+    (puntos lisos de los botones, lejos de las letras)."""
+    cancel = [color(img, x, 740, 3) for x in (600, 880)]
+    return (all(_green(color(img, x, 740, 3)) for x in (1030, 1300)) and min(color(img, 960, 580, 4)) > 200
+            and all(c[0] > 190 and 50 < c[1] < 120 and c[2] < 70 for c in cancel))
+
+
+def no_builder_dialog(img):
+    """«¡No hay constructores libres!»: X roja arriba a la derecha y botón verde (de GEMAS) en el centro."""
+    red = [color(img, x, 350, 3) for x in (1318, 1385)]
+    return (all(c[0] > 190 and c[1] < 60 and c[2] < 60 for c in red)
+            and all(_green(color(img, x, 740, 3)) for x in (820, 1100)))
+
+
+GOBLIN_X = (1717, 232)                    # X de «¡Buenas, jefe!» (el duende constructor cobra GEMAS)
+GOBLIN_ONLY = {}                          # cuenta -> nº de libres cuando el único libre era el duende
+
+
+def goblin_dialog(img):
+    """«¡Buenas, jefe!»: el constructor duende ofrece trabajar por gemas. X roja arriba a la derecha del
+    cuadro y botón verde (de GEMAS) en el centro."""
+    x = color(img, 1740, 250, 3)
+    return (x[0] > 190 and x[1] < 70 and x[2] < 70 and min(color(img, 1100, 270, 4)) > 200
+            and all(_green(color(img, gx, 690, 3)) for gx in (1215, 1440)))
+
+
+def _accept_walls(img, pay, word, total_price, got, prices, res):
+    """Lee «¿Quieres mejorar los muros seleccionados por Oro xN?» y pulsa «Vale» sólo si cuadra. Devuelve
+    (captura tras aceptar, (pay, word, total_price)) o None si se canceló."""
+    what, amount = _walls_question(img)
+    alt = {"oro": "gold", "elixir": "elixir"}.get(what)
+    if (alt and alt != pay and amount and prices.get(alt) and amount <= (res.get(alt) or 0)
+            and abs(amount - got * prices[alt]) <= prices[alt] * 0.02):
+        # se pulsó el botón de la otra moneda: lo que pide la confirmación es justo y llega, vale igual
+        log("think", f"La confirmación pide {what} en vez de {word} ({amount}, tengo {res.get(alt)}): vale igual.")
+        img.save(HERE / "muro_rechazado.png")
+        pay, word, total_price = alt, what, amount
+    if (what not in ("oro", "elixir") or what != word or not amount
+            or abs(amount - total_price) > prices[pay] * 0.02):
+        img.save(HERE / "muro_rechazado.png")
+        log("warn", f"La confirmación pide {amount} de «{what}» y esperaba {total_price} de {word}: cancelo.")
+        tap(747, 692, "Cancelar", 1.2)
+        return None
+    tap(*WALLS_OK, f"Vale: {got} muros por {amount} {word}", 2)
+    return dev.shot(), (pay, word, total_price)
+
+
+def single_wall_ok(img, pay, lvl, price, have):
+    """Ventana normal «¿Mejorar tu Muro al Nivel N?» (sale cuando sólo se mejora un muro): se acepta sólo si es
+    un muro, al nivel siguiente, con el botón «Confirmar» en el recurso elegido (nunca gemas ni martillo) y
+    por el precio esperado, y si llega. Texto literal + regex (el modelo copia los números de ejemplo)."""
+    if not (upgrade_window(img) and price_ok(img)):
+        return False
+    icon = color(img, 1460, 960, 4)
+    is_gold = icon[0] > 200 and icon[1] > 160 and icon[2] < 90
+    is_elixir = icon[0] > 170 and icon[2] > 170 and icon[1] < 120
+    if not ((pay == "gold" and is_gold) or (pay == "elixir" and is_elixir)):
+        return False
+    b = (380, 40, 1560, 115)
+    d = eyes.ask(img.crop(b).resize(((b[2] - b[0]) * 2, (b[3] - b[1]) * 2)),
+                 'Copia exactamente el título. Responde {"text": "..."}')
+    # «¿Mejorar tu Muro al Nivel N?» (la de un muro ya al máximo dice «Muro de nivel N»: nunca vale)
+    m = re.search(r"mejorar.*?muro.*?\bal\s+nivel\s*(\d+)", str(d.get("text") or ""), re.I)
+    if not m or (lvl and int(m[1]) != lvl + 1):
+        return False
+    b = (1215, 922, 1430, 962)                 # cifra de arriba (la tachada de debajo es el precio sin descuento)
+    amount = eyes.ocr("price", img, b, hr=(16, 32))
+    if amount is None:
+        d = eyes.ask(img.crop(b).resize(((b[2] - b[0]) * 3, (b[3] - b[1]) * 3)),
+                     'Copia exactamente el número. Responde {"text": "..."}')
+        digits = re.sub(r"\D", "", str(d.get("text") or ""))
+        amount = int(digits) if digits else None
+    return bool(amount and price) and abs(amount - price) <= price * 0.02 and amount <= have
+
+
+def upgrade_walls(acc, res=None):
+    """Mejora muros con «Mejorar más» (varios del mismo nivel de una vez) mientras haya constructor libre y
+    dinero. Nunca gemas, martillos ni anillos: sólo los botones con precio en oro o elixir, sólo si llega, y
+    la confirmación se lee antes de aceptar. Devuelve "max" si ya no queda ningún muro por mejorar, "busy" si
+    no hay constructor libre, o cuántos muros mejoró (0 si no llegaba el dinero o algo no cuadró)."""
+    if not main_village():
+        return 0
+    res = dict(res or eyes.my_resources(dev.shot()))
+    done, empty_scans, warmed = 0, 0, False
+    for _round in range(5):                   # oro, elixir y alguna vuelta más si quedan muros a otro nivel
+        check_stop()
+        go_home()
+        tap(*BUILD_BTN, "abrir mejoras (constructores)", 2)
+        img = dev.shot()
+        if not builder_panel_open(img):
+            log("warn", "El panel de constructores no se ha abierto.")
+            break
+        free, total = free_builders(img)
+        if not free or free <= GOBLIN_ONLY.get(acc, 0):
+            why = "sólo el duende, que cobra gemas" if free else "ninguno"
+            log("think", f"{acc}: no hay constructor libre para los muros ({free}/{total}: {why}).")
+            go_home()
+            return done or "busy"
+        if not warmed:                        # la confirmación «Mejorar muros» la lee el modelo: que se vaya
+            warmed = True                     # cargando mientras se recorre la lista del panel (~40 s)
+            threading.Thread(target=eyes.warm, daemon=True).start()
+        rows, complete = wall_rows()
+        if not rows:
+            if not complete:
+                log("warn", f"{acc}: no encuentro los muros en el panel; lo dejo para luego.")
+                break
+            empty_scans += 1
+            if empty_scans < 2:               # se repasa la lista entera otra vez antes de darlo por hecho
+                continue
+            go_home()
+            return done or "max"
+        cheap = min(rows, key=lambda r: r["price"] or 1e18)     # de los que se ven, el más barato
+        tap(1620, cheap["y"], f"elegir muros ({cheap['count']} a {cheap['price']})", 2.5)
+        img = dev.shot()
+        lay = wall_layout(img)
+        name, lvl, _ = _wall_title(img, lay)
+        if "muro" not in name.lower():
+            img.save(HERE / "muro_rechazado.png")
+            log("warn", f"La fila elegida no es de muros («{name}»): no toco nada (captura en muro_rechazado.png).")
+            break
+        btns = pay_buttons(img, lay)           # oro / elixir; el de anillos ni se considera
+        prices = {k: _wall_price(img, btns[k][1]) if k in btns else None for k in ("gold", "elixir")}
+        ref = cheap.get("price")              # el del panel: otra pantalla y otra letra (lectura independiente)
+        for k, p in list(prices.items()):
+            if p and ref and abs(p - ref) > 0.02 * ref:
+                # no coincide (p. ej. una cifra inicial perdida): segunda lectura con el modelo; si tampoco, fuera
+                p2 = _wall_price(img, btns[k][1], scale=4)
+                prices[k] = p2 if p2 and abs(p2 - ref) <= 0.02 * ref else None
+                log("think", f"Precio de muro en {k}: leí {p} y el panel dice {ref}; relectura {p2} → "
+                             f"{'vale' if prices[k] else 'no lo uso'}.")
+        can = {k: min((res.get(k) or 0) // p, cheap["count"] or 1) if p else 0 for k, p in prices.items()}
+        pay = max(can, key=can.get)
+        n, word = can[pay], "oro" if pay == "gold" else "elixir"
+        if n < 1:
+            log("think", f"{acc}: muros de nivel {lvl} a {prices.get('gold')} (oro) / {prices.get('elixir')} "
+                         f"(elixir); con {res.get('gold')} oro y {res.get('elixir')} elixir no llega para ninguno.")
+            break
+        if (cheap["count"] or 1) <= CFG.get("walls_one_by_one", 10):
+            # quedan pocos de este nivel y van sueltos por la aldea: «Mejorar más» no los junta y los «+1»
+            # caían en la aldea (2026-11-09). De uno en uno, con la ventana normal de un muro.
+            n = 1
+        if n > 1:
+            tap(*lay["more"], f"Mejorar más (barra en {lay['name']})", 1.5)
+            for _ in range((n - 1) // 10):
+                tap(*lay["add10"], "añadir 10 muros", 0.7)
+            for _ in range((n - 1) % 10):
+                tap(*lay["add1"], "añadir 1 muro", 0.5)
+            time.sleep(0.5)
+            img = dev.shot()
+            lay = wall_layout(img)
+            _, _, got = _wall_title(img, lay)
+            btns = pay_buttons(img, lay)
+        else:
+            got = 1                            # sin «Mejorar más»: la barra es la del muro elegido
+        total_price = _wall_price(img, btns[pay][1]) if pay in btns else None
+        if pay in btns and prices.get(pay) and (not total_price or abs(total_price - got * prices[pay]) > prices[pay] * 0.02):
+            total_price = _wall_price(img, btns[pay][1], scale=4)      # segunda lectura, a otra escala
+        if (not total_price or total_price > (res.get(pay) or 0) or not 1 <= got <= n
+                or abs(total_price - got * prices[pay]) > prices[pay] * 0.02):
+            img.save(HERE / "muro_rechazado.png")
+            log("warn", f"{acc}: la cuenta de muros no cuadra (x{got} de {n}, {total_price} de {res.get(pay)} "
+                        f"{word}): no confirmo.")
+            break
+        img.save(HERE / "muro_pago.png")       # para revisar qué botón se eligió
+        log("think", f"Botones de pago: " + ", ".join(f"{k} x={v[0]}" for k, v in btns.items()))
+        tap(btns[pay][0], btns[pay][2], f"mejorar {got} muros de nivel {lvl} con {word} ({total_price})", 1.8)
+        img = dev.shot()
+        if not walls_confirm(img) and got == 1 and upgrade_window(img):
+            # con UN solo muro sale la ventana normal «¿Mejorar tu Muro al Nivel N?» en vez de «Mejorar muros»
+            if not single_wall_ok(img, pay, lvl, total_price, res.get(pay) or 0):
+                img.save(HERE / "muro_rechazado.png")
+                log("warn", "Ventana de mejora de un muro que no cuadra (nombre, nivel, recurso o precio): la cierro.")
+                tap(1697, 83, "cerrar ventana de mejora (X)", 1.5)
+                break
+            tap(*CONFIRM_BTN, f"Confirmar: 1 muro de nivel {lvl} por {total_price} {word}", 2)
+            img = dev.shot()
+        elif not walls_confirm(img):
+            img.save(HERE / "muro_rechazado.png")
+            log("warn", "No ha salido la confirmación «Mejorar muros»: no acepto nada (captura en muro_rechazado.png).")
+            break
+        else:
+            ok = _accept_walls(img, pay, word, total_price, got, prices, res)
+            if ok is None:
+                break
+            img, (pay, word, total_price) = ok
+        if no_builder_dialog(img):            # el contador de constructores se leyó mal: nunca las gemas
+            tap(*NO_BUILDER_X, "cerrar «no hay constructores libres» (sin gemas)", 1.2)
+            go_home()
+            return done or "busy"
+        if goblin_dialog(img):                # el libre era el duende: trabaja por gemas, nunca
+            GOBLIN_ONLY[acc] = free
+            tap(*GOBLIN_X, "cerrar el duende constructor (pide gemas)", 1.2)
+            log("think", f"{acc}: el constructor libre es el duende (cobra gemas): espero a uno normal.")
+            go_home()
+            return done or "busy"
+        go_home()
+        after = eyes.my_resources(dev.shot())
+        spent = (res.get(pay) or 0) - (after.get(pay) or 0)
+        if spent < total_price * 0.9:
+            dev.shot().save(HERE / "muro_rechazado.png")
+            log("warn", f"{acc}: tras aceptar no se ha gastado lo esperado ({spent} de {total_price} {word}).")
+            break
+        done += got
+        log("done", f"{acc}: {got} muros mejorados al nivel {(lvl or 0) + 1} por {total_price} {word}.")
+        res = after
+        if all(p and (res.get(k) or 0) < p for k, p in prices.items()):
+            # lo que queda no paga ni un muro del nivel más barato (los siguientes sólo pueden costar más): no
+            # se vuelve a abrir el panel y recorrer la lista entera (~70 s) para acabar en «no llega para ninguno»
+            log("think", f"{acc}: quedan {res.get('gold')} oro y {res.get('elixir')} elixir; un muro cuesta "
+                         f"{prices.get('gold')} (oro) / {prices.get('elixir')} (elixir): no llega para otro.")
+            break
+    go_home()
+    dev.zoom_out(2)                          # tocar la fila acerca la cámara: se deja como estaba
+    return done
+
+
+def walls_rich(acc):
+    """¿Hay oro o elixir de sobra para gastar en muros? (al `walls_spend_ratio` del almacén, 80 % por defecto,
+    o la barra al tope). Devuelve (sí/no, recursos leídos)."""
+    shot = dev.shot()
+    res = eyes.my_resources(shot)
+    a = CFG["accounts"][acc]
+    cap = a.get("capacity") or {}
+    r = a.get("walls_spend_ratio", CFG.get("walls_spend_ratio", 0.8))
+    rich = [k for k in ("gold", "elixir")
+            if bar_full(shot, k) or (cap_ok(k, cap.get(k)) and (res.get(k) or 0) >= cap[k] * r)]
+    return bool(rich), res
+
+
+def queue_next_walls(acc):
+    """Los muros de `acc` ya están al máximo: activa el siguiente paso de muros que esté en cola (queue)."""
+    p = HERE / "config.json"
+    c = json.loads(p.read_text(encoding="utf-8"))
+    for st in c["routine"]:
+        if st.get("task") == "walls" and st.get("queue") and st.get("enabled") is False and st["account"] != acc:
+            st["enabled"] = True
+            st.pop("queue", None)
+            p.write_text(json.dumps(c, indent=2, ensure_ascii=False), encoding="utf-8")
+            reload_config()
+            log("done", f"Muros de {acc} al máximo: activo los muros de {st['account']} (estaba en cola).")
+            return st["account"]
+    return None
+
+
+WALLS_BUSY = {}                            # cuenta -> cuándo se vio sin constructor libre
+WALLS_MAX = {}                             # cuenta -> lecturas seguidas de «no queda ningún muro»
+
+
+def walls_task(acc):
+    """Farmea sin tope y, cada vez que el oro o el elixir llegan al umbral, los gasta en muros (si hay
+    constructor libre). Acaba cuando ya no queda ningún muro por mejorar en este ayuntamiento ("max"); antes
+    sólo si los almacenes están llenos y no hay constructor ("full": se vuelve tras el descanso)."""
+    a = CFG["accounts"][acc]
+    if a.get("walls_done") and time.time() - a.get("walls_checked", 0) < CFG.get("walls_recheck_hours", 72) * 3600:
+        return "max"                           # se vuelve a mirar cada 12 h (por si sube el ayuntamiento)
+    for n in itertools.count():               # sin tope: hasta que no quede ningún muro (o no se pueda seguir)
+        check_stop()
+        if blocked_until.get(acc, 0) > time.time():
+            return
+        reload_config()
+        if not main_village():
+            return
+        if mass_on():
+            # en masa (pedido por el usuario): los almacenes se leen con el modelo sólo cada 20 ataques y
+            # entonces se gasta todo lo que dé; entre medias, sólo la barra por píxeles (gratis): si una
+            # está al tope se gasta ya, para no perder botín.
+            shot = dev.shot()
+            if any(bar_full(shot, k) for k in ("gold", "elixir")) or n % CFG.get("mass_walls_every", 20) == 0:
+                rich, res = walls_rich(acc)
+                cap = a.get("capacity") or {}
+                rich = rich or any((res.get(k) or 0) >= (cap.get(k) or 1e18) * 0.3 for k in ("gold", "elixir"))
+            else:
+                rich, res = False, {}
+        else:
+            rich, res = walls_rich(acc)
+        busy = time.time() - WALLS_BUSY.get(acc, 0) < 900   # sin constructor hace <15 min: ni se mira
+        if (rich or n == 0 and a.get("walls_done") or WALLS_MAX.get(acc)) and not busy:
+            r = upgrade_walls(acc, res)
+            if r == "busy":
+                WALLS_BUSY[acc] = busy = time.time()
+            if r == "max" and not a.get("walls_done"):
+                # un «no queda ningún muro» suelto no basta (el panel a veces no se desliza o carga a medias):
+                # hacen falta dos lecturas seguidas, con un ataque de por medio
+                WALLS_MAX[acc] = WALLS_MAX.get(acc, 0) + 1
+                if WALLS_MAX[acc] < 2:
+                    log("think", f"{acc}: no veo muros pendientes; lo compruebo otra vez tras el próximo ataque.")
+                    r = None
+            elif r != "max":
+                WALLS_MAX.pop(acc, None)
+            if r == "max":
+                WALLS_MAX.pop(acc, None)
+                a["walls_done"], a["walls_checked"] = True, time.time()
+                save_account_field(acc, "walls_done", True)
+                save_account_field(acc, "walls_checked", a["walls_checked"])
+                log("done", f"{acc}: todos los muros al nivel máximo de su ayuntamiento.")
+                queue_next_walls(acc)
+                return "max"
+            if a.get("walls_done"):            # quedaban muros (subió el ayuntamiento): se sigue con ellos
+                a["walls_done"] = False
+                save_account_field(acc, "walls_done", False)
+        if rich and busy and storages_full(acc, ["gold", "elixir"]):
+            log("done", f"{acc}: almacenes llenos y ningún constructor libre para muros: espero.")
+            return "full"
+        if not attack(acc) and not attack(acc):
+            return
+        check_stop()
+        clan_duties()
+
+
 def save_account_field(acc, key, value):
     """Guarda un dato de la cuenta en config.json (sobrevive a reinicios)."""
     p = HERE / "config.json"
@@ -2156,16 +3422,31 @@ def run_step(step):
     if blocked_until.get(acc, 0) > time.time():
         log("think", f"Me salto {acc}: la está usando el dueño.")
         return "skip"
+    a = CFG["accounts"].get(acc, {})
+    if task == "walls" and a.get("walls_done") and time.time() - a.get("walls_checked", 0) < CFG.get("walls_recheck_hours", 72) * 3600:
+        return "max"                              # muros ya al máximo: ni se cambia de cuenta
     if not switch_to(acc):
-        return
+        if not paused():
+            return
+        # el cambio falló porque entró el dueño: tras la pausa se reintenta ESTE paso (10-nov 21:20: se perdía
+        # el de ARDHIAMATEUR y, al saltar la pausa desde el visor, seguía por la aldea nocturna)
+        owner_pause()
+        if blocked_until.get(acc, 0) > time.time() or not switch_to(acc):
+            return
     clan_duties()
     if task == "builder_base":
-        return builder_base(acc, step.get("attacks", 10))
+        return builder_base(acc)
     if task == "build":
         build_recommended(acc)
         return
-    limit = step.get("attacks", CFG["max_attacks_per_account"])
-    for n in range(limit):
+    if task == "walls":
+        return walls_task(acc)
+    # llenar almacenes: sin tope, hasta llenarlos; «farmear» es justo eso, N ataques
+    limit = step.get("attacks", 6) if task == "farm" else None
+    dry = 0
+    for n in itertools.count():
+        if limit is not None and n >= limit:
+            return
         check_stop()
         if blocked_until.get(acc, 0) > time.time():
             return
@@ -2175,9 +3456,12 @@ def run_step(step):
             return "full"
         if not attack(acc) and not attack(acc):   # un fallo suelto (nubes, popup) se reintenta una vez
             return
+        check_stop()                              # recién acabada la batalla: buen momento para obedecer
         clan_duties()
-        if sum(LAST_GAIN.get(k) or 0 for k in ("gold", "elixir", "dark")) < 3000:
-            log("done", f"{acc}: el último ataque no ha sumado nada (almacenes llenos). Paso a lo siguiente.")
+        dry = 0 if LAST_GAIN.get("mass") else (
+            dry + 1 if sum(LAST_GAIN.get(k) or 0 for k in ("gold", "elixir", "dark")) < 3000 else 0)
+        if dry >= 2:                              # uno malo suelto no para nada; dos seguidos = ya no cabe
+            log("done", f"{acc}: dos ataques seguidos sin sumar nada (almacenes llenos). Paso a lo siguiente.")
             return "full"
 
 
@@ -2196,68 +3480,116 @@ def set_state(**kw):
     tmp.replace(STATE)
 
 
+TASK_NAMES = {"fill_storages": "llenar almacenes", "farm": "farmear", "builder_base": "aldea nocturna",
+              "build": "mejorar lo recomendado", "walls": "mejorar muros"}
+
+
+def cycle(start=0, forced=None):
+    """Una vuelta de la rutina desde el paso `start` y su descanso. `forced`: paso pedido desde el visor
+    (se hace aunque esté desactivado)."""
+    reload_config()
+    results = {}
+    set_state(phase="run", current=None, results={}, routine=CFG["routine"])
+    i = start
+    while i < len(CFG["routine"]):           # se relee en cada paso: los cambios del visor valen ya
+        step = CFG["routine"][i]
+        check_stop()
+        if step.get("enabled", True) is False and i != forced:
+            results[str(i)] = "off"
+            i += 1
+            continue
+        set_state(phase="run", current=i, step=step, results=results, routine=CFG["routine"])
+        try:
+            r = run_step(step)
+        except SystemExit:
+            raise
+        except Exception as e:
+            log("warn", f"Error en {step}: {e}")
+            r = "error"
+            time.sleep(5)
+        results[str(i)] = r or "ok"
+        set_state(results=results)
+        reload_config()
+        i += 1
+    rest = CFG["rest_minutes_between_cycles"]
+    real = [r for r in results.values() if r != "off"]
+    if not real:
+        log("warn", "No hay ningún paso activo en la rutina: no hago nada (actívalo en el visor).")
+        rest = max(rest, 10)
+    if real and all(r in ("full", "skip", "max") for r in real):
+        rest = CFG.get("rest_minutes_when_full", 30)
+        log("think", "Todas las cuentas llenas (o en uso por el dueño): descanso largo.")
+    log("think", f"Rutina completa. Descanso {rest} min y vuelvo a empezar.")
+    t_end = time.time() + rest * 60
+    set_state(phase="rest", current=None, results=results, rest_until=t_end)
+    owner_pause()
+    home = CFG.get("home_account")
+    if home and blocked_until.get(home, 0) > time.time():
+        home = None                      # su cuenta la usa el dueño: no se vuelve a ella
+    every = CFG.get("donation_check_minutes", 4) * 60
+    if home:
+        try:
+            switch_to(home)
+        except Exception as e:
+            log("warn", f"No he podido volver a {home}: {e}")
+    last_don = beat = time.time()
+    while time.time() < t_end:           # se mira el visor cada 2 s
+        check_stop()
+        if (HERE / "SKIP_REST").exists():  # botón «empezar ya» del visor
+            (HERE / "SKIP_REST").unlink(missing_ok=True)
+            log("think", "Descanso cancelado desde el visor: empiezo la rutina.")
+            break
+        if home and time.time() - last_don >= every:   # la cuenta donante atiende peticiones mientras descansa
+            last_don = time.time()
+            try:
+                if which_account() == home:
+                    clan_duties()
+                else:
+                    switch_to(home)
+            except Exception as e:
+                log("warn", f"Revisión de donaciones falló: {e}")
+        elif time.time() - beat >= 300:                # latido cada 5 min para que el vigilante no lo crea colgado
+            beat = time.time()
+            log("think", f"Descansando… quedan {math.ceil((t_end - beat) / 60)} min.")
+        time.sleep(2)
+
+
 def main():
     dev.connect()
     log("think", "Asistente en marcha: rutina " + " → ".join(f"{s['account']} ({s['task']})" for s in CFG["routine"]) + ".")
+    start = 0                                    # EMPEZAR_EN (un número): la 1ª vuelta empieza en ese paso
+    try:
+        start = int((HERE / "EMPEZAR_EN").read_text().strip())
+        log("think", f"Empiezo esta vuelta por el paso {start + 1} de la rutina (EMPEZAR_EN).")
+    except (OSError, ValueError):
+        pass
+    (HERE / "EMPEZAR_EN").unlink(missing_ok=True)
+    forced = None
     while True:
-        reload_config()
-        results = {}
-        set_state(phase="run", current=None, results={}, routine=CFG["routine"])
-        i = 0
-        while i < len(CFG["routine"]):           # se relee en cada paso: los cambios del visor valen ya
-            step = CFG["routine"][i]
-            check_stop()
-            if step.get("enabled", True) is False:
-                results[str(i)] = "off"
-                i += 1
-                continue
-            set_state(phase="run", current=i, step=step, results=results, routine=CFG["routine"])
-            try:
-                r = run_step(step)
-            except SystemExit:
-                raise
-            except Exception as e:
-                log("warn", f"Error en {step}: {e}")
-                r = "error"
-                time.sleep(5)
-            results[str(i)] = r or "ok"
-            set_state(results=results)
-            reload_config()
-            i += 1
-        rest = CFG["rest_minutes_between_cycles"]
-        real = [r for r in results.values() if r != "off"]
-        if real and all(r in ("full", "skip") for r in real):
-            rest = CFG.get("rest_minutes_when_full", 30)
-            log("think", "Todas las cuentas llenas (o en uso por el dueño): descanso largo.")
-        log("think", f"Rutina completa. Descanso {rest} min y vuelvo a empezar.")
-        set_state(phase="rest", current=None, results=results, rest_until=time.time() + rest * 60)
-        owner_pause()
-        home = CFG.get("home_account")
-        if home and blocked_until.get(home, 0) > time.time():
-            home = None                      # su cuenta la usa el dueño: no se vuelve a ella
-        every = CFG.get("donation_check_minutes", 4) * 6
-        if home:
-            try:
-                switch_to(home)
-            except Exception as e:
-                log("warn", f"No he podido volver a {home}: {e}")
-        for k in range(rest * 6):
-            check_stop()
-            if (HERE / "SKIP_REST").exists():  # botón «empezar ya» del visor
-                (HERE / "SKIP_REST").unlink(missing_ok=True)
-                log("think", "Descanso cancelado desde el visor: empiezo la rutina.")
-                break
-            if home and k and k % every == 0:     # la cuenta donante atiende las peticiones mientras descansa
+        try:
+            cycle(start, forced)
+            start, forced = 0, None
+        except Redirect as r:                    # botón «hacer ahora» del visor (fichero IR_A)
+            log("think", f"Orden del visor: dejo lo que hacía y voy al paso {r.index + 1} "
+                         f"({r.step['account']} · {TASK_NAMES.get(r.step['task'], r.step['task'])}); "
+                         f"luego sigo la rutina desde ahí.")
+            start = forced = r.index
+            # un paso DESACTIVADO lanzado con ⚡ queda activado: antes la orden sólo vivía en memoria y, tras un
+            # reinicio, la rutina (con ese único paso apagado) daba «Rutina completa» cada 2 min sin hacer nada
+            # mientras aún quedaban muros (13-nov)
+            if r.step.get("enabled") is False:
                 try:
-                    if which_account() == home:
-                        clan_duties()
-                    else:
-                        switch_to(home)
-                except Exception as e:
-                    log("warn", f"Revisión de donaciones falló: {e}")
-            elif k and k % 30 == 0:                # latido cada 5 min para que el vigilante no lo crea colgado
-                log("think", f"Descansando… quedan {rest - k // 6} min.")
-            time.sleep(10)
+                    p = HERE / "config.json"
+                    c = json.loads(p.read_text(encoding="utf-8"))
+                    st = c["routine"][r.index]
+                    if st["account"] == r.step["account"] and st["task"] == r.step["task"]:
+                        st.pop("enabled", None)
+                        st.pop("queue", None)
+                        p.write_text(json.dumps(c, indent=2, ensure_ascii=False), encoding="utf-8")
+                        reload_config()
+                        log("think", "Ese paso estaba desactivado: lo dejo activado para que siga tras un reinicio.")
+                except (OSError, ValueError, KeyError, IndexError) as e:
+                    log("warn", f"No he podido activar el paso: {e}")
 
 
 if __name__ == "__main__":

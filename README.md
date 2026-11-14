@@ -73,7 +73,7 @@ Abre **`asistente\config.json`** con el Bloc de notas. Por cada cuenta, en `"acc
 | `village_name` | el nombre de la aldea **tal cual sale arriba a la izquierda** en el juego | `"MiAldea"` |
 | `switch_label` | el nombre de la tarjeta en **Supercell ID → Cambiar de cuenta** | `"MiAldea"` |
 | `label` | cómo quieres verla en el visor | `"Principal · TH18"` |
-| `capacity` | no hace falta: el asistente lee el **Máx.** de cada recurso del juego y lo actualiza solo | `28000000` |
+| `capacity` | no hace falta: el asistente lee el **Máx.** de cada recurso del juego y lo actualiza solo (descarta lecturas imposibles o con una cifra de más, y si la barra del recurso está al tope lo da por lleno aunque la cifra no cuadre) | `28000000` |
 | `builder_capacity` | *(opcional)* igual, para la aldea nocturna | `4700000` |
 | `min_loot` | botín mínimo para atacar una base | `1000000` |
 | `auto_build` | `true` si quieres que **mejore solo** esa cuenta | `true` |
@@ -101,7 +101,7 @@ Si una cuenta te sobra, bórrala (y sus pasos en `"routine"`). Guarda el archivo
 |---|---|
 | **Pantalla** | El emulador en directo, con los toques del asistente marcados. |
 | **📦 Almacenes** | Por cuenta: barra con lo que tienes y una **marca blanca que arrastras** = hasta qué % llenar. Debajo, cuánto tendrías, cuánto falta y **≈ cuántos ataques**. Se actualiza tras cada ataque. |
-| **🔁 Rutina en bucle** | La lista de tareas. **Arrastra** las filas para cambiar la prioridad, cambia cuenta/tarea, ⏸ desactiva, ✕ quita, ＋ añade. Pulsa **Guardar**. Iconos: ⚙️ haciéndolo · ✅ hecho/lleno · ⏳ pendiente · 🙈 saltada (estabas jugando) · ⚠️ falló · 💤 desactivada. **⏭ Empezar ya** se salta el descanso. |
+| **🔁 Rutina en bucle** | La lista de tareas. **Arrastra** las filas para cambiar la prioridad, cambia cuenta/tarea, ⏸ desactiva, ✕ quita, ＋ añade. Pulsa **Guardar**. Iconos: ⚙️ haciéndolo · ✅ hecho/lleno · ⏳ pendiente · 🙈 saltada (estabas jugando) · ⚠️ falló · 💤 desactivada · ➡️ pedido desde el visor. **⚡ Hacer ya** (en cada fila): deja lo que esté haciendo y va a ese paso; luego sigue la rutina desde ahí. Obedece en el siguiente punto seguro (entre ataques, en la búsqueda o en la pausa; nunca corta una batalla con tropas ya desplegadas) y, si estaba detenido, lo arranca. Arriba: **⏭ Empezar ya** se salta el descanso y **⏭ Ya no juego** se salta la pausa de cuando juegas tú. |
 | **💰 Botín por ataque** | Cada ataque con estrellas, % y oro/elixir/oscuro, y el TOTAL. |
 | **Diario** | Qué ve, qué decide y qué hace, en tiempo real. |
 | **🏆 Rendimiento** | Enlace a la web del clan, que es un proyecto aparte: ver [`rendimiento/`](rendimiento/README.md). |
@@ -114,10 +114,11 @@ La web del clan vive en [`rendimiento/`](rendimiento/README.md): se abre aparte 
 
 | Tarea | Qué hace |
 |---|---|
-| **Llenar almacenes** | Ataca bases con buen botín hasta llegar al % objetivo. Si ya está lleno, pasa a lo siguiente. |
-| **Farmear** | Igual, pero como mucho N ataques por vuelta. |
-| **Llenar aldea nocturna** | Batallas de constructor hasta llenar la aldea nocturna (tope N por vuelta). |
+| **Llenar almacenes** | Ataca sin tope, con buen botín, hasta llegar al % objetivo. Si ya está lleno, pasa a lo siguiente (también si dos ataques seguidos no suman nada: ya no cabe). |
+| **Farmear** | N ataques por vuelta (la única tarea con número; las demás siguen hasta cumplir su objetivo). |
+| **Llenar aldea nocturna** | Batallas de constructor, sin tope, hasta llenar la aldea nocturna. Sólo para antes si dos batallas seguidas no suman nada (bonus diario agotado). |
 | **Mejorar lo recomendado** | Abre el panel de constructores y pone a mejorar lo **recomendado** que se pueda pagar (nunca con gemas). Para al llegar a `auto_build_until_th`. |
+| **Mejorar muros** | Farmea sin tope y, cuando el oro o el elixir llegan al `walls_spend_ratio` del almacén (80 % por defecto), los gasta en muros: busca la fila «Muro x N» del panel de constructores (por plantilla, `tpl/muro_panel.png`), usa **Mejorar más** para pagar de una vez todos los que lleguen, primero el nivel más bajo, y lee la confirmación «Mejorar muros … por Oro xN» antes de pulsar Vale. Necesita un **constructor libre normal**: el duende constructor cobra gemas («¡Buenas, jefe!») y se cierra con la X; si no hay, sigue farmeando y con los almacenes llenos descansa. Los botones de pago se buscan por el icono de su precio (moneda o gota), porque en ayuntamientos altos aparece un tercer botón con **anillos de muro**, que nunca se toca. Nunca gemas, martillos ni anillos. Cuando la lista ya no tiene muros (repasada dos veces), marca la cuenta como terminada (`walls_done`, se revisa cada 12 h por si sube el ayuntamiento) y **activa el siguiente paso de muros que esté en cola** (`"queue": true`, icono 🕓 en el visor). |
 
 ---
 
@@ -146,7 +147,7 @@ La web del clan vive en [`rendimiento/`](rendimiento/README.md): se abre aparte 
 | Lee mal los números | Comprueba que Ollama está instalado y que se descargó el modelo: `ollama list` debe mostrar `qwen2.5vl:7b`. |
 | El PC va muy lento | El modelo de visión necesita RAM: cierra programas o usa un PC con 16 GB+. |
 | Quiero que pare ya | `Detener asistente`. Para que deje de tocar al instante, cierra BlueStacks. |
-| Estaba jugando y se ha parado | Normal: si entras desde otro dispositivo se aparta 45 min. Para que siga antes, borra `asistente\PAUSA_DUENO`. |
+| Estaba jugando y se ha parado | Normal: si entras desde otro dispositivo se aparta 45 min. Para que siga antes, pulsa **Ya no juego** en el visor (o borra `asistente\PAUSA_DUENO`). |
 
 ---
 
