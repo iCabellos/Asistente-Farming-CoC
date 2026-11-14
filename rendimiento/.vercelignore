@@ -1,7 +1,0 @@
-clan.json
-clan.db*
-.env*
-__pycache__
-*.bat
-*.ps1
-tests

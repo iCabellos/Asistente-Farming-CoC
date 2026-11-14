@@ -104,11 +104,11 @@ Si una cuenta te sobra, bórrala (y sus pasos en `"routine"`). Guarda el archivo
 | **🔁 Rutina en bucle** | La lista de tareas. **Arrastra** las filas para cambiar la prioridad, cambia cuenta/tarea, ⏸ desactiva, ✕ quita, ＋ añade. Pulsa **Guardar**. Iconos: ⚙️ haciéndolo · ✅ hecho/lleno · ⏳ pendiente · 🙈 saltada (estabas jugando) · ⚠️ falló · 💤 desactivada · ➡️ pedido desde el visor. **⚡ Hacer ya** (en cada fila): deja lo que esté haciendo y va a ese paso; luego sigue la rutina desde ahí. Obedece en el siguiente punto seguro (entre ataques, en la búsqueda o en la pausa; nunca corta una batalla con tropas ya desplegadas) y, si estaba detenido, lo arranca. Arriba: **⏭ Empezar ya** se salta el descanso y **⏭ Ya no juego** se salta la pausa de cuando juegas tú. |
 | **💰 Botín por ataque** | Cada ataque con estrellas, % y oro/elixir/oscuro, y el TOTAL. |
 | **Diario** | Qué ve, qué decide y qué hace, en tiempo real. |
-| **🏆 Rendimiento** | Enlace a la web del clan, que es un proyecto aparte: ver [`rendimiento/`](rendimiento/README.md). |
+| **🏆 Rendimiento** | Enlace a la web del clan, que es un proyecto aparte. |
 
 ### Rendimiento
 
-La web del clan vive en [`rendimiento/`](rendimiento/README.md): se abre aparte con `rendimiento/Abrir rendimiento.bat` y se puede publicar en Vercel. El visor sólo la enlaza; cambia el enlace con la variable `COC_RENDIMIENTO_URL`.
+La web del clan es un proyecto aparte y vive en la rama `rendimiento-web`. El visor sólo la enlaza; cambia el enlace con la variable `COC_RENDIMIENTO_URL`.
 
 ### Tareas disponibles
 
@@ -162,7 +162,6 @@ coc-asistente/
 ├─ probar_zoom.bat         ← comprueba el zoom out
 ├─ vigilante.py            ← mantiene todo vivo
 ├─ server.py · index.html  ← visor web (localhost:8000)
-├─ rendimiento/            ← web del clan, independiente (lista para Vercel)
 ├─ requirements.txt
 └─ asistente/
    ├─ asistente.py           ← el asistente
@@ -183,4 +182,4 @@ git remote add origin https://github.com/TU_USUARIO/coc-asistente.git
 git push -u origin main
 ```
 
-`asistente/config.json` (tus cuentas), `rendimiento/clan.json` y `rendimiento/clan.db` (tu clan), los registros y las capturas **no se suben** (están en `.gitignore`).
+`asistente/config.json` (tus cuentas), los registros y las capturas **no se suben** (están en `.gitignore`).
